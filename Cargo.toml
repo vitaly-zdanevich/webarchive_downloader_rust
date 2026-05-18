@@ -1,0 +1,18 @@
+[package]
+name = "webarchive-downloader-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Download static website snapshots from the Internet Archive Wayback Machine."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+lol_html = "2.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream"] }
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.23"

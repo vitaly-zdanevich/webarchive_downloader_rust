@@ -1,0 +1,130 @@
+# webarchive-downloader-rust
+
+Download a static copy of a website from the Internet Archive Wayback Machine.
+
+The Cargo package and executable use kebab-case:
+
+```sh
+webarchive-downloader-rust another.by
+```
+
+Inside Rust code, Cargo exposes the library crate as `webarchive_downloader_rust` because Rust identifiers cannot contain hyphens. That split is normal Rust practice.
+
+## Status
+
+This is an early but working Rust CLI. It:
+
+- queries the Wayback CDX API for archived captures
+- keeps the latest capture per original URL by default
+- downloads files sequentially to keep memory use low and avoid hammering the Internet Archive
+- logs each URL before downloading it
+- skips existing files by default so interrupted runs can resume
+- writes through temporary files and renames atomically after success
+- handles Ctrl-C by stopping new downloads and reporting the partial output
+- reports the output folder size and 10 biggest files at the end
+- streams binary files to disk
+- rewrites common HTML and CSS links to local relative paths
+- writes to `public/` by default, which matches GitLab Pages conventions
+
+## Install
+
+From this repository:
+
+```sh
+cargo install --path .
+```
+
+Or run without installing:
+
+```sh
+cargo run --release -- another.by
+```
+
+## Usage
+
+Download a domain and all subdomains into `public/`:
+
+```sh
+webarchive-downloader-rust another.by
+```
+
+Choose an output directory. If a previous run was interrupted, run the same command again and already completed files will be skipped:
+
+```sh
+webarchive-downloader-rust another.by --output public
+```
+
+Inspect selected captures without downloading:
+
+```sh
+webarchive-downloader-rust another.by --list --limit 20
+```
+
+Download an older museum snapshot:
+
+```sh
+webarchive-downloader-rust another.by --to 20141231 --strategy latest
+```
+
+Force a full refresh of already downloaded files:
+
+```sh
+webarchive-downloader-rust another.by --overwrite
+```
+
+During a long run, press Ctrl-C once to stop after current requests finish. Already
+completed files stay in place, incomplete temporary files are not promoted, and the
+final report still prints the output size and biggest files. Press Ctrl-C a second
+time to exit immediately.
+
+Useful options:
+
+```text
+--match-type domain|host|prefix|exact
+--strategy latest|earliest
+--from YYYYMMDDhhmmss
+--to YYYYMMDDhhmmss
+--limit N
+--overwrite
+--no-rewrite
+--user-agent "webarchive-downloader-rust/0.1 your-email@example.com"
+```
+
+## GitLab Pages
+
+For a museum repository, commit the downloaded `public/` directory and add a Pages job like this:
+
+```yaml
+pages:
+  stage: deploy
+  script:
+    - test -d public
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+```
+
+Then run:
+
+```sh
+webarchive-downloader-rust another.by --output public
+```
+
+Review the result locally, commit `public/`, and push to GitLab.
+
+## Notes
+
+The default `--match-type domain` asks the CDX API for the host and subdomains. Third-party CDN assets are downloaded only when they appear in the selected CDX results.
+
+The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself.
+
+For very large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
+
+## References
+
+- Internet Archive Wayback CDX Server API: https://github.com/internetarchive/wayback/blob/master/wayback-cdx-server/README.md
+- waybackpack: https://github.com/jsvine/waybackpack
+- wmd-straw: https://github.com/StrawberryMaster/wayback-machine-downloader
+- Wayback Machine Downloader JS: https://github.com/birbwatcher/wayback-machine-downloader
