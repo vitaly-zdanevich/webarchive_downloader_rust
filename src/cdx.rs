@@ -1,9 +1,53 @@
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{
+    Response, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
+use tokio::time::sleep;
 use url::Url;
+
+use crate::wayback_client::WaybackClient;
+
+pub const MAX_WAYBACK_RETRY_DELAY_SECONDS: u64 = 24 * 60 * 60;
+const FIRST_VERBOSE_RETRY_ATTEMPTS: usize = 5;
+const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
+const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
+const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CdxRetryPolicy {
+    max_attempts: Option<usize>,
+}
+
+impl CdxRetryPolicy {
+    pub const fn primary() -> Self {
+        Self::unlimited()
+    }
+
+    pub const fn recovery() -> Self {
+        Self::unlimited()
+    }
+
+    pub const fn unlimited() -> Self {
+        Self { max_attempts: None }
+    }
+
+    #[cfg(test)]
+    pub const fn limited(max_attempts: usize) -> Self {
+        Self {
+            max_attempts: Some(max_attempts),
+        }
+    }
+
+    fn should_retry_after_attempt(self, attempt: usize) -> bool {
+        self.max_attempts.is_none_or(|max| attempt + 1 < max)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CdxRecord {
@@ -99,15 +143,12 @@ impl CdxQuery {
     }
 }
 
-pub async fn fetch_latest_records(client: &Client, query: &CdxQuery) -> Result<Vec<CdxRecord>> {
+pub async fn fetch_latest_records(
+    client: &WaybackClient,
+    query: &CdxQuery,
+) -> Result<Vec<CdxRecord>> {
     let search_url = query.search_url()?;
-    let response = client
-        .get(search_url)
-        .send()
-        .await
-        .context("failed to query the Wayback CDX API")?
-        .error_for_status()
-        .context("Wayback CDX API returned an error")?;
+    let response = send_cdx_request(client, search_url, CdxRetryPolicy::primary()).await?;
 
     let mut records_by_url: HashMap<String, CdxRecord> = HashMap::new();
     let mut stream = response.bytes_stream();
@@ -136,6 +177,237 @@ pub async fn fetch_latest_records(client: &Client, query: &CdxQuery) -> Result<V
     Ok(records)
 }
 
+pub async fn fetch_all_records(client: &WaybackClient, query: &CdxQuery) -> Result<Vec<CdxRecord>> {
+    fetch_all_records_with_policy(client, query, CdxRetryPolicy::primary()).await
+}
+
+pub async fn fetch_all_records_with_policy(
+    client: &WaybackClient,
+    query: &CdxQuery,
+    retry_policy: CdxRetryPolicy,
+) -> Result<Vec<CdxRecord>> {
+    let search_url = query.search_url()?;
+    let response = send_cdx_request(client, search_url, retry_policy).await?;
+
+    let mut records = Vec::new();
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed while reading CDX response")?;
+        pending.extend_from_slice(&chunk);
+
+        while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=line_end).collect::<Vec<_>>();
+            ingest_all_cdx_line(&line, &mut records)?;
+        }
+    }
+
+    if !pending.is_empty() {
+        ingest_all_cdx_line(&pending, &mut records)?;
+    }
+
+    sort_records_for_strategy(&mut records, query.strategy);
+    Ok(records)
+}
+
+pub fn is_cdx_connectivity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_connect()
+                || error.is_timeout()
+                || error.status().is_some_and(|status| {
+                    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                })
+        })
+    })
+}
+
+async fn send_cdx_request(
+    client: &WaybackClient,
+    search_url: Url,
+    retry_policy: CdxRetryPolicy,
+) -> Result<Response> {
+    let mut attempt = 0usize;
+    let started_at = Instant::now();
+    let mut suppressed_retry_messages = 0usize;
+    let mut next_connectivity_notice_after = FIRST_CONNECTIVITY_NOTICE_AFTER;
+    loop {
+        let response = match client.get(search_url.clone()).send().await {
+            Ok(response) => response,
+            Err(error) if retry_policy.should_retry_after_attempt(attempt) => {
+                let attempt_number = attempt + 1;
+                let elapsed = started_at.elapsed();
+                let delay = retry_after_delay(&HeaderMap::new(), attempt);
+                if try_activate_ssh_client(
+                    client,
+                    &format!("CDX API request failed: {}", format_error_chain(&error)),
+                ) {
+                    attempt = 0;
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                if should_log_retry_attempt(attempt_number) {
+                    eprintln!(
+                        "Wayback CDX API request failed on attempt {} after {}{}: {}; retrying in {} seconds",
+                        attempt_number,
+                        format_retry_elapsed(elapsed),
+                        format_suppressed_retries(suppressed_retry_messages),
+                        format_error_chain(&error),
+                        delay.as_secs()
+                    );
+                    suppressed_retry_messages = 0;
+                } else {
+                    suppressed_retry_messages = suppressed_retry_messages.saturating_add(1);
+                }
+
+                if is_reqwest_connectivity_error(&error)
+                    && elapsed >= next_connectivity_notice_after
+                {
+                    eprintln!(
+                        "Wayback CDX API has been unreachable at TCP connect level for {}; this is not HTTP throttling. The downloader will keep retrying. Check network, firewall, proxy, VPN, or route access to https://web.archive.org/.",
+                        format_retry_elapsed(elapsed)
+                    );
+                    next_connectivity_notice_after = elapsed + CONNECTIVITY_NOTICE_INTERVAL;
+                }
+
+                sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                return Err(error).context("failed to query the Wayback CDX API");
+            }
+        };
+
+        if is_retryable_cdx_status(response.status())
+            && retry_policy.should_retry_after_attempt(attempt)
+        {
+            let attempt_number = attempt + 1;
+            let elapsed = started_at.elapsed();
+            let status = response.status();
+            let delay = retry_after_delay(response.headers(), attempt);
+            if try_activate_ssh_client(client, &format!("CDX API returned {status}")) {
+                attempt = 0;
+                suppressed_retry_messages = 0;
+                continue;
+            }
+            if should_log_retry_attempt(attempt_number) {
+                eprintln!(
+                    "Wayback CDX API returned {status} on attempt {} after {}{}; retrying in {} seconds",
+                    attempt_number,
+                    format_retry_elapsed(elapsed),
+                    format_suppressed_retries(suppressed_retry_messages),
+                    delay.as_secs()
+                );
+                suppressed_retry_messages = 0;
+            } else {
+                suppressed_retry_messages = suppressed_retry_messages.saturating_add(1);
+            }
+            sleep(delay).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+
+        if response.status() == StatusCode::FORBIDDEN
+            && try_activate_ssh_client(client, "CDX API returned 403 Forbidden")
+        {
+            attempt = 0;
+            suppressed_retry_messages = 0;
+            continue;
+        }
+
+        return response
+            .error_for_status()
+            .context("Wayback CDX API returned an error");
+    }
+}
+
+fn is_retryable_cdx_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn try_activate_ssh_client(client: &WaybackClient, reason: &str) -> bool {
+    match client.activate_ssh(reason) {
+        Ok(activated) => activated,
+        Err(error) => {
+            eprintln!("SSH fallback failed: {error:#}; continuing direct Wayback retries");
+            false
+        }
+    }
+}
+
+fn is_reqwest_connectivity_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn should_log_retry_attempt(attempt_number: usize) -> bool {
+    attempt_number <= FIRST_VERBOSE_RETRY_ATTEMPTS
+        || attempt_number.is_multiple_of(RETRY_LOG_EVERY_ATTEMPTS)
+}
+
+fn format_suppressed_retries(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " (1 similar retry message suppressed)".to_owned(),
+        count => format!(" ({count} similar retry messages suppressed)"),
+    }
+}
+
+fn format_error_chain(error: &dyn StdError) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+
+    while let Some(error) = source {
+        let part = error.to_string();
+        if !message.contains(&part) {
+            message.push_str(": ");
+            message.push_str(&part);
+        }
+        source = error.source();
+    }
+
+    message
+}
+
+fn format_retry_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn retry_after_delay(headers: &HeaderMap, attempt: usize) -> Duration {
+    if let Some(seconds) = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.clamp(1, MAX_WAYBACK_RETRY_DELAY_SECONDS));
+    }
+
+    let seconds = (5u64 << attempt.min(15)).min(MAX_WAYBACK_RETRY_DELAY_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn sort_records_for_strategy(records: &mut [CdxRecord], strategy: SnapshotStrategy) {
+    records.sort_by(|left, right| {
+        let timestamp_order = match strategy {
+            SnapshotStrategy::Latest => right.timestamp.cmp(&left.timestamp),
+            SnapshotStrategy::Earliest => left.timestamp.cmp(&right.timestamp),
+        };
+        timestamp_order.then_with(|| left.original.cmp(&right.original))
+    });
+}
+
 fn ingest_cdx_line(
     line: &[u8],
     strategy: SnapshotStrategy,
@@ -155,6 +427,17 @@ fn ingest_cdx_line(
             records_by_url.insert(key, record);
         }
     }
+    Ok(())
+}
+
+fn ingest_all_cdx_line(line: &[u8], records: &mut Vec<CdxRecord>) -> Result<()> {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    records.push(parse_cdx_line(line)?);
     Ok(())
 }
 
@@ -207,6 +490,7 @@ pub fn canonical_original_key(original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn parses_text_cdx_line() {
@@ -238,5 +522,95 @@ mod tests {
         assert!(url.contains("matchType=domain"));
         assert!(url.contains("fl=timestamp%2Coriginal%2Cmimetype%2Cstatuscode%2Cdigest%2Clength"));
         assert!(url.contains("filter=statuscode%3A200"));
+    }
+
+    #[test]
+    fn uses_retry_after_seconds_for_cdx_429_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("42"));
+
+        assert_eq!(retry_after_delay(&headers, 0), Duration::from_secs(42));
+    }
+
+    #[test]
+    fn caps_retry_after_seconds_for_cdx_429_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("999999"));
+
+        assert_eq!(
+            retry_after_delay(&headers, 0),
+            Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_exponential_cdx_429_delay() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(retry_after_delay(&headers, 0), Duration::from_secs(5));
+        assert_eq!(retry_after_delay(&headers, 2), Duration::from_secs(20));
+        assert_eq!(retry_after_delay(&headers, 5), Duration::from_secs(160));
+        assert_eq!(retry_after_delay(&headers, 7), Duration::from_secs(640));
+        assert_eq!(retry_after_delay(&headers, 10), Duration::from_secs(5120));
+        assert_eq!(retry_after_delay(&headers, 11), Duration::from_secs(10240));
+        assert_eq!(retry_after_delay(&headers, 14), Duration::from_secs(81920));
+        assert_eq!(
+            retry_after_delay(&headers, 100),
+            Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS)
+        );
+    }
+
+    #[test]
+    fn formats_retry_elapsed_time() {
+        assert_eq!(format_retry_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(format_retry_elapsed(Duration::from_secs(67)), "1m 7s");
+        assert_eq!(format_retry_elapsed(Duration::from_secs(3667)), "1h 1m 7s");
+    }
+
+    #[test]
+    fn logs_first_retry_attempts_then_periodically() {
+        assert!(should_log_retry_attempt(1));
+        assert!(should_log_retry_attempt(FIRST_VERBOSE_RETRY_ATTEMPTS));
+        assert!(!should_log_retry_attempt(FIRST_VERBOSE_RETRY_ATTEMPTS + 1));
+        assert!(should_log_retry_attempt(RETRY_LOG_EVERY_ATTEMPTS));
+        assert!(!should_log_retry_attempt(RETRY_LOG_EVERY_ATTEMPTS + 1));
+    }
+
+    #[test]
+    fn formats_suppressed_retry_count() {
+        assert_eq!(format_suppressed_retries(0), "");
+        assert_eq!(
+            format_suppressed_retries(1),
+            " (1 similar retry message suppressed)"
+        );
+        assert_eq!(
+            format_suppressed_retries(9),
+            " (9 similar retry messages suppressed)"
+        );
+    }
+
+    #[test]
+    fn retries_primary_cdx_requests_indefinitely() {
+        let policy = CdxRetryPolicy::primary();
+
+        assert!(policy.should_retry_after_attempt(0));
+        assert!(policy.should_retry_after_attempt(1_000_000));
+    }
+
+    #[test]
+    fn limited_policy_stops_after_configured_attempts() {
+        let policy = CdxRetryPolicy::limited(3);
+
+        assert!(policy.should_retry_after_attempt(0));
+        assert!(policy.should_retry_after_attempt(1));
+        assert!(!policy.should_retry_after_attempt(2));
+    }
+
+    #[test]
+    fn retries_only_transient_cdx_statuses() {
+        assert!(is_retryable_cdx_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_cdx_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_cdx_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_cdx_status(StatusCode::FORBIDDEN));
     }
 }

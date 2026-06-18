@@ -1,5 +1,11 @@
+pub mod alias_repair;
 pub mod cdx;
+pub mod download_refs;
 pub mod downloader;
+pub mod link_validation;
+pub mod noise;
 pub mod output_summary;
 pub mod pathmap;
 pub mod rewrite;
+pub mod soft_redirect;
+pub mod wayback_client;

@@ -17,13 +17,23 @@ This is an early but working Rust CLI. It:
 - queries the Wayback CDX API for archived captures
 - keeps the latest capture per original URL by default
 - downloads files sequentially to keep memory use low and avoid hammering the Internet Archive
+- retries transient Wayback CDX failures indefinitely with backoff and diagnostic retry logs
 - logs each URL before downloading it
 - skips existing files by default so interrupted runs can resume
 - writes through temporary files and renames atomically after success
 - handles Ctrl-C by stopping new downloads and reporting the partial output
 - reports the output folder size and 10 biggest files at the end
+- falls back to older captures when the latest HTML capture is only a soft redirect
+- skips obvious session/query/placeholder-noise URLs by default
 - streams binary files to disk
+- downloads explicitly linked binary archives/installers and static assets from related subdomains when they fit the configured size cap
 - rewrites common HTML and CSS links to local relative paths
+- can repair an existing output directory by fetching missing static assets that are present in Wayback
+- queries Wayback directly for missing local static assets that were not present in the initial CDX result
+- creates conservative local aliases for obvious static asset filename variants, such as `screen4.jpg` to an archived `screenshot4.jpg`
+- removes broken local resource references after recovery finishes without deferred Wayback lookups
+- removes generated local anchor links when their target was not captured
+- validates generated local links after download and reports missing files
 - writes to `public/` by default, which matches GitLab Pages conventions
 
 ## Install
@@ -42,10 +52,17 @@ cargo run --release -- another.by
 
 ## Usage
 
-Download a domain and all subdomains into `public/`:
+Download one host into `public/`:
 
 ```sh
 webarchive-downloader-rust another.by
+```
+
+Download a whole domain, including subdomains, only when you explicitly want a
+multi-host archive:
+
+```sh
+webarchive-downloader-rust another.by --match-type domain
 ```
 
 Choose an output directory. If a previous run was interrupted, run the same command again and already completed files will be skipped:
@@ -58,6 +75,20 @@ Inspect selected captures without downloading:
 
 ```sh
 webarchive-downloader-rust another.by --list --limit 20
+```
+
+Validate an existing output directory without downloading or modifying files:
+
+```sh
+webarchive-downloader-rust --validate-only --output public --strict-validate-links
+```
+
+Repair an existing output directory. This fetches only recoverable missing static
+assets from Wayback, then reports assets that are not archived or exceed the size
+cap:
+
+```sh
+webarchive-downloader-rust another.by --repair-output --output public
 ```
 
 Download an older museum snapshot:
@@ -85,8 +116,15 @@ Useful options:
 --from YYYYMMDDhhmmss
 --to YYYYMMDDhhmmss
 --limit N
+--validate-only
+--repair-output
 --overwrite
 --no-rewrite
+--no-validate-links
+--strict-validate-links
+--max-extra-download-size-mib N
+--timeout-seconds N
+--ssh USER@HOST
 --user-agent "webarchive-downloader-rust/0.1 your-email@example.com"
 ```
 
@@ -116,11 +154,62 @@ Review the result locally, commit `public/`, and push to GitLab.
 
 ## Notes
 
-The default `--match-type domain` asks the CDX API for the host and subdomains. Third-party CDN assets are downloaded only when they appear in the selected CDX results.
+The default `--match-type host` asks the CDX API for one host only. This produces
+a root-level static site that is easier to host on GitLab Pages. If you use
+`--match-type domain`, subdomains are written under `_hosts/<hostname>/` so their
+paths cannot collide with the primary site.
+
+Even with `--match-type host`, the downloader follows explicit binary download
+links and static assets to related subdomains, such as
+`downloads.example.com/file.exe` or `downloads.example.com/preview/shot.jpg`,
+without crawling the whole subdomain. These extra files are stored under
+`_hosts/<hostname>/`. The default cap is 1 byte under 100 MiB per extra download
+so the output stays below common Git hosting per-file limits. Use
+`--max-extra-download-size-mib 0` to disable this pass.
 
 The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself.
 
-For very large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
+If the latest HTML capture is only a meta-refresh or JavaScript redirect, the
+downloader tries older exact captures for that URL. During that fallback it also
+skips captures that no longer look like the requested site, for example a reused
+domain whose page does not mention the original site name.
+
+The downloader skips obvious session/query/placeholder-noise URLs by default,
+such as `sid=...`, `PHPSESSID=...`, `ticket=...`, empty query strings, forum
+login/posting/profile/search/member-list action pages, forum sort/highlight/mark
+actions, and common cPanel/hosting placeholder paths like `cgi-sys/`, `img-sys/`,
+`sys_cpanel/`, `cgi-bin/`, and root `welcome.png` IIS placeholder images.
+
+After post-processing, the downloader scans local references in generated HTML,
+CSS, and common inline JavaScript strings, then reports references whose target
+file is missing. By default this is a warning so partial museum builds can still
+finish. Use `--strict-validate-links` to return exit code 2 when missing local
+links remain, or `--no-validate-links` to skip the pass.
+
+The repair pass only downloads real files that Wayback has captured. It first
+tries the site CDX result, then queries likely original URLs for each still
+missing static asset. Transient Wayback failures such as timeouts, connection
+errors, HTTP 429, and server errors are retried indefinitely with capped
+exponential backoff, so long preservation runs do not require manual reruns just
+because the Internet Archive was temporarily unavailable. This applies both to
+CDX lookups and archived snapshot downloads. When Wayback does not provide a
+`Retry-After` header, the backoff grows to a one-day cap. Retry logs include the
+attempt number, elapsed retry time, and underlying network cause. Repeated retry
+messages are compacted after the first few attempts, and long TCP connect
+failures print a periodic diagnostic telling the user to check network, firewall,
+proxy, VPN, or route access to `https://web.archive.org/`. The default request
+timeout is 900 seconds and can be changed with `--timeout-seconds`.
+
+If local Wayback access is blocked for a long time, pass `--ssh USER@HOST` to
+allow the downloader to retry through that host. The SSH tunnel is started lazily
+only after a direct Wayback request hits a retryable failure such as a timeout,
+HTTP 429, HTTP 403, or server error. It uses OpenSSH dynamic forwarding
+(`ssh -N -D`) and requires non-interactive key or SSH agent authentication;
+configure host keys and jump hosts in your normal SSH config. If recovery
+finishes without deferred static assets, remaining broken local resource
+references are removed instead of inventing placeholder content.
+
+For large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
 
 ## References
 

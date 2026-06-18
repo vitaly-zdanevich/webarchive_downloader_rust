@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use crate::cdx::CdxRecord;
 
@@ -15,10 +15,7 @@ pub struct SiteMapper {
 impl SiteMapper {
     pub fn new(input: &str) -> Result<Self> {
         let url = parse_user_url(input)?;
-        let host = url
-            .host_str()
-            .context("target URL must contain a host")?
-            .to_ascii_lowercase();
+        let host = normalize_host(url.host_str().context("target URL must contain a host")?);
 
         let mut primary_hosts = vec![host.clone()];
         if let Some(stripped) = host.strip_prefix("www.") {
@@ -39,19 +36,34 @@ impl SiteMapper {
         &self.root_host
     }
 
+    pub fn primary_hosts(&self) -> &[String] {
+        &self.primary_hosts
+    }
+
     pub fn is_primary_host(&self, host: &str) -> bool {
+        let host = normalize_host(host);
         self.primary_hosts
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(host))
+            .any(|candidate| candidate.eq_ignore_ascii_case(&host))
+    }
+
+    pub fn is_related_host(&self, host: &str) -> bool {
+        let host = normalize_host(host);
+        if self.is_primary_host(&host) {
+            return true;
+        }
+
+        let base = self
+            .root_host
+            .strip_prefix("www.")
+            .unwrap_or(&self.root_host);
+        host.ends_with(&format!(".{base}"))
     }
 
     pub fn local_path_for_url(&self, original: &str, mimetype: &str) -> Result<PathBuf> {
         let url =
             Url::parse(original).with_context(|| format!("invalid archived URL: {original}"))?;
-        let host = url
-            .host_str()
-            .unwrap_or("unknown-host")
-            .to_ascii_lowercase();
+        let host = normalize_host(url.host_str().unwrap_or("unknown-host"));
 
         let mut path = PathBuf::new();
         if !self.is_primary_host(&host) {
@@ -78,25 +90,24 @@ impl SiteMapper {
             || (should_be_html && extension_of(sanitized_segments.last().unwrap()).is_none());
         if needs_index_file {
             sanitized_segments.push("index.html".to_owned());
-        } else if should_be_html
-            && !extension_of(sanitized_segments.last().unwrap()).is_some_and(is_html_extension)
-            && let Some(last_segment) = sanitized_segments.last_mut()
-        {
-            last_segment.push_str(".html");
-        } else if extension_of(sanitized_segments.last().unwrap()).is_none()
-            && let Some(extension) = extension_for_mimetype(mimetype)
-            && let Some(last_segment) = sanitized_segments.last_mut()
-        {
-            last_segment.push('.');
-            last_segment.push_str(extension);
+        } else if let Some(last_segment) = sanitized_segments.last_mut() {
+            let current_extension = extension_of(last_segment).map(str::to_owned);
+            if should_be_html && !current_extension.as_deref().is_some_and(is_html_extension) {
+                last_segment.push_str(".html");
+            } else if let Some(extension) = extension_for_mimetype(mimetype)
+                && should_append_mimetype_extension(current_extension.as_deref(), extension)
+            {
+                last_segment.push('.');
+                last_segment.push_str(extension);
+            }
         }
 
         for segment in sanitized_segments {
             path.push(segment);
         }
 
-        if let Some(query) = url.query() {
-            append_query_hash(&mut path, query);
+        if let Some(query) = canonical_query_without_volatile_params(&url) {
+            append_query_hash(&mut path, &query);
         }
 
         Ok(path)
@@ -111,6 +122,54 @@ impl SiteMapper {
         }
         Ok(paths)
     }
+
+    pub fn original_url_candidates_for_local_path(&self, local_path: &Path) -> Vec<String> {
+        let mut components = local_path
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(component) => {
+                    Some(component.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            return Vec::new();
+        }
+
+        let hosts = if components.len() >= 3 && components[0] == "_hosts" {
+            let host = components.remove(1);
+            components.remove(0);
+            vec![host]
+        } else {
+            self.primary_hosts.clone()
+        };
+
+        let mut candidates = Vec::new();
+        for host in hosts {
+            for scheme in ["http", "https"] {
+                if let Some(candidate) = build_original_url_candidate(scheme, &host, &components) {
+                    if scheme == "http" {
+                        if let Some(path) = candidate.strip_prefix(&format!("http://{host}/")) {
+                            candidates.push(format!("http://{host}:80/{path}"));
+                        }
+                    }
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+}
+
+fn build_original_url_candidate(scheme: &str, host: &str, components: &[String]) -> Option<String> {
+    let mut url = Url::parse(&format!("{scheme}://{host}/")).ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .extend(components.iter().map(String::as_str));
+    Some(url.to_string())
 }
 
 pub fn parse_user_url(input: &str) -> Result<Url> {
@@ -127,7 +186,85 @@ pub fn normalize_lookup_url(input: &str) -> String {
         return input.to_owned();
     };
     url.set_fragment(None);
+    if let Some(host) = url.host_str() {
+        let host = normalize_host(host);
+        let _ = url.set_host(Some(&host));
+    }
+    let canonical_query = canonical_query_without_volatile_params(&url);
+    url.set_query(canonical_query.as_deref());
     url.to_string()
+}
+
+pub fn canonical_query_without_volatile_params(url: &Url) -> Option<String> {
+    let query = url.query()?;
+    if query.is_empty() {
+        return None;
+    }
+
+    let mut pairs = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            let key = normalized_query_key(&key).to_owned();
+            if is_volatile_query_key(&key) {
+                None
+            } else {
+                Some((key, value.into_owned()))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    pairs.sort();
+
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(&key, &value);
+    }
+    Some(serializer.finish())
+}
+
+pub fn is_volatile_query_key(key: &str) -> bool {
+    let key = normalized_query_key(key).to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "sid"
+            | "sessionid"
+            | "session_id"
+            | "phpsessid"
+            | "jsessionid"
+            | "aspsessionid"
+            | "cfid"
+            | "cftoken"
+            | "cron_type"
+            | "amp"
+            | "highlight"
+            | "mark"
+            | "postdays"
+            | "postorder"
+            | "sd"
+            | "sk"
+            | "ticket"
+            | "st"
+            | "view"
+    )
+}
+
+fn normalized_query_key(key: &str) -> &str {
+    if key
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("amp;"))
+    {
+        &key[4..]
+    } else {
+        key
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 pub fn relative_link(from_file: &Path, to_file: &Path) -> String {
@@ -236,6 +373,27 @@ fn extension_for_mimetype(mimetype: &str) -> Option<&'static str> {
     }
 }
 
+fn should_append_mimetype_extension(
+    current_extension: Option<&str>,
+    mimetype_extension: &str,
+) -> bool {
+    !current_extension
+        .is_some_and(|extension| extension_matches_mimetype(extension, mimetype_extension))
+}
+
+fn extension_matches_mimetype(extension: &str, mimetype_extension: &str) -> bool {
+    if extension.eq_ignore_ascii_case(mimetype_extension) {
+        return true;
+    }
+
+    match mimetype_extension {
+        "jpg" => extension.eq_ignore_ascii_case("jpeg") || extension.eq_ignore_ascii_case("jpe"),
+        "js" => extension.eq_ignore_ascii_case("mjs"),
+        "xml" => extension.eq_ignore_ascii_case("rss") || extension.eq_ignore_ascii_case("atom"),
+        _ => false,
+    }
+}
+
 fn sanitize_segment(segment: &str) -> String {
     let mut cleaned = String::with_capacity(segment.len());
     for character in segment.chars() {
@@ -290,6 +448,26 @@ mod tests {
     }
 
     #[test]
+    fn maps_trailing_dot_primary_host_to_root() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+        assert_eq!(
+            mapper
+                .local_path_for_url("http://www.example.com.:80/", "text/html")
+                .unwrap(),
+            PathBuf::from("index.html")
+        );
+    }
+
+    #[test]
+    fn detects_related_subdomains() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+
+        assert!(mapper.is_related_host("downloads.example.com"));
+        assert!(mapper.is_related_host("www.example.com"));
+        assert!(!mapper.is_related_host("notexample.com"));
+    }
+
+    #[test]
     fn maps_assets_without_forcing_index() {
         let mapper = SiteMapper::new("example.com").unwrap();
         assert_eq!(
@@ -337,6 +515,39 @@ mod tests {
     }
 
     #[test]
+    fn builds_original_url_candidates_for_primary_local_paths() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+
+        assert_eq!(
+            mapper.original_url_candidates_for_local_path(Path::new("shared/logo.gif")),
+            vec![
+                "http://example.com/shared/logo.gif".to_owned(),
+                "http://example.com:80/shared/logo.gif".to_owned(),
+                "http://www.example.com/shared/logo.gif".to_owned(),
+                "http://www.example.com:80/shared/logo.gif".to_owned(),
+                "https://example.com/shared/logo.gif".to_owned(),
+                "https://www.example.com/shared/logo.gif".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_original_url_candidates_for_host_local_paths() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+
+        assert_eq!(
+            mapper.original_url_candidates_for_local_path(Path::new(
+                "_hosts/downloads.example.com/file.exe"
+            )),
+            vec![
+                "http://downloads.example.com/file.exe".to_owned(),
+                "http://downloads.example.com:80/file.exe".to_owned(),
+                "https://downloads.example.com/file.exe".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn appends_stable_query_hash() {
         let mapper = SiteMapper::new("example.com").unwrap();
         let path = mapper
@@ -345,6 +556,51 @@ mod tests {
 
         assert!(path.to_string_lossy().starts_with("css/site__q_"));
         assert!(path.to_string_lossy().ends_with(".css"));
+    }
+
+    #[test]
+    fn maps_dynamic_css_to_static_css_and_ignores_session_query() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let stable_path = mapper
+            .local_path_for_url(
+                "http://example.com/forums/style.php?id=1&lang=en",
+                "text/css",
+            )
+            .unwrap();
+        let session_path = mapper
+            .local_path_for_url(
+                "http://example.com/forums/style.php?sid=abc&id=1&lang=en",
+                "text/css",
+            )
+            .unwrap();
+
+        assert_eq!(session_path, stable_path);
+        assert!(
+            stable_path
+                .to_string_lossy()
+                .starts_with("forums/style.php__q_")
+        );
+        assert!(stable_path.to_string_lossy().ends_with(".css"));
+    }
+
+    #[test]
+    fn normalizes_lookup_url_host_trailing_dot() {
+        assert_eq!(
+            normalize_lookup_url("http://www.example.com.:80/about#section"),
+            "http://www.example.com/about"
+        );
+    }
+
+    #[test]
+    fn normalize_lookup_url_drops_volatile_query_parameters() {
+        assert_eq!(
+            normalize_lookup_url("http://example.com/forums/style.php?sid=abc&id=1&lang=en"),
+            "http://example.com/forums/style.php?id=1&lang=en"
+        );
+        assert_eq!(
+            normalize_lookup_url("http://example.com/forums/viewtopic.php?t=1&amp;sid=abc"),
+            "http://example.com/forums/viewtopic.php?t=1"
+        );
     }
 
     #[test]
