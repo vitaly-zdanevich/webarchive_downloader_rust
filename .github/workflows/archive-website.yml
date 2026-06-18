@@ -1,0 +1,177 @@
+name: Archive website
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Domain or URL to archive. Leave empty to use ARCHIVE_TARGET repository variable."
+        required: false
+        type: string
+      match_type:
+        description: "Wayback CDX match type"
+        required: true
+        default: host
+        type: choice
+        options:
+          - host
+          - domain
+          - prefix
+          - exact
+      from:
+        description: "Earliest capture timestamp, YYYYMMDDhhmmss. Optional."
+        required: false
+        type: string
+      to:
+        description: "Latest capture timestamp, YYYYMMDDhhmmss. Optional."
+        required: false
+        type: string
+      limit:
+        description: "Maximum CDX records to read. Optional."
+        required: false
+        type: string
+      max_extra_download_size_mib:
+        description: "Maximum MiB for extra linked downloads from related subdomains."
+        required: true
+        default: "100"
+        type: string
+      ssh_destination:
+        description: "Optional SSH fallback destination. Overrides WAYBACK_SSH_DESTINATION repository variable."
+        required: false
+        type: string
+      strict_validate_links:
+        description: "Fail the run when generated local links are missing."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-website-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      ARCHIVE_TARGET: ${{ vars.ARCHIVE_TARGET }}
+      WAYBACK_SSH_DESTINATION: ${{ vars.WAYBACK_SSH_DESTINATION }}
+      WAYBACK_SSH_PRIVATE_KEY: ${{ secrets.WAYBACK_SSH_PRIVATE_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Build downloader
+        run: cargo build --release --locked
+
+      - name: Prepare SSH fallback
+        if: ${{ inputs.ssh_destination != '' || vars.WAYBACK_SSH_DESTINATION != '' }}
+        env:
+          INPUT_SSH_DESTINATION: ${{ inputs.ssh_destination }}
+        run: |
+          set -euo pipefail
+
+          ssh_destination="$INPUT_SSH_DESTINATION"
+          if [ -z "$ssh_destination" ]; then
+            ssh_destination="$WAYBACK_SSH_DESTINATION"
+          fi
+
+          if [ -z "$WAYBACK_SSH_PRIVATE_KEY" ]; then
+            echo "::error::WAYBACK_SSH_PRIVATE_KEY secret is required when SSH fallback is configured"
+            exit 2
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$WAYBACK_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh_host="${ssh_destination#*@}"
+          ssh_host="${ssh_host%%:*}"
+          ssh-keyscan -H "$ssh_host" >> ~/.ssh/known_hosts
+
+      - name: Download archive
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_FROM: ${{ inputs.from }}
+          INPUT_TO: ${{ inputs.to }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_SSH_DESTINATION: ${{ inputs.ssh_destination }}
+          STRICT_VALIDATE_LINKS: ${{ inputs.strict_validate_links }}
+        run: |
+          set -euo pipefail
+
+          target="$INPUT_TARGET"
+          if [ -z "$target" ]; then
+            target="$ARCHIVE_TARGET"
+          fi
+          if [ -z "$target" ]; then
+            echo "::error::Provide a target input or set the ARCHIVE_TARGET repository variable"
+            exit 2
+          fi
+
+          ssh_destination="$INPUT_SSH_DESTINATION"
+          if [ -z "$ssh_destination" ]; then
+            ssh_destination="$WAYBACK_SSH_DESTINATION"
+          fi
+
+          cmd=(
+            target/release/webarchive-downloader-rust
+            "$target"
+            --match-type "${{ inputs.match_type }}"
+            --output public
+            --max-extra-download-size-mib "${{ inputs.max_extra_download_size_mib }}"
+          )
+
+          if [ -n "$INPUT_FROM" ]; then
+            cmd+=(--from "$INPUT_FROM")
+          fi
+          if [ -n "$INPUT_TO" ]; then
+            cmd+=(--to "$INPUT_TO")
+          fi
+          if [ -n "$INPUT_LIMIT" ]; then
+            cmd+=(--limit "$INPUT_LIMIT")
+          fi
+          if [ "$STRICT_VALIDATE_LINKS" = "true" ]; then
+            cmd+=(--strict-validate-links)
+          fi
+          if [ -n "$ssh_destination" ]; then
+            cmd+=(--ssh "$ssh_destination")
+          fi
+
+          printf 'Running:'
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
+          "${cmd[@]}"
+
+      - name: Pack archive
+        run: tar -czf website-archive.tar.gz public
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-archive-${{ github.run_id }}
+          path: website-archive.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0

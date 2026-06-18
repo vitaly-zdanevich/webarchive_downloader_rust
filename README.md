@@ -103,6 +103,27 @@ Force a full refresh of already downloaded files:
 webarchive-downloader-rust another.by --overwrite
 ```
 
+## GitHub Actions archiver
+
+This repository includes a manual `Archive website` GitHub Actions workflow for
+small sites. Open the Actions tab, choose `Archive website`, click `Run workflow`,
+and provide a domain or URL. The workflow builds the downloader, writes the site
+to `public/`, packs `website-archive.tar.gz`, and stores it as a downloadable
+artifact for 7 days.
+
+For repeated runs, set the `ARCHIVE_TARGET` repository variable and leave the
+manual `target` input empty. Optional variables and secrets:
+
+- `ARCHIVE_TARGET`: default domain or URL to archive.
+- `WAYBACK_SSH_DESTINATION`: default SSH fallback destination, such as
+  `ubuntu@151.145.94.114`.
+- `WAYBACK_SSH_PRIVATE_KEY`: private key secret used when SSH fallback is
+  configured.
+
+GitHub-hosted runners can run one job for up to 6 hours, so this workflow is
+intended for modest sites, not multi-day domain downloads. Use a self-hosted
+runner or a VPS for larger preservation runs.
+
 During a long run, press Ctrl-C once to stop after current requests finish. Already
 completed files stay in place, incomplete temporary files are not promoted, and the
 final report still prints the output size and biggest files. Press Ctrl-C a second
