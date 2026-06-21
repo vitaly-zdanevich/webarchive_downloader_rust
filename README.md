@@ -1,5 +1,17 @@
 # webarchive-downloader-rust
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=bugs)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Duplicated Lines](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Reliability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Security](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_webarchive_downloader_rust&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_webarchive_downloader_rust)
+
 Download a static copy of a website from the Internet Archive Wayback Machine.
 
 The Cargo package and executable use kebab-case:
