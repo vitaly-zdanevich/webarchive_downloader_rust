@@ -83,6 +83,11 @@ Choose an output directory. If a previous run was interrupted, run the same comm
 webarchive-downloader-rust another.by --output public
 ```
 
+Existing non-empty files are skipped by default, and downloads are written
+through temporary files before being renamed into place. If Wayback's CDX index
+points at a snapshot that now returns a permanent missing status such as 404, the
+file is reported as an unavailable snapshot and the run continues.
+
 Inspect selected captures without downloading:
 
 ```sh
@@ -127,8 +132,9 @@ For repeated runs, set the `ARCHIVE_TARGET` repository variable and leave the
 manual `target` input empty. Optional variables and secrets:
 
 - `ARCHIVE_TARGET`: default domain or URL to archive.
-- `WAYBACK_SSH_DESTINATION`: default SSH fallback destination, such as
-  `ubuntu@151.145.94.114`.
+- `WAYBACK_SSH_DESTINATION`: default SSH fallback destination or destinations,
+  such as `ubuntu@151.145.94.114`. Use commas, spaces, or newlines to provide
+  multiple fallbacks.
 - `WAYBACK_SSH_PRIVATE_KEY`: private key secret used when SSH fallback is
   configured.
 
@@ -157,7 +163,7 @@ Useful options:
 --strict-validate-links
 --max-extra-download-size-mib N
 --timeout-seconds N
---ssh USER@HOST
+--ssh USER@HOST  (repeatable)
 --user-agent "webarchive-downloader-rust/0.1 your-email@example.com"
 ```
 
@@ -200,7 +206,7 @@ without crawling the whole subdomain. These extra files are stored under
 so the output stays below common Git hosting per-file limits. Use
 `--max-extra-download-size-mib 0` to disable this pass.
 
-The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself.
+The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes.
 
 If the latest HTML capture is only a meta-refresh or JavaScript redirect, the
 downloader tries older exact captures for that URL. During that fallback it also
@@ -215,9 +221,11 @@ actions, and common cPanel/hosting placeholder paths like `cgi-sys/`, `img-sys/`
 
 After post-processing, the downloader scans local references in generated HTML,
 CSS, and common inline JavaScript strings, then reports references whose target
-file is missing. By default this is a warning so partial museum builds can still
+file is missing. It also reports image elements that still have neither `src`
+nor `srcset`, because those cannot render but do not have a target path to
+validate. By default this is a warning so partial museum builds can still
 finish. Use `--strict-validate-links` to return exit code 2 when missing local
-links remain, or `--no-validate-links` to skip the pass.
+links or source-less images remain, or `--no-validate-links` to skip the pass.
 
 The repair pass only downloads real files that Wayback has captured. It first
 tries the site CDX result, then queries likely original URLs for each still
@@ -231,16 +239,20 @@ attempt number, elapsed retry time, and underlying network cause. Repeated retry
 messages are compacted after the first few attempts, and long TCP connect
 failures print a periodic diagnostic telling the user to check network, firewall,
 proxy, VPN, or route access to `https://web.archive.org/`. The default request
-timeout is 900 seconds and can be changed with `--timeout-seconds`.
+timeout is 900 seconds and can be changed with `--timeout-seconds`. CDX retries
+share a process-wide cooldown, so when Wayback starts returning 429s or TCP-level
+failures, later primary and recovery CDX lookups pause before sending more
+requests.
 
 If local Wayback access is blocked for a long time, pass `--ssh USER@HOST` to
-allow the downloader to retry through that host. The SSH tunnel is started lazily
-only after a direct Wayback request hits a retryable failure such as a timeout,
-HTTP 429, HTTP 403, or server error. It uses OpenSSH dynamic forwarding
-(`ssh -N -D`) and requires non-interactive key or SSH agent authentication;
-configure host keys and jump hosts in your normal SSH config. If recovery
-finishes without deferred static assets, remaining broken local resource
-references are removed instead of inventing placeholder content.
+allow the downloader to retry through that host. Repeat `--ssh` to provide
+multiple fallbacks; they are tried in order as the current route fails. SSH
+tunnels are started lazily only after a Wayback request hits a retryable failure
+such as a timeout, HTTP 429, HTTP 403, or server error. The fallback uses OpenSSH
+dynamic forwarding (`ssh -N -D`) and requires non-interactive key or SSH agent
+authentication; configure host keys and jump hosts in your normal SSH config. If
+recovery finishes without deferred static assets, remaining broken local
+resource references are removed instead of inventing placeholder content.
 
 For large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
 

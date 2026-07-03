@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,16 @@ const FIRST_VERBOSE_RETRY_ATTEMPTS: usize = 5;
 const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
 const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+static CDX_COOLDOWN: Mutex<CdxCooldown> = Mutex::new(CdxCooldown {
+    next_allowed_at: None,
+    consecutive_failures: 0,
+});
+
+struct CdxCooldown {
+    next_allowed_at: Option<Instant>,
+    consecutive_failures: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CdxRetryPolicy {
@@ -233,19 +244,24 @@ async fn send_cdx_request(
     let mut suppressed_retry_messages = 0usize;
     let mut next_connectivity_notice_after = FIRST_CONNECTIVITY_NOTICE_AFTER;
     loop {
+        wait_for_cdx_cooldown().await;
+
         let response = match client.get(search_url.clone()).send().await {
             Ok(response) => response,
             Err(error) if retry_policy.should_retry_after_attempt(attempt) => {
                 let attempt_number = attempt + 1;
                 let elapsed = started_at.elapsed();
                 let delay = retry_after_delay(&HeaderMap::new(), attempt);
-                if try_activate_ssh_client(
+                if try_switch_wayback_route(
                     client,
                     &format!("CDX API request failed: {}", format_error_chain(&error)),
                 ) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
+                }
+                if is_reqwest_connectivity_error(&error) {
+                    remember_cdx_cooldown(delay, "CDX API connection failed");
                 }
                 if should_log_retry_attempt(attempt_number) {
                     eprintln!(
@@ -287,11 +303,16 @@ async fn send_cdx_request(
             let elapsed = started_at.elapsed();
             let status = response.status();
             let delay = retry_after_delay(response.headers(), attempt);
-            if try_activate_ssh_client(client, &format!("CDX API returned {status}")) {
+            let should_switch_route =
+                !client.is_using_ssh() || matches!(status, StatusCode::TOO_MANY_REQUESTS);
+            if should_switch_route
+                && try_switch_wayback_route(client, &format!("CDX API returned {status}"))
+            {
                 attempt = 0;
                 suppressed_retry_messages = 0;
                 continue;
             }
+            remember_cdx_cooldown(delay, &format!("CDX API returned {status}"));
             if should_log_retry_attempt(attempt_number) {
                 eprintln!(
                     "Wayback CDX API returned {status} on attempt {} after {}{}; retrying in {} seconds",
@@ -310,24 +331,88 @@ async fn send_cdx_request(
         }
 
         if response.status() == StatusCode::FORBIDDEN
-            && try_activate_ssh_client(client, "CDX API returned 403 Forbidden")
+            && try_switch_wayback_route(client, "CDX API returned 403 Forbidden")
         {
             attempt = 0;
             suppressed_retry_messages = 0;
             continue;
         }
 
-        return response
+        let response = response
             .error_for_status()
-            .context("Wayback CDX API returned an error");
+            .context("Wayback CDX API returned an error")?;
+        remember_cdx_success();
+        return Ok(response);
     }
+}
+
+async fn wait_for_cdx_cooldown() {
+    loop {
+        let Some(remaining) = cdx_cooldown_remaining() else {
+            return;
+        };
+        eprintln!(
+            "Wayback CDX shared cooldown active; waiting {} before next CDX request",
+            format_retry_elapsed(remaining)
+        );
+        sleep(remaining).await;
+    }
+}
+
+fn remember_cdx_cooldown(delay: Duration, reason: &str) {
+    let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
+    let failure_index = cooldown.consecutive_failures;
+    cooldown.consecutive_failures = cooldown.consecutive_failures.saturating_add(1);
+    let global_delay = retry_after_delay(&HeaderMap::new(), failure_index);
+    let delay = delay.max(global_delay);
+    let next_allowed_at = Instant::now() + delay;
+    if cooldown
+        .next_allowed_at
+        .is_none_or(|current| next_allowed_at > current)
+    {
+        cooldown.next_allowed_at = Some(next_allowed_at);
+        eprintln!(
+            "Wayback CDX shared cooldown set to {} because {reason}",
+            format_retry_elapsed(delay)
+        );
+    }
+}
+
+fn remember_cdx_success() {
+    let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
+    cooldown.consecutive_failures = 0;
+    if cooldown
+        .next_allowed_at
+        .is_some_and(|next_allowed_at| next_allowed_at <= Instant::now())
+    {
+        cooldown.next_allowed_at = None;
+    }
+}
+
+fn cdx_cooldown_remaining() -> Option<Duration> {
+    lock_unpoisoned(&CDX_COOLDOWN)
+        .next_allowed_at
+        .and_then(|next_allowed_at| next_allowed_at.checked_duration_since(Instant::now()))
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn is_retryable_cdx_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-fn try_activate_ssh_client(client: &WaybackClient, reason: &str) -> bool {
+fn try_switch_wayback_route(client: &WaybackClient, reason: &str) -> bool {
+    if client.is_using_ssh() {
+        match client.recover_from_active_ssh_failure(reason) {
+            Ok(switched) => return switched,
+            Err(error) => {
+                eprintln!(
+                    "SSH fallback recovery failed: {error:#}; continuing current Wayback retries"
+                );
+                return false;
+            }
+        }
+    }
+
     match client.activate_ssh(reason) {
         Ok(activated) => activated,
         Err(error) => {
@@ -383,6 +468,10 @@ fn format_retry_elapsed(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn retry_after_delay(headers: &HeaderMap, attempt: usize) -> Duration {
@@ -492,6 +581,8 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
 
+    static CDX_COOLDOWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_text_cdx_line() {
         let record =
@@ -568,6 +659,48 @@ mod tests {
     }
 
     #[test]
+    fn shared_cdx_cooldown_extends_but_does_not_shorten() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+
+        remember_cdx_cooldown(Duration::from_secs(30), "test");
+        let first_deadline = cdx_cooldown_deadline_for_test().unwrap();
+
+        remember_cdx_cooldown(Duration::from_secs(5), "test");
+        assert_eq!(cdx_cooldown_deadline_for_test(), Some(first_deadline));
+
+        remember_cdx_cooldown(Duration::from_secs(60), "test");
+        assert!(cdx_cooldown_deadline_for_test().unwrap() > first_deadline);
+
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
+    fn shared_cdx_cooldown_escalates_across_distinct_requests() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+
+        remember_cdx_cooldown(Duration::from_secs(5), "test");
+        assert_eq!(cdx_cooldown_failure_count_for_test(), 1);
+        let first_remaining = cdx_cooldown_remaining().unwrap();
+        assert!(first_remaining <= Duration::from_secs(5));
+
+        remember_cdx_cooldown(Duration::from_secs(5), "test");
+        assert_eq!(cdx_cooldown_failure_count_for_test(), 2);
+        let second_remaining = cdx_cooldown_remaining().unwrap();
+        assert!(second_remaining > first_remaining);
+
+        remember_cdx_success();
+        assert_eq!(cdx_cooldown_failure_count_for_test(), 0);
+
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
     fn logs_first_retry_attempts_then_periodically() {
         assert!(should_log_retry_attempt(1));
         assert!(should_log_retry_attempt(FIRST_VERBOSE_RETRY_ATTEMPTS));
@@ -612,5 +745,19 @@ mod tests {
         assert!(is_retryable_cdx_status(StatusCode::BAD_GATEWAY));
         assert!(!is_retryable_cdx_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_cdx_status(StatusCode::FORBIDDEN));
+    }
+
+    fn cdx_cooldown_deadline_for_test() -> Option<Instant> {
+        lock_unpoisoned(&CDX_COOLDOWN).next_allowed_at
+    }
+
+    fn cdx_cooldown_failure_count_for_test() -> usize {
+        lock_unpoisoned(&CDX_COOLDOWN).consecutive_failures
+    }
+
+    fn reset_cdx_cooldown_for_test() {
+        let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
+        cooldown.next_allowed_at = None;
+        cooldown.consecutive_failures = 0;
     }
 }

@@ -48,6 +48,20 @@ macro_rules! collect_javascript_attr {
     }};
 }
 
+macro_rules! collect_guarded_attr {
+    ($selector:literal, $attr:literal, $references:ident) => {{
+        let references = Rc::clone(&$references);
+        element!($selector, move |element| {
+            if let Some(value) = element.get_attribute($attr)
+                && looks_like_url_reference_or_file(&value)
+            {
+                references.borrow_mut().push(value);
+            }
+            Ok(())
+        })
+    }};
+}
+
 macro_rules! resource_attr_remover {
     ($selector:literal, $attr:literal, $root:ident, $file:ident, $removed_in_file:ident) => {{
         let removed_in_file = Rc::clone(&$removed_in_file);
@@ -79,18 +93,41 @@ macro_rules! event_attr_resource_remover {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A local reference whose rewritten target does not exist in the output tree.
 pub struct MissingLocalLink {
+    /// HTML or CSS file that contains the missing reference.
     pub source: PathBuf,
+    /// Reference text as it appeared in the source file.
     pub href: String,
+    /// Resolved local filesystem target expected by the reference.
     pub target: PathBuf,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct LinkValidationReport {
-    pub checked: usize,
-    pub missing: Vec<MissingLocalLink>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// An image element that has neither `src` nor `srcset`.
+pub struct MissingImageSource {
+    /// HTML file that contains the image element.
+    pub source: PathBuf,
+    /// Compact description of the image attributes useful for locating it.
+    pub descriptor: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Result of scanning generated local files for preservation defects.
+pub struct LinkValidationReport {
+    /// Number of local URL references checked for an existing target.
+    pub checked: usize,
+    /// Local URL references whose target does not exist.
+    pub missing: Vec<MissingLocalLink>,
+    /// Image elements that cannot render because no source attribute exists.
+    pub missing_image_sources: Vec<MissingImageSource>,
+}
+
+/// Validates local references in generated HTML and CSS files.
+///
+/// The scan checks ordinary attributes, `srcset`, inline CSS, CSS files, common
+/// JavaScript string references, legacy applet/object attributes, meta refresh
+/// targets, and image elements that are missing both `src` and `srcset`.
 pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
     let root = normalize_path(root);
     let mut files = Vec::new();
@@ -100,12 +137,23 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
     let mut report = LinkValidationReport::default();
     for file in files {
         let input = read_lossy(&file)?;
-        let references = if is_html_file(&file) {
-            extract_html_references(&input)
-                .with_context(|| format!("failed to parse {}", file.display()))?
-        } else {
-            extract_css_url_references(&input)
-        };
+        let references =
+            if is_html_file(&file) {
+                let html_report = extract_html_references(&input)
+                    .with_context(|| format!("failed to parse {}", file.display()))?;
+                report.missing_image_sources.extend(
+                    html_report
+                        .missing_image_sources
+                        .into_iter()
+                        .map(|descriptor| MissingImageSource {
+                            source: file.clone(),
+                            descriptor,
+                        }),
+                );
+                html_report.references
+            } else {
+                extract_css_url_references(&input)
+            };
         let mut seen_in_file = HashSet::new();
 
         for href in references {
@@ -129,6 +177,10 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
     Ok(report)
 }
 
+/// Removes missing local document links from anchor and image-map elements.
+///
+/// This post-processing step keeps the visible text/content but drops `href`
+/// attributes that point at files not present in the generated archive.
 pub fn remove_missing_local_href_links(root: &Path) -> Result<usize> {
     let root = normalize_path(root);
     let mut files = Vec::new();
@@ -182,6 +234,11 @@ pub fn remove_missing_local_href_links(root: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+/// Removes missing local resource references from HTML and CSS files.
+///
+/// This is used after recovery has exhausted Wayback lookups, so pages do not
+/// keep references to local images, scripts, stylesheets, or media files that
+/// cannot exist in the output.
 pub fn remove_missing_local_resource_references(root: &Path) -> Result<usize> {
     let root = normalize_path(root);
     let mut files = Vec::new();
@@ -386,7 +443,7 @@ fn remove_missing_javascript_string_references(
         };
         let value = &input[index + 1..end];
         if !value.contains('\\')
-            && looks_like_file_reference(value)
+            && looks_like_url_reference_or_file(value)
             && should_remove_missing_local_reference(root, file, Some(value.to_owned()))
         {
             output.push_str(&input[cursor..index + 1]);
@@ -402,27 +459,89 @@ fn remove_missing_javascript_string_references(
     (output, removed)
 }
 
-fn extract_html_references(input: &str) -> Result<Vec<String>> {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HtmlReferenceReport {
+    references: Vec<String>,
+    missing_image_sources: Vec<String>,
+}
+
+fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
     let references = Rc::new(RefCell::new(Vec::new()));
+    let missing_image_sources = Rc::new(RefCell::new(Vec::new()));
     {
         let script_text_references = Rc::clone(&references);
         let style_attr_references = Rc::clone(&references);
         let style_text_references = Rc::clone(&references);
+        let missing_image_sources_handler = Rc::clone(&missing_image_sources);
         let settings = Settings {
             element_content_handlers: vec![
                 collect_attr!("*[href]", "href", references),
                 collect_attr!("*[src]", "src", references),
+                collect_attr!("blockquote[cite]", "cite", references),
+                collect_attr!("q[cite]", "cite", references),
+                collect_attr!("del[cite]", "cite", references),
+                collect_attr!("ins[cite]", "cite", references),
                 collect_attr!("form[action]", "action", references),
                 collect_attr!("object[data]", "data", references),
+                collect_guarded_attr!("object[codebase]", "codebase", references),
+                collect_guarded_attr!("applet[code]", "code", references),
+                collect_guarded_attr!("option[value]", "value", references),
+                collect_guarded_attr!("param[value]", "value", references),
                 collect_attr!("video[poster]", "poster", references),
                 collect_attr!("*[background]", "background", references),
                 collect_srcset_attr!("*[srcset]", "srcset", references),
+                element!("applet[archive]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if let Some(value) = element.get_attribute("archive") {
+                            references.borrow_mut().extend(
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|value| looks_like_url_reference_or_file(value))
+                                    .map(str::to_owned),
+                            );
+                        }
+                        Ok(())
+                    }
+                }),
+                element!("meta[http-equiv][content]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if element
+                            .get_attribute("http-equiv")
+                            .is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
+                            && let Some(value) = element.get_attribute("content")
+                            && let Some(reference) = extract_meta_refresh_reference(&value)
+                        {
+                            references.borrow_mut().push(reference);
+                        }
+                        Ok(())
+                    }
+                }),
                 collect_javascript_attr!("*[onclick]", "onclick", references),
+                collect_javascript_attr!("*[onfocus]", "onfocus", references),
+                collect_javascript_attr!("*[onblur]", "onblur", references),
+                collect_javascript_attr!("*[onchange]", "onchange", references),
                 collect_javascript_attr!("*[onload]", "onload", references),
                 collect_javascript_attr!("*[onmousedown]", "onmousedown", references),
                 collect_javascript_attr!("*[onmouseout]", "onmouseout", references),
                 collect_javascript_attr!("*[onmouseover]", "onmouseover", references),
                 collect_javascript_attr!("*[onmouseup]", "onmouseup", references),
+                element!("img", move |element| {
+                    if element
+                        .get_attribute("src")
+                        .is_none_or(|value| value.trim().is_empty())
+                        && element
+                            .get_attribute("srcset")
+                            .is_none_or(|value| value.trim().is_empty())
+                    {
+                        missing_image_sources_handler
+                            .borrow_mut()
+                            .push(describe_img_without_source(element));
+                    }
+                    Ok(())
+                }),
                 element!("*[style]", move |element| {
                     if let Some(value) = element.get_attribute("style") {
                         style_attr_references
@@ -452,9 +571,57 @@ fn extract_html_references(input: &str) -> Result<Vec<String>> {
         rewriter.end()?;
     }
 
-    Rc::try_unwrap(references)
+    let references = Rc::try_unwrap(references)
         .map_err(|_| anyhow!("HTML reference collector still has outstanding references"))
-        .map(RefCell::into_inner)
+        .map(RefCell::into_inner)?;
+    let missing_image_sources = Rc::try_unwrap(missing_image_sources)
+        .map_err(|_| anyhow!("HTML image-source collector still has outstanding references"))
+        .map(RefCell::into_inner)?;
+
+    Ok(HtmlReferenceReport {
+        references,
+        missing_image_sources,
+    })
+}
+
+fn describe_img_without_source(element: &lol_html::html_content::Element<'_, '_>) -> String {
+    let mut parts = Vec::new();
+    for attr in ["id", "name", "alt", "width", "height", "class"] {
+        if let Some(value) = element.get_attribute(attr) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                parts.push(format!("{attr}={trimmed:?}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "img".to_owned()
+    } else {
+        format!("img {}", parts.join(" "))
+    }
+}
+
+fn extract_meta_refresh_reference(input: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let url_marker = lower.find("url=")?;
+    let value_start = url_marker + 4;
+    let leading_ws = input[value_start..]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let value_start = value_start + leading_ws;
+    let rest = &input[value_start..];
+    if let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
+        let quoted_start = value_start + quote.len_utf8();
+        let relative_end = input[quoted_start..].find(quote)?;
+        Some(input[quoted_start..quoted_start + relative_end].to_owned())
+    } else {
+        let end = rest
+            .find(|character: char| character == ';' || character.is_whitespace())
+            .unwrap_or(rest.len());
+        (!rest[..end].is_empty()).then(|| rest[..end].to_owned())
+    }
 }
 
 fn extract_css_url_references(input: &str) -> Vec<String> {
@@ -499,7 +666,7 @@ fn extract_javascript_string_references(input: &str) -> Vec<String> {
             break;
         };
         let value = &input[index + 1..end];
-        if looks_like_file_reference(value) {
+        if looks_like_url_reference_or_file(value) {
             references.push(value.to_owned());
         }
         index = end + 1;
@@ -529,6 +696,27 @@ fn find_javascript_string_end(bytes: &[u8], quote: u8, start: usize) -> Option<u
     None
 }
 
+fn looks_like_url_reference_or_file(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && !trimmed.contains('\\')
+        && !trimmed.contains(char::is_whitespace)
+        && !should_skip_reference(trimmed)
+        && !is_dynamic_action_reference(trimmed)
+        && ((trimmed.starts_with('/') && !trimmed.starts_with("//"))
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || looks_like_file_reference(trimmed))
+}
+
+fn is_dynamic_action_reference(value: &str) -> bool {
+    let path = strip_query_and_fragment(value).to_ascii_lowercase();
+    path == "/cgi-bin" || path.starts_with("/cgi-bin/") || path.contains("/cgi-bin/")
+}
+
 fn looks_like_file_reference(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -555,6 +743,7 @@ fn is_common_reference_extension(extension: &str) -> bool {
         extension.to_ascii_lowercase().as_str(),
         "7z" | "avi"
             | "bmp"
+            | "class"
             | "css"
             | "exe"
             | "gif"
@@ -844,6 +1033,59 @@ mod tests {
 
         assert_eq!(report.checked, 1);
         assert!(report.missing.is_empty());
+    }
+
+    #[test]
+    fn validates_dropdown_srcset_meta_refresh_and_legacy_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("pc/game")).unwrap();
+        fs::create_dir_all(root.join("img")).unwrap();
+        fs::create_dir_all(root.join("java")).unwrap();
+        fs::write(root.join("pc/game/index.htm"), "game").unwrap();
+        fs::write(root.join("about.html"), "about").unwrap();
+        fs::write(root.join("img/small.png"), "small").unwrap();
+        fs::write(root.join("img/large.png"), "large").unwrap();
+        fs::write(root.join("movie.swf"), "movie").unwrap();
+        fs::write(root.join("java/game.jar"), "jar").unwrap();
+        fs::write(
+            root.join("index.html"),
+            r#"<select><option value="/pc/game/index.htm">Game</option><option value="Action">Action</option></select><img srcset="img/small.png 1x, img/large.png 2x"><meta http-equiv="refresh" content="0; url=about.html"><param value="movie.swf"><applet archive="java/game.jar"></applet>"#,
+        )
+        .unwrap();
+
+        let report = validate_local_links(root).unwrap();
+
+        assert_eq!(report.checked, 6);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert!(report.missing_image_sources.is_empty());
+    }
+
+    #[test]
+    fn reports_images_without_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(
+            root.join("index.html"),
+            r#"<img name="webgames" alt="Web games"><img src="ok.gif">"#,
+        )
+        .unwrap();
+        fs::write(root.join("ok.gif"), "gif").unwrap();
+
+        let report = validate_local_links(root).unwrap();
+
+        assert_eq!(report.checked, 1);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.missing_image_sources.len(), 1);
+        assert_eq!(
+            report.missing_image_sources[0].source,
+            root.join("index.html")
+        );
+        assert!(
+            report.missing_image_sources[0]
+                .descriptor
+                .contains(r#"name="webgames""#)
+        );
     }
 
     #[test]

@@ -15,30 +15,27 @@ pub struct WaybackClient {
 struct WaybackClientInner {
     direct: Client,
     active: Mutex<ActiveWaybackClient>,
-    ssh_fallback: Option<SshFallback>,
+    ssh_fallbacks: Vec<SshFallback>,
 }
 
 enum ActiveWaybackClient {
     Direct,
-    Ssh(Client),
+    Ssh { index: usize, client: Client },
 }
 
 impl WaybackClient {
-    pub fn new(
-        user_agent: &str,
-        timeout: Duration,
-        ssh_destination: Option<String>,
-    ) -> Result<Self> {
+    pub fn new(user_agent: &str, timeout: Duration, ssh_destinations: Vec<String>) -> Result<Self> {
         let direct = build_reqwest_client(user_agent, timeout, None)?;
-        let ssh_fallback = ssh_destination
+        let ssh_fallbacks = ssh_destinations
+            .into_iter()
             .map(|destination| SshFallback::new(destination, user_agent.to_owned(), timeout))
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             inner: Arc::new(WaybackClientInner {
                 direct,
                 active: Mutex::new(ActiveWaybackClient::Direct),
-                ssh_fallback,
+                ssh_fallbacks,
             }),
         })
     }
@@ -48,35 +45,98 @@ impl WaybackClient {
     }
 
     pub fn activate_ssh(&self, reason: &str) -> Result<bool> {
-        let Some(ssh_fallback) = &self.inner.ssh_fallback else {
+        if self.inner.ssh_fallbacks.is_empty() {
             return Ok(false);
         };
 
         let mut active = lock_unpoisoned(&self.inner.active);
-        if matches!(*active, ActiveWaybackClient::Ssh(_)) {
-            return Ok(false);
-        }
+        let start_index = match &*active {
+            ActiveWaybackClient::Direct => 0,
+            ActiveWaybackClient::Ssh { index, .. } => index.saturating_add(1),
+        };
 
-        let Some(client) = ssh_fallback.client()? else {
+        self.activate_ssh_from(&mut active, start_index, reason)
+    }
+
+    /// Marks the currently active SSH route as unusable and switches route.
+    ///
+    /// This is used when the SOCKS proxy is alive but the remote SSH side cannot
+    /// connect to Wayback, which appears as SOCKS handshake or channel-open
+    /// failures. If no later SSH fallback is available, the client returns to
+    /// direct Wayback access so retries do not stay pinned to a broken tunnel.
+    pub fn recover_from_active_ssh_failure(&self, reason: &str) -> Result<bool> {
+        let mut active = lock_unpoisoned(&self.inner.active);
+        let ActiveWaybackClient::Ssh { index, .. } = &*active else {
             return Ok(false);
         };
+        let failed_index = *index;
+        let failed = &self.inner.ssh_fallbacks[failed_index];
+        failed.mark_failed();
         eprintln!(
-            "Wayback unavailable via direct connection ({reason}); retrying through SSH tunnel {}",
-            ssh_fallback.destination()
+            "SSH fallback {} became unusable ({reason}); trying next configured SSH destination",
+            failed.destination()
         );
-        *active = ActiveWaybackClient::Ssh(client);
-        Ok(true)
+        *active = ActiveWaybackClient::Direct;
+        if self.activate_ssh_from(&mut active, failed_index.saturating_add(1), reason)? {
+            Ok(true)
+        } else {
+            eprintln!("No usable SSH fallback remains; continuing direct Wayback retries");
+            Ok(true)
+        }
+    }
+
+    /// Returns true when requests are currently routed through an SSH fallback.
+    pub fn is_using_ssh(&self) -> bool {
+        matches!(
+            &*lock_unpoisoned(&self.inner.active),
+            ActiveWaybackClient::Ssh { .. }
+        )
+    }
+
+    fn activate_ssh_from(
+        &self,
+        active: &mut ActiveWaybackClient,
+        start_index: usize,
+        reason: &str,
+    ) -> Result<bool> {
+        for index in start_index..self.inner.ssh_fallbacks.len() {
+            let ssh_fallback = &self.inner.ssh_fallbacks[index];
+            let client = match ssh_fallback.client() {
+                Ok(Some(client)) => client,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "SSH fallback {} failed: {error:#}; trying next configured SSH destination",
+                        ssh_fallback.destination()
+                    );
+                    continue;
+                }
+            };
+            eprintln!(
+                "Wayback unavailable via current route ({reason}); retrying through SSH tunnel {}",
+                ssh_fallback.destination()
+            );
+            *active = ActiveWaybackClient::Ssh { index, client };
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     #[cfg(test)]
     fn is_ssh_configured(&self) -> bool {
-        self.inner.ssh_fallback.is_some()
+        !self.inner.ssh_fallbacks.is_empty()
+    }
+
+    #[cfg(test)]
+    fn ssh_fallback_count(&self) -> usize {
+        self.inner.ssh_fallbacks.len()
     }
 
     fn active_client(&self) -> Client {
         match &*lock_unpoisoned(&self.inner.active) {
             ActiveWaybackClient::Direct => self.inner.direct.clone(),
-            ActiveWaybackClient::Ssh(client) => client.clone(),
+            ActiveWaybackClient::Ssh { client, .. } => client.clone(),
         }
     }
 }
@@ -140,6 +200,13 @@ impl SshFallback {
                 Err(error)
             }
         }
+    }
+
+    fn mark_failed(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.failed = true;
+        state.client = None;
+        state.tunnel = None;
     }
 
     fn start_client(&self) -> Result<(SshTunnel, Client)> {
@@ -244,11 +311,27 @@ mod tests {
         let client = WaybackClient::new(
             "webarchive-downloader-rust/0.1",
             Duration::from_secs(1),
-            None,
+            Vec::new(),
         )
         .unwrap();
 
         assert!(!client.is_ssh_configured());
+    }
+
+    #[test]
+    fn builds_with_multiple_ssh_fallbacks() {
+        let client = WaybackClient::new(
+            "webarchive-downloader-rust/0.1",
+            Duration::from_secs(1),
+            vec![
+                "ubuntu@151.145.94.114".to_owned(),
+                "ubuntu@203.0.113.10".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert!(client.is_ssh_configured());
+        assert_eq!(client.ssh_fallback_count(), 2);
     }
 
     #[test]
@@ -257,9 +340,57 @@ mod tests {
             WaybackClient::new(
                 "webarchive-downloader-rust/0.1",
                 Duration::from_secs(1),
-                Some(" ".to_owned())
+                vec![" ".to_owned()]
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn recovers_from_active_ssh_failure_without_reusing_failed_fallback() {
+        let direct = build_reqwest_client(
+            "webarchive-downloader-rust/0.1",
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+        let fallback = SshFallback::new(
+            "ubuntu@151.145.94.114".to_owned(),
+            "webarchive-downloader-rust/0.1".to_owned(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let client = WaybackClient {
+            inner: Arc::new(WaybackClientInner {
+                direct: direct.clone(),
+                active: Mutex::new(ActiveWaybackClient::Ssh {
+                    index: 0,
+                    client: direct,
+                }),
+                ssh_fallbacks: vec![fallback],
+            }),
+        };
+
+        assert!(client.is_using_ssh());
+        assert!(
+            client
+                .recover_from_active_ssh_failure("SOCKS handshake failed")
+                .unwrap()
+        );
+        assert!(!client.is_using_ssh());
+        assert!(!client.activate_ssh("retry").unwrap());
+    }
+
+    #[test]
+    fn active_ssh_recovery_is_noop_for_direct_route() {
+        let client = WaybackClient::new(
+            "webarchive-downloader-rust/0.1",
+            Duration::from_secs(1),
+            vec!["ubuntu@151.145.94.114".to_owned()],
+        )
+        .unwrap();
+
+        assert!(!client.is_using_ssh());
+        assert!(!client.recover_from_active_ssh_failure("direct").unwrap());
     }
 }

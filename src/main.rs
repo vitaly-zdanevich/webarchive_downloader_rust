@@ -97,8 +97,9 @@ struct Cli {
     timeout_seconds: u64,
 
     /// SSH destination used as a fallback SOCKS tunnel when Wayback blocks the direct connection.
+    /// Repeat to provide multiple fallback hosts.
     #[arg(long, value_name = "USER@HOST")]
-    ssh: Option<String>,
+    ssh: Vec<String>,
 }
 
 #[tokio::main]
@@ -191,7 +192,9 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
 
         let exit_code = if cancellation.is_cancelled() {
             ExitCode::from(130)
-        } else if cli.strict_validate_links && report.missing_local_links > 0 {
+        } else if cli.strict_validate_links
+            && (report.missing_local_links > 0 || report.missing_image_sources > 0)
+        {
             ExitCode::from(2)
         } else {
             ExitCode::SUCCESS
@@ -226,7 +229,9 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
 
     let exit_code = if cancellation.is_cancelled() || report.cancelled > 0 {
         ExitCode::from(130)
-    } else if cli.strict_validate_links && report.missing_local_links > 0 {
+    } else if cli.strict_validate_links
+        && (report.missing_local_links > 0 || report.missing_image_sources > 0)
+    {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
@@ -244,9 +249,10 @@ fn validate_output_dir(output_dir: &Path, strict: bool) -> Result<ExitCode> {
     })?;
 
     println!(
-        "validated {} local links; missing {}",
+        "validated {} local links; missing {}; images without source {}",
         report.checked,
-        report.missing.len()
+        report.missing.len(),
+        report.missing_image_sources.len()
     );
 
     for missing in report.missing.iter().take(20) {
@@ -270,7 +276,26 @@ fn validate_output_dir(output_dir: &Path, strict: bool) -> Result<ExitCode> {
         println!("missing local links omitted: {}", report.missing.len() - 20);
     }
 
-    if strict && !report.missing.is_empty() {
+    for missing in report.missing_image_sources.iter().take(20) {
+        let source = missing
+            .source
+            .strip_prefix(output_dir)
+            .unwrap_or(&missing.source);
+        println!(
+            "image without source: {} ({})",
+            source.display(),
+            missing.descriptor
+        );
+    }
+
+    if report.missing_image_sources.len() > 20 {
+        println!(
+            "images without source omitted: {}",
+            report.missing_image_sources.len() - 20
+        );
+    }
+
+    if strict && (!report.missing.is_empty() || !report.missing_image_sources.is_empty()) {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -323,6 +348,7 @@ fn print_repair_report(report: &webarchive_downloader_rust::downloader::RepairRe
     println!("  aliases: {}", report.aliases_created);
     println!("  checked links: {}", report.local_links_checked);
     println!("  missing links: {}", report.missing_local_links);
+    println!("  images without source: {}", report.missing_image_sources);
     println!("  output: {}", report.output_dir.display());
 }
 
@@ -333,6 +359,7 @@ fn print_stopped_report(report: &webarchive_downloader_rust::downloader::Downloa
     println!("  skipped: {}", report.skipped);
     println!("  cancelled: {}", report.cancelled);
     println!("  failed: {}", report.failed);
+    println!("  unavailable snapshots: {}", report.unavailable_snapshots);
     println!("  output: {}", report.output_dir.display());
 }
 
@@ -342,6 +369,7 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
     println!("  downloaded: {}", report.downloaded);
     println!("  skipped: {}", report.skipped);
     println!("  failed: {}", report.failed);
+    println!("  unavailable snapshots: {}", report.unavailable_snapshots);
     println!("  linked files downloaded: {}", report.extra_downloads);
     println!(
         "  linked files unavailable: {}",
@@ -376,6 +404,7 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
     println!("  aliases: {}", report.aliases_created);
     println!("  checked links: {}", report.local_links_checked);
     println!("  missing links: {}", report.missing_local_links);
+    println!("  images without source: {}", report.missing_image_sources);
     println!("  output: {}", report.output_dir.display());
 }
 
@@ -438,6 +467,27 @@ fn format_elapsed_time(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_repeated_ssh_destinations() {
+        let cli = Cli::try_parse_from([
+            "webarchive-downloader-rust",
+            "example.com",
+            "--ssh",
+            "ubuntu@151.145.94.114",
+            "--ssh",
+            "ubuntu@203.0.113.10",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.ssh,
+            vec![
+                "ubuntu@151.145.94.114".to_owned(),
+                "ubuntu@203.0.113.10".to_owned()
+            ]
+        );
+    }
 
     #[test]
     fn formats_elapsed_time() {

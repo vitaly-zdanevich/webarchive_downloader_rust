@@ -52,6 +52,7 @@ pub struct DownloadReport {
     pub skipped: usize,
     pub cancelled: usize,
     pub failed: usize,
+    pub unavailable_snapshots: usize,
     pub aliases_created: usize,
     pub extra_downloads: usize,
     pub linked_files_unavailable: usize,
@@ -65,6 +66,7 @@ pub struct DownloadReport {
     pub local_resources_removed: usize,
     pub local_links_checked: usize,
     pub missing_local_links: usize,
+    pub missing_image_sources: usize,
     pub output_dir: PathBuf,
 }
 
@@ -94,6 +96,7 @@ pub struct RepairReport {
     pub local_resources_removed: usize,
     pub local_links_checked: usize,
     pub missing_local_links: usize,
+    pub missing_image_sources: usize,
     pub output_dir: PathBuf,
 }
 
@@ -233,6 +236,10 @@ pub async fn download_site(
             }
             Ok(DownloadStatus::Skipped) => report.skipped += 1,
             Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
+            Err(error) if is_unavailable_snapshot_error(&error) => {
+                report.unavailable_snapshots += 1;
+                eprintln!("snapshot unavailable: {error:#}");
+            }
             Err(error) => {
                 report.failed += 1;
                 eprintln!("download failed: {error:#}");
@@ -293,6 +300,11 @@ pub async fn download_site(
                     }
                     Ok(DownloadStatus::Skipped) => report.skipped += 1,
                     Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
+                    Err(error) if is_unavailable_snapshot_error(&error) => {
+                        report.unavailable_snapshots += 1;
+                        report.linked_files_unavailable += 1;
+                        eprintln!("linked file snapshot unavailable: {error:#}");
+                    }
                     Err(error) => {
                         report.failed += 1;
                         eprintln!("download failed: {error:#}");
@@ -402,10 +414,12 @@ pub async fn download_site(
         let validation_report = validate_local_links(&options.output_dir)?;
         report.local_links_checked = validation_report.checked;
         report.missing_local_links = validation_report.missing.len();
+        report.missing_image_sources = validation_report.missing_image_sources.len();
         println!(
-            "validated {} local links; missing {}",
+            "validated {} local links; missing {}; images without source {}",
             validation_report.checked,
-            validation_report.missing.len()
+            validation_report.missing.len(),
+            validation_report.missing_image_sources.len()
         );
 
         for missing in validation_report.missing.iter().take(20) {
@@ -429,6 +443,25 @@ pub async fn download_site(
             println!(
                 "missing local links omitted: {}",
                 validation_report.missing.len() - 20
+            );
+        }
+
+        for missing in validation_report.missing_image_sources.iter().take(20) {
+            let source = missing
+                .source
+                .strip_prefix(&options.output_dir)
+                .unwrap_or(&missing.source);
+            println!(
+                "image without source: {} ({})",
+                source.display(),
+                missing.descriptor
+            );
+        }
+
+        if validation_report.missing_image_sources.len() > 20 {
+            println!(
+                "images without source omitted: {}",
+                validation_report.missing_image_sources.len() - 20
             );
         }
     }
@@ -564,10 +597,12 @@ pub async fn repair_output_dir(
         let validation_report = validate_local_links(&options.output_dir)?;
         report.local_links_checked = validation_report.checked;
         report.missing_local_links = validation_report.missing.len();
+        report.missing_image_sources = validation_report.missing_image_sources.len();
         println!(
-            "validated {} local links; missing {}",
+            "validated {} local links; missing {}; images without source {}",
             validation_report.checked,
-            validation_report.missing.len()
+            validation_report.missing.len(),
+            validation_report.missing_image_sources.len()
         );
 
         for missing in validation_report.missing.iter().take(20) {
@@ -591,6 +626,25 @@ pub async fn repair_output_dir(
             println!(
                 "missing local links omitted: {}",
                 validation_report.missing.len() - 20
+            );
+        }
+
+        for missing in validation_report.missing_image_sources.iter().take(20) {
+            let source = missing
+                .source
+                .strip_prefix(&options.output_dir)
+                .unwrap_or(&missing.source);
+            println!(
+                "image without source: {} ({})",
+                source.display(),
+                missing.descriptor
+            );
+        }
+
+        if validation_report.missing_image_sources.len() > 20 {
+            println!(
+                "images without source omitted: {}",
+                validation_report.missing_image_sources.len() - 20
             );
         }
     }
@@ -2068,11 +2122,36 @@ fn is_retryable_snapshot_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn is_unavailable_snapshot_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::GONE | StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+    )
+}
+
+fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .is_some_and(is_unavailable_snapshot_status)
+    })
+}
+
 fn try_activate_ssh_for_snapshot_status(
     client: &WaybackClient,
     record: &CdxRecord,
     status: StatusCode,
 ) -> bool {
+    if client.is_using_ssh()
+        && !matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+        )
+    {
+        return false;
+    }
+
     try_activate_ssh_client(
         client,
         &format!("snapshot for {} returned {status}", record.original),
@@ -2095,6 +2174,18 @@ fn try_activate_ssh_for_snapshot_error(
 }
 
 fn try_activate_ssh_client(client: &WaybackClient, reason: &str) -> bool {
+    if client.is_using_ssh() {
+        match client.recover_from_active_ssh_failure(reason) {
+            Ok(switched) => return switched,
+            Err(error) => {
+                eprintln!(
+                    "SSH fallback recovery failed: {error:#}; continuing current Wayback retries"
+                );
+                return false;
+            }
+        }
+    }
+
     match client.activate_ssh(reason) {
         Ok(activated) => activated,
         Err(error) => {
@@ -2547,9 +2638,9 @@ pub fn snapshot_url(archive_root: &Url, record: &CdxRecord) -> Result<Url> {
 pub fn build_client(
     user_agent: &str,
     timeout: Duration,
-    ssh_destination: Option<String>,
+    ssh_destinations: Vec<String>,
 ) -> Result<WaybackClient> {
-    WaybackClient::new(user_agent, timeout, ssh_destination)
+    WaybackClient::new(user_agent, timeout, ssh_destinations)
 }
 
 #[cfg(test)]
@@ -2581,6 +2672,20 @@ mod tests {
         assert!(is_retryable_snapshot_status(StatusCode::BAD_GATEWAY));
         assert!(!is_retryable_snapshot_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_snapshot_status(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn classifies_permanently_unavailable_snapshot_statuses() {
+        assert!(is_unavailable_snapshot_status(StatusCode::NOT_FOUND));
+        assert!(is_unavailable_snapshot_status(StatusCode::GONE));
+        assert!(is_unavailable_snapshot_status(
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        ));
+        assert!(!is_unavailable_snapshot_status(StatusCode::FORBIDDEN));
+        assert!(!is_unavailable_snapshot_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!is_unavailable_snapshot_status(StatusCode::BAD_GATEWAY));
     }
 
     #[test]

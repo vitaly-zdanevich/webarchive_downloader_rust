@@ -35,7 +35,7 @@ on:
         default: "100"
         type: string
       ssh_destination:
-        description: "Optional SSH fallback destination. Overrides WAYBACK_SSH_DESTINATION repository variable."
+        description: "Optional SSH fallback destination(s). Overrides WAYBACK_SSH_DESTINATION repository variable."
         required: false
         type: string
       strict_validate_links:
@@ -96,6 +96,20 @@ jobs:
             ssh_destination="$WAYBACK_SSH_DESTINATION"
           fi
 
+          parse_ssh_destinations() {
+            local raw="${1//$'\r'/}"
+            raw="${raw//,/ }"
+            SSH_DESTINATIONS=()
+            local line destination
+            while IFS= read -r line; do
+              for destination in $line; do
+                SSH_DESTINATIONS+=("$destination")
+              done
+            done <<< "$raw"
+          }
+
+          parse_ssh_destinations "$ssh_destination"
+
           if [ -z "$WAYBACK_SSH_PRIVATE_KEY" ]; then
             echo "::error::WAYBACK_SSH_PRIVATE_KEY secret is required when SSH fallback is configured"
             exit 2
@@ -106,9 +120,11 @@ jobs:
           printf '%s\n' "$WAYBACK_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          ssh_host="${ssh_destination#*@}"
-          ssh_host="${ssh_host%%:*}"
-          ssh-keyscan -H "$ssh_host" >> ~/.ssh/known_hosts
+          for ssh_destination in "${SSH_DESTINATIONS[@]}"; do
+            ssh_host="${ssh_destination#*@}"
+            ssh_host="${ssh_host%%:*}"
+            ssh-keyscan -H "$ssh_host" >> ~/.ssh/known_hosts
+          done
 
       - name: Download archive
         env:
@@ -135,6 +151,20 @@ jobs:
             ssh_destination="$WAYBACK_SSH_DESTINATION"
           fi
 
+          parse_ssh_destinations() {
+            local raw="${1//$'\r'/}"
+            raw="${raw//,/ }"
+            SSH_DESTINATIONS=()
+            local line destination
+            while IFS= read -r line; do
+              for destination in $line; do
+                SSH_DESTINATIONS+=("$destination")
+              done
+            done <<< "$raw"
+          }
+
+          parse_ssh_destinations "$ssh_destination"
+
           cmd=(
             target/release/webarchive-downloader-rust
             "$target"
@@ -155,9 +185,9 @@ jobs:
           if [ "$STRICT_VALIDATE_LINKS" = "true" ]; then
             cmd+=(--strict-validate-links)
           fi
-          if [ -n "$ssh_destination" ]; then
+          for ssh_destination in "${SSH_DESTINATIONS[@]}"; do
             cmd+=(--ssh "$ssh_destination")
-          fi
+          done
 
           printf 'Running:'
           printf ' %q' "${cmd[@]}"
