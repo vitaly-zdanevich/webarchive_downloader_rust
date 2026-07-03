@@ -242,7 +242,9 @@ proxy, VPN, or route access to `https://web.archive.org/`. The default request
 timeout is 900 seconds and can be changed with `--timeout-seconds`. CDX retries
 share a process-wide cooldown, so when Wayback starts returning 429s or TCP-level
 failures, later primary and recovery CDX lookups pause before sending more
-requests.
+requests. The CDX throttle is intentionally sticky: a single successful CDX
+response does not reset it, and it only decays after a quiet period without CDX
+throttling.
 
 If local Wayback access is blocked for a long time, pass `--ssh USER@HOST` to
 allow the downloader to retry through that host. Repeat `--ssh` to provide

@@ -19,15 +19,18 @@ const FIRST_VERBOSE_RETRY_ATTEMPTS: usize = 5;
 const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
 const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CDX_THROTTLE_DECAY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 static CDX_COOLDOWN: Mutex<CdxCooldown> = Mutex::new(CdxCooldown {
     next_allowed_at: None,
-    consecutive_failures: 0,
+    throttle_score: 0,
+    last_throttle_at: None,
 });
 
 struct CdxCooldown {
     next_allowed_at: Option<Instant>,
-    consecutive_failures: usize,
+    throttle_score: usize,
+    last_throttle_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,11 +364,16 @@ async fn wait_for_cdx_cooldown() {
 
 fn remember_cdx_cooldown(delay: Duration, reason: &str) {
     let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
-    let failure_index = cooldown.consecutive_failures;
-    cooldown.consecutive_failures = cooldown.consecutive_failures.saturating_add(1);
-    let global_delay = retry_after_delay(&HeaderMap::new(), failure_index);
+    let now = Instant::now();
+    decay_cdx_throttle(&mut cooldown, now);
+
+    let throttle_index = cooldown.throttle_score;
+    cooldown.throttle_score = cooldown.throttle_score.saturating_add(1);
+    cooldown.last_throttle_at = Some(now);
+
+    let global_delay = retry_after_delay(&HeaderMap::new(), throttle_index);
     let delay = delay.max(global_delay);
-    let next_allowed_at = Instant::now() + delay;
+    let next_allowed_at = now + delay;
     if cooldown
         .next_allowed_at
         .is_none_or(|current| next_allowed_at > current)
@@ -379,13 +387,25 @@ fn remember_cdx_cooldown(delay: Duration, reason: &str) {
 }
 
 fn remember_cdx_success() {
+    let now = Instant::now();
     let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
-    cooldown.consecutive_failures = 0;
+    decay_cdx_throttle(&mut cooldown, now);
     if cooldown
         .next_allowed_at
-        .is_some_and(|next_allowed_at| next_allowed_at <= Instant::now())
+        .is_some_and(|next_allowed_at| next_allowed_at <= now)
     {
         cooldown.next_allowed_at = None;
+    }
+}
+
+fn decay_cdx_throttle(cooldown: &mut CdxCooldown, now: Instant) {
+    if cooldown
+        .last_throttle_at
+        .and_then(|last_throttle_at| now.checked_duration_since(last_throttle_at))
+        .is_some_and(|elapsed| elapsed >= CDX_THROTTLE_DECAY_AFTER)
+    {
+        cooldown.throttle_score = 0;
+        cooldown.last_throttle_at = None;
     }
 }
 
@@ -678,24 +698,28 @@ mod tests {
     }
 
     #[test]
-    fn shared_cdx_cooldown_escalates_across_distinct_requests() {
+    fn shared_cdx_cooldown_escalates_across_intermittent_successes() {
         let _guard = CDX_COOLDOWN_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         reset_cdx_cooldown_for_test();
 
         remember_cdx_cooldown(Duration::from_secs(5), "test");
-        assert_eq!(cdx_cooldown_failure_count_for_test(), 1);
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 1);
         let first_remaining = cdx_cooldown_remaining().unwrap();
         assert!(first_remaining <= Duration::from_secs(5));
 
+        remember_cdx_success();
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 1);
+
         remember_cdx_cooldown(Duration::from_secs(5), "test");
-        assert_eq!(cdx_cooldown_failure_count_for_test(), 2);
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 2);
         let second_remaining = cdx_cooldown_remaining().unwrap();
         assert!(second_remaining > first_remaining);
 
+        age_cdx_throttle_for_test(CDX_THROTTLE_DECAY_AFTER + Duration::from_secs(1));
         remember_cdx_success();
-        assert_eq!(cdx_cooldown_failure_count_for_test(), 0);
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 0);
 
         reset_cdx_cooldown_for_test();
     }
@@ -751,13 +775,18 @@ mod tests {
         lock_unpoisoned(&CDX_COOLDOWN).next_allowed_at
     }
 
-    fn cdx_cooldown_failure_count_for_test() -> usize {
-        lock_unpoisoned(&CDX_COOLDOWN).consecutive_failures
+    fn cdx_cooldown_throttle_score_for_test() -> usize {
+        lock_unpoisoned(&CDX_COOLDOWN).throttle_score
+    }
+
+    fn age_cdx_throttle_for_test(age: Duration) {
+        lock_unpoisoned(&CDX_COOLDOWN).last_throttle_at = Some(Instant::now() - age);
     }
 
     fn reset_cdx_cooldown_for_test() {
         let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
         cooldown.next_allowed_at = None;
-        cooldown.consecutive_failures = 0;
+        cooldown.throttle_score = 0;
+        cooldown.last_throttle_at = None;
     }
 }
