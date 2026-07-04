@@ -144,6 +144,8 @@ const MAX_ALTERNATE_PAGE_CAPTURE_CHECKS: usize = 20;
 const MAX_EXTRA_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const MAX_STATIC_ASSET_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const MAX_ALTERNATE_CDX_CONNECTIVITY_FAILURES: usize = 3;
+const SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS: usize = 5;
+const MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS: usize = 20;
 const FIRST_VERBOSE_SNAPSHOT_RETRY_ATTEMPTS: usize = 5;
 const SNAPSHOT_RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 
@@ -840,6 +842,7 @@ async fn download_one(
             archive_root,
             &job.record,
             &destination,
+            fallback_options,
             &options.cancellation,
         )
         .await?;
@@ -1018,6 +1021,7 @@ async fn recover_missing_static_assets(
             &record,
             &destination,
             max_bytes,
+            Some(fallback_options),
             cancellation,
         )
         .await?
@@ -1188,6 +1192,7 @@ async fn create_missing_static_asset_aliases_from_alternate_pages(
                 if create_static_asset_alias_from_candidate(
                     client,
                     archive_root,
+                    fallback_options,
                     recovery_records_by_path,
                     &output_dir,
                     &request.target,
@@ -1335,6 +1340,7 @@ async fn alternate_text_records_for_source(
 async fn create_static_asset_alias_from_candidate(
     client: &WaybackClient,
     archive_root: &Url,
+    fallback_options: &FallbackOptions,
     recovery_records_by_path: &HashMap<PathBuf, CdxRecord>,
     output_dir: &Path,
     target: &Path,
@@ -1354,6 +1360,7 @@ async fn create_static_asset_alias_from_candidate(
     let Some(source) = ensure_static_asset_alias_source(
         client,
         archive_root,
+        fallback_options,
         recovery_records_by_path,
         output_dir,
         candidate,
@@ -1384,6 +1391,7 @@ async fn create_static_asset_alias_from_candidate(
 async fn ensure_static_asset_alias_source(
     client: &WaybackClient,
     archive_root: &Url,
+    fallback_options: &FallbackOptions,
     recovery_records_by_path: &HashMap<PathBuf, CdxRecord>,
     output_dir: &Path,
     candidate: &Path,
@@ -1415,6 +1423,7 @@ async fn ensure_static_asset_alias_source(
         record,
         &source,
         max_bytes,
+        Some(fallback_options),
         cancellation,
     )
     .await?
@@ -1856,26 +1865,51 @@ async fn download_record_to_file(
     archive_root: &Url,
     record: &CdxRecord,
     destination: &Path,
+    fallback_options: &FallbackOptions,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
-    let snapshot_url = snapshot_url(archive_root, record)?;
+    let mut current_record = record.clone();
+    let mut snapshot_url = snapshot_url(archive_root, &current_record)?;
     let mut attempt = 0usize;
-    let started_at = Instant::now();
+    let mut started_at = Instant::now();
     let mut suppressed_retry_messages = 0usize;
+    let mut seen_records = HashSet::new();
+    let mut alternate_switches = 0usize;
+    remember_snapshot_record(&mut seen_records, &current_record);
 
     loop {
-        match fetch_snapshot_response_once(client, &snapshot_url, record).await {
+        match fetch_snapshot_response_once(client, &snapshot_url, &current_record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
                 match stream_response_to_file(response, destination).await {
                     Ok(()) => return Ok(()),
                     Err(error) if is_retryable_snapshot_error(&error) => {
-                        if try_activate_ssh_for_snapshot_error(client, record, &error) {
+                        if try_activate_ssh_for_snapshot_error(client, &current_record, &error) {
                             attempt = 0;
                             suppressed_retry_messages = 0;
                             continue;
                         }
+                        if maybe_switch_to_alternate_snapshot(
+                            client,
+                            archive_root,
+                            Some(fallback_options),
+                            &mut current_record,
+                            &mut snapshot_url,
+                            &mut seen_records,
+                            &mut alternate_switches,
+                            None,
+                            attempt,
+                            &error,
+                            cancellation,
+                        )
+                        .await?
+                        {
+                            attempt = 0;
+                            started_at = Instant::now();
+                            suppressed_retry_messages = 0;
+                            continue;
+                        }
                         retry_snapshot_after_error(
-                            record,
+                            &current_record,
                             &mut attempt,
                             started_at,
                             &mut suppressed_retry_messages,
@@ -1888,13 +1922,13 @@ async fn download_record_to_file(
                 }
             }
             Ok(SnapshotResponseAttempt::RetryStatus { status, headers }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_status(
-                    record,
+                    &current_record,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
@@ -1905,21 +1939,41 @@ async fn download_record_to_file(
                 .await?;
             }
             Ok(SnapshotResponseAttempt::SshFallbackStatus { status }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
-                bail!("Wayback returned {status} for {}", record.original);
+                bail!("Wayback returned {status} for {}", current_record.original);
             }
             Err(error) if is_retryable_snapshot_error(&error) => {
-                if try_activate_ssh_for_snapshot_error(client, record, &error) {
+                if try_activate_ssh_for_snapshot_error(client, &current_record, &error) {
                     attempt = 0;
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                if maybe_switch_to_alternate_snapshot(
+                    client,
+                    archive_root,
+                    Some(fallback_options),
+                    &mut current_record,
+                    &mut snapshot_url,
+                    &mut seen_records,
+                    &mut alternate_switches,
+                    None,
+                    attempt,
+                    &error,
+                    cancellation,
+                )
+                .await?
+                {
+                    attempt = 0;
+                    started_at = Instant::now();
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_error(
-                    record,
+                    &current_record,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
@@ -1939,26 +1993,51 @@ async fn download_record_to_file_limited(
     record: &CdxRecord,
     destination: &Path,
     max_bytes: u64,
+    fallback_options: Option<&FallbackOptions>,
     cancellation: &CancellationFlag,
 ) -> Result<bool> {
-    let snapshot_url = snapshot_url(archive_root, record)?;
+    let mut current_record = record.clone();
+    let mut snapshot_url = snapshot_url(archive_root, &current_record)?;
     let mut attempt = 0usize;
-    let started_at = Instant::now();
+    let mut started_at = Instant::now();
     let mut suppressed_retry_messages = 0usize;
+    let mut seen_records = HashSet::new();
+    let mut alternate_switches = 0usize;
+    remember_snapshot_record(&mut seen_records, &current_record);
 
     loop {
-        match fetch_snapshot_response_once(client, &snapshot_url, record).await {
+        match fetch_snapshot_response_once(client, &snapshot_url, &current_record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
                 match stream_response_to_file_limited(response, destination, max_bytes).await {
                     Ok(downloaded) => return Ok(downloaded),
                     Err(error) if is_retryable_snapshot_error(&error) => {
-                        if try_activate_ssh_for_snapshot_error(client, record, &error) {
+                        if try_activate_ssh_for_snapshot_error(client, &current_record, &error) {
                             attempt = 0;
                             suppressed_retry_messages = 0;
                             continue;
                         }
+                        if maybe_switch_to_alternate_snapshot(
+                            client,
+                            archive_root,
+                            fallback_options,
+                            &mut current_record,
+                            &mut snapshot_url,
+                            &mut seen_records,
+                            &mut alternate_switches,
+                            Some(max_bytes),
+                            attempt,
+                            &error,
+                            cancellation,
+                        )
+                        .await?
+                        {
+                            attempt = 0;
+                            started_at = Instant::now();
+                            suppressed_retry_messages = 0;
+                            continue;
+                        }
                         retry_snapshot_after_error(
-                            record,
+                            &current_record,
                             &mut attempt,
                             started_at,
                             &mut suppressed_retry_messages,
@@ -1971,13 +2050,13 @@ async fn download_record_to_file_limited(
                 }
             }
             Ok(SnapshotResponseAttempt::RetryStatus { status, headers }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_status(
-                    record,
+                    &current_record,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
@@ -1988,21 +2067,41 @@ async fn download_record_to_file_limited(
                 .await?;
             }
             Ok(SnapshotResponseAttempt::SshFallbackStatus { status }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
-                bail!("Wayback returned {status} for {}", record.original);
+                bail!("Wayback returned {status} for {}", current_record.original);
             }
             Err(error) if is_retryable_snapshot_error(&error) => {
-                if try_activate_ssh_for_snapshot_error(client, record, &error) {
+                if try_activate_ssh_for_snapshot_error(client, &current_record, &error) {
                     attempt = 0;
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                if maybe_switch_to_alternate_snapshot(
+                    client,
+                    archive_root,
+                    fallback_options,
+                    &mut current_record,
+                    &mut snapshot_url,
+                    &mut seen_records,
+                    &mut alternate_switches,
+                    Some(max_bytes),
+                    attempt,
+                    &error,
+                    cancellation,
+                )
+                .await?
+                {
+                    attempt = 0;
+                    started_at = Instant::now();
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_error(
-                    record,
+                    &current_record,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
@@ -2014,6 +2113,149 @@ async fn download_record_to_file_limited(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Switches a streaming snapshot download to another capture after repeated body read failures.
+async fn maybe_switch_to_alternate_snapshot(
+    client: &WaybackClient,
+    archive_root: &Url,
+    fallback_options: Option<&FallbackOptions>,
+    current_record: &mut CdxRecord,
+    current_snapshot_url: &mut Url,
+    seen_records: &mut HashSet<(String, String)>,
+    alternate_switches: &mut usize,
+    max_bytes: Option<u64>,
+    attempt: usize,
+    error: &anyhow::Error,
+    cancellation: &CancellationFlag,
+) -> Result<bool> {
+    let Some(fallback_options) = fallback_options else {
+        return Ok(false);
+    };
+    if !should_try_alternate_snapshot_after_error(error, attempt) {
+        return Ok(false);
+    }
+    if *alternate_switches >= MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS {
+        eprintln!(
+            "already tried {} alternate captures for {}; continuing selected capture",
+            *alternate_switches, current_record.original
+        );
+        return Ok(false);
+    }
+
+    let alternate = match find_alternate_snapshot_record(
+        client,
+        archive_root,
+        fallback_options,
+        current_record,
+        seen_records,
+        max_bytes,
+        cancellation,
+    )
+    .await
+    {
+        Ok(Some(alternate)) => alternate,
+        Ok(None) => {
+            eprintln!(
+                "no alternate capture found for {} after repeated snapshot body read failures",
+                current_record.original
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to look up alternate captures for {}: {error:#}; continuing selected capture",
+                current_record.original
+            );
+            return Ok(false);
+        }
+    };
+
+    eprintln!(
+        "snapshot for {} at {} failed repeatedly while reading bytes; trying alternate capture {} at {}",
+        current_record.original, current_record.timestamp, alternate.original, alternate.timestamp
+    );
+
+    *current_record = alternate;
+    *current_snapshot_url = snapshot_url(archive_root, current_record)?;
+    *alternate_switches = (*alternate_switches).saturating_add(1);
+    Ok(true)
+}
+
+/// Finds the next unique capture for the current original URL and date strategy.
+async fn find_alternate_snapshot_record(
+    client: &WaybackClient,
+    archive_root: &Url,
+    fallback_options: &FallbackOptions,
+    current_record: &CdxRecord,
+    seen_records: &mut HashSet<(String, String)>,
+    max_bytes: Option<u64>,
+    cancellation: &CancellationFlag,
+) -> Result<Option<CdxRecord>> {
+    for target in fallback_capture_targets(&current_record.original) {
+        let mut query = CdxQuery::new(
+            target,
+            MatchType::Exact,
+            fallback_options.strategy,
+            archive_root.clone(),
+        );
+        query.from = fallback_options.from.clone();
+        query.to = fallback_options.to.clone();
+
+        let records =
+            fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery()).await?;
+        if let Some(candidate) = alternate_snapshot_candidate_from_records(
+            records,
+            seen_records,
+            max_bytes,
+            cancellation,
+        ) {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Selects the next capture we have not already tried for this download.
+fn alternate_snapshot_candidate_from_records(
+    records: Vec<CdxRecord>,
+    seen_records: &mut HashSet<(String, String)>,
+    max_bytes: Option<u64>,
+    cancellation: &CancellationFlag,
+) -> Option<CdxRecord> {
+    for record in records {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if max_bytes.is_some_and(|limit| record.length.is_some_and(|length| length > limit)) {
+            continue;
+        }
+        if !remember_snapshot_record(seen_records, &record) {
+            continue;
+        }
+
+        return Some(record);
+    }
+
+    None
+}
+
+/// Returns true once a snapshot retry has enough body read failures to try another capture.
+fn should_try_alternate_snapshot_after_error(error: &anyhow::Error, attempt: usize) -> bool {
+    is_retryable_snapshot_body_error(error)
+        && attempt.saturating_add(1) >= SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS
+}
+
+/// Remembers a capture by timestamp and normalized original URL.
+fn remember_snapshot_record(
+    seen_records: &mut HashSet<(String, String)>,
+    record: &CdxRecord,
+) -> bool {
+    seen_records.insert((
+        record.timestamp.clone(),
+        normalize_lookup_url(&record.original),
+    ))
 }
 
 async fn fetch_snapshot_response_once(
@@ -2203,6 +2445,14 @@ fn is_retryable_snapshot_error(error: &anyhow::Error) -> bool {
                 || error.is_body()
                 || error.status().is_some_and(is_retryable_snapshot_status)
         })
+    })
+}
+
+fn is_retryable_snapshot_body_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
     })
 }
 
@@ -2706,6 +2956,51 @@ mod tests {
             snapshot_retry_after_delay(&HeaderMap::new(), 100),
             Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS)
         );
+    }
+
+    #[test]
+    fn selects_alternate_snapshot_candidate_after_skipping_known_and_oversized_captures() {
+        let current = CdxRecord {
+            timestamp: "20200101000000".to_owned(),
+            original: "http://www.example.com:80/downloads/game.exe".to_owned(),
+            mimetype: "application/octet-stream".to_owned(),
+            status_code: 200,
+            digest: "same-digest".to_owned(),
+            length: Some(100),
+        };
+        let mut seen_records = HashSet::new();
+        remember_snapshot_record(&mut seen_records, &current);
+
+        let records = vec![
+            current.clone(),
+            CdxRecord {
+                timestamp: "20200202000000".to_owned(),
+                original: "http://example.com/downloads/game.exe".to_owned(),
+                mimetype: "application/octet-stream".to_owned(),
+                status_code: 200,
+                digest: "same-digest".to_owned(),
+                length: Some(2_000),
+            },
+            CdxRecord {
+                timestamp: "20200303000000".to_owned(),
+                original: "http://example.com/downloads/game.exe".to_owned(),
+                mimetype: "application/octet-stream".to_owned(),
+                status_code: 200,
+                digest: "same-digest".to_owned(),
+                length: Some(900),
+            },
+        ];
+
+        let selected = alternate_snapshot_candidate_from_records(
+            records,
+            &mut seen_records,
+            Some(1_000),
+            &CancellationFlag::new(),
+        )
+        .unwrap();
+
+        assert_eq!(selected.timestamp, "20200303000000");
+        assert_eq!(selected.digest, "same-digest");
     }
 
     #[test]
