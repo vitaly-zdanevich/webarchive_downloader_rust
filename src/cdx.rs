@@ -20,6 +20,7 @@ const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
 const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CDX_THROTTLE_DECAY_AFTER: Duration = Duration::from_secs(10 * 60);
+const RECOVERY_CDX_MAX_ATTEMPTS: usize = 3;
 
 static CDX_COOLDOWN: Mutex<CdxCooldown> = Mutex::new(CdxCooldown {
     next_allowed_at: None,
@@ -44,7 +45,9 @@ impl CdxRetryPolicy {
     }
 
     pub const fn recovery() -> Self {
-        Self::unlimited()
+        Self {
+            max_attempts: Some(RECOVERY_CDX_MAX_ATTEMPTS),
+        }
     }
 
     pub const fn unlimited() -> Self {
@@ -778,6 +781,15 @@ mod tests {
 
         assert!(policy.should_retry_after_attempt(0));
         assert!(policy.should_retry_after_attempt(1_000_000));
+    }
+
+    #[test]
+    fn recovery_cdx_requests_are_bounded() {
+        let policy = CdxRetryPolicy::recovery();
+
+        assert!(policy.should_retry_after_attempt(0));
+        assert!(policy.should_retry_after_attempt(1));
+        assert!(!policy.should_retry_after_attempt(RECOVERY_CDX_MAX_ATTEMPTS - 1));
     }
 
     #[test]
