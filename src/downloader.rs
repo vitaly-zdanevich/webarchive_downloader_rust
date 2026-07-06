@@ -146,8 +146,48 @@ const MAX_STATIC_ASSET_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const MAX_ALTERNATE_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS: usize = 5;
 const MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS: usize = 20;
+const OPTIONAL_SNAPSHOT_MAX_ATTEMPTS: usize = 5;
 const FIRST_VERBOSE_SNAPSHOT_RETRY_ATTEMPTS: usize = 5;
 const SNAPSHOT_RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotRetryPolicy {
+    max_attempts: Option<usize>,
+}
+
+impl SnapshotRetryPolicy {
+    const fn primary() -> Self {
+        Self { max_attempts: None }
+    }
+
+    const fn optional() -> Self {
+        Self {
+            max_attempts: Some(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS),
+        }
+    }
+
+    fn should_retry_after_attempt(self, attempt: usize) -> bool {
+        self.max_attempts.is_none_or(|max| attempt + 1 < max)
+    }
+}
+
+#[derive(Debug)]
+struct DeferredSnapshotDownload {
+    original: String,
+    attempts: usize,
+}
+
+impl std::fmt::Display for DeferredSnapshotDownload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "deferred snapshot download for {} after {} attempts",
+            self.original, self.attempts
+        )
+    }
+}
+
+impl std::error::Error for DeferredSnapshotDownload {}
 
 pub async fn download_site(
     client: WaybackClient,
@@ -227,6 +267,7 @@ pub async fn download_site(
             &fallback_options,
             &known_paths,
             job,
+            SnapshotRetryPolicy::primary(),
         )
         .await;
         match result {
@@ -293,6 +334,7 @@ pub async fn download_site(
                     &fallback_options,
                     &known_paths,
                     job,
+                    SnapshotRetryPolicy::optional(),
                 )
                 .await;
                 match result {
@@ -306,6 +348,10 @@ pub async fn download_site(
                         report.unavailable_snapshots += 1;
                         report.linked_files_unavailable += 1;
                         eprintln!("linked file snapshot unavailable: {error:#}");
+                    }
+                    Err(error) if is_deferred_snapshot_error(&error) => {
+                        report.linked_files_deferred += 1;
+                        eprintln!("linked file snapshot deferred: {error:#}");
                     }
                     Err(error) => {
                         report.failed += 1;
@@ -778,6 +824,7 @@ async fn download_one(
     fallback_options: &FallbackOptions,
     known_paths: &HashMap<String, PathBuf>,
     job: DownloadJob,
+    snapshot_retry_policy: SnapshotRetryPolicy,
 ) -> Result<DownloadStatus> {
     if options.cancellation.is_cancelled() {
         return Ok(DownloadStatus::Cancelled);
@@ -843,6 +890,7 @@ async fn download_one(
             &job.record,
             &destination,
             fallback_options,
+            snapshot_retry_policy,
             &options.cancellation,
         )
         .await?;
@@ -1015,17 +1063,27 @@ async fn recover_missing_static_assets(
         }
 
         println!("{}", record.original);
-        if download_record_to_file_limited(
+        let downloaded = match download_record_to_file_limited(
             client,
             archive_root,
             &record,
             &destination,
             max_bytes,
             Some(fallback_options),
+            SnapshotRetryPolicy::optional(),
             cancellation,
         )
-        .await?
+        .await
         {
+            Ok(downloaded) => downloaded,
+            Err(error) if is_deferred_snapshot_error(&error) => {
+                report.deferred += 1;
+                eprintln!("static asset snapshot deferred: {error:#}");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if downloaded {
             report.recovered += 1;
         } else {
             report.unavailable += 1;
@@ -1417,17 +1475,26 @@ async fn ensure_static_asset_alias_source(
     }
 
     println!("{}", record.original);
-    if download_record_to_file_limited(
+    let downloaded = match download_record_to_file_limited(
         client,
         archive_root,
         record,
         &source,
         max_bytes,
         Some(fallback_options),
+        SnapshotRetryPolicy::optional(),
         cancellation,
     )
-    .await?
+    .await
     {
+        Ok(downloaded) => downloaded,
+        Err(error) if is_deferred_snapshot_error(&error) => {
+            eprintln!("static asset alias source snapshot deferred: {error:#}");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if downloaded {
         Ok(Some(source))
     } else {
         Ok(None)
@@ -1796,6 +1863,7 @@ async fn fetch_record_bytes(
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
+                            SnapshotRetryPolicy::primary(),
                             cancellation,
                         )
                         .await?;
@@ -1816,6 +1884,7 @@ async fn fetch_record_bytes(
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
+                    SnapshotRetryPolicy::primary(),
                     cancellation,
                 )
                 .await?;
@@ -1840,6 +1909,7 @@ async fn fetch_record_bytes(
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
+                    SnapshotRetryPolicy::primary(),
                     cancellation,
                 )
                 .await?;
@@ -1866,6 +1936,7 @@ async fn download_record_to_file(
     record: &CdxRecord,
     destination: &Path,
     fallback_options: &FallbackOptions,
+    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let mut current_record = record.clone();
@@ -1914,6 +1985,7 @@ async fn download_record_to_file(
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
+                            snapshot_retry_policy,
                             cancellation,
                         )
                         .await?;
@@ -1934,6 +2006,7 @@ async fn download_record_to_file(
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
+                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
@@ -1978,6 +2051,7 @@ async fn download_record_to_file(
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
+                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
@@ -1994,6 +2068,7 @@ async fn download_record_to_file_limited(
     destination: &Path,
     max_bytes: u64,
     fallback_options: Option<&FallbackOptions>,
+    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<bool> {
     let mut current_record = record.clone();
@@ -2042,6 +2117,7 @@ async fn download_record_to_file_limited(
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
+                            snapshot_retry_policy,
                             cancellation,
                         )
                         .await?;
@@ -2062,6 +2138,7 @@ async fn download_record_to_file_limited(
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
+                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
@@ -2106,6 +2183,7 @@ async fn download_record_to_file_limited(
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
+                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
@@ -2292,9 +2370,23 @@ async fn retry_snapshot_after_status(
     suppressed_retry_messages: &mut usize,
     headers: &HeaderMap,
     status: StatusCode,
+    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
+    if !snapshot_retry_policy.should_retry_after_attempt(*attempt) {
+        eprintln!(
+            "Wayback snapshot for {} returned {status} on attempt {} after {}; deferring optional snapshot download",
+            record.original,
+            attempt_number,
+            format_snapshot_retry_elapsed(started_at.elapsed())
+        );
+        return Err(anyhow::Error::new(DeferredSnapshotDownload {
+            original: record.original.clone(),
+            attempts: attempt_number,
+        }));
+    }
+
     let delay = snapshot_retry_after_delay(headers, *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
@@ -2320,9 +2412,26 @@ async fn retry_snapshot_after_error(
     started_at: Instant,
     suppressed_retry_messages: &mut usize,
     error: &anyhow::Error,
+    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
+    if !snapshot_retry_policy.should_retry_after_attempt(*attempt) {
+        eprintln!(
+            "Wayback snapshot for {} failed on attempt {} after {}{}: {}; deferring optional snapshot download",
+            record.original,
+            attempt_number,
+            format_snapshot_retry_elapsed(started_at.elapsed()),
+            format_snapshot_suppressed_retries(*suppressed_retry_messages),
+            format_anyhow_error_chain(error)
+        );
+        *suppressed_retry_messages = 0;
+        return Err(anyhow::Error::new(DeferredSnapshotDownload {
+            original: record.original.clone(),
+            attempts: attempt_number,
+        }));
+    }
+
     let delay = snapshot_retry_after_delay(&HeaderMap::new(), *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
@@ -2378,6 +2487,12 @@ fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
             .and_then(reqwest::Error::status)
             .is_some_and(is_unavailable_snapshot_status)
     })
+}
+
+fn is_deferred_snapshot_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DeferredSnapshotDownload>().is_some())
 }
 
 fn try_activate_ssh_for_snapshot_status(
@@ -2956,6 +3071,25 @@ mod tests {
             snapshot_retry_after_delay(&HeaderMap::new(), 100),
             Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS)
         );
+    }
+
+    #[test]
+    fn primary_snapshot_retries_are_unbounded_but_optional_retries_are_bounded() {
+        assert!(SnapshotRetryPolicy::primary().should_retry_after_attempt(1_000_000));
+
+        let optional = SnapshotRetryPolicy::optional();
+        assert!(optional.should_retry_after_attempt(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS - 2));
+        assert!(!optional.should_retry_after_attempt(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS - 1));
+    }
+
+    #[test]
+    fn detects_deferred_snapshot_errors() {
+        let error = anyhow::Error::new(DeferredSnapshotDownload {
+            original: "http://example.com/file.zip".to_owned(),
+            attempts: OPTIONAL_SNAPSHOT_MAX_ATTEMPTS,
+        });
+
+        assert!(is_deferred_snapshot_error(&error));
     }
 
     #[test]
