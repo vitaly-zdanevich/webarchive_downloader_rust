@@ -206,6 +206,13 @@ without crawling the whole subdomain. These extra files are stored under
 so the output stays below common Git hosting per-file limits. Use
 `--max-extra-download-size-mib 0` to disable this pass.
 
+Primary CDX discovery retries patiently because the archive cannot be built
+without it. Optional enrichment work, such as extra linked files and static
+asset recovery, is best effort: if Wayback is already forcing a long shared CDX
+cooldown, the downloader defers that optional lookup so the run can finish.
+Rerun later against the same output directory to pick up deferred files when
+Wayback allows more requests.
+
 The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes.
 
 If the latest HTML capture is only a meta-refresh or JavaScript redirect, the
