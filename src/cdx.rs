@@ -20,8 +20,6 @@ const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
 const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CDX_THROTTLE_DECAY_AFTER: Duration = Duration::from_secs(10 * 60);
-const RECOVERY_CDX_MAX_ATTEMPTS: usize = 3;
-const RECOVERY_CDX_MAX_COOLDOWN_WAIT: Duration = Duration::from_secs(2 * 60);
 
 static CDX_COOLDOWN: Mutex<CdxCooldown> = Mutex::new(CdxCooldown {
     next_allowed_at: None,
@@ -38,7 +36,6 @@ struct CdxCooldown {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CdxRetryPolicy {
     max_attempts: Option<usize>,
-    max_cooldown_wait: Option<Duration>,
 }
 
 impl CdxRetryPolicy {
@@ -47,24 +44,17 @@ impl CdxRetryPolicy {
     }
 
     pub const fn recovery() -> Self {
-        Self {
-            max_attempts: Some(RECOVERY_CDX_MAX_ATTEMPTS),
-            max_cooldown_wait: Some(RECOVERY_CDX_MAX_COOLDOWN_WAIT),
-        }
+        Self::unlimited()
     }
 
     pub const fn unlimited() -> Self {
-        Self {
-            max_attempts: None,
-            max_cooldown_wait: None,
-        }
+        Self { max_attempts: None }
     }
 
     #[cfg(test)]
     pub const fn limited(max_attempts: usize) -> Self {
         Self {
             max_attempts: Some(max_attempts),
-            max_cooldown_wait: None,
         }
     }
 
@@ -72,27 +62,6 @@ impl CdxRetryPolicy {
         self.max_attempts.is_none_or(|max| attempt + 1 < max)
     }
 }
-
-#[derive(Debug)]
-struct DeferredCdxLookup {
-    target: String,
-    cooldown: Duration,
-    max_wait: Duration,
-}
-
-impl std::fmt::Display for DeferredCdxLookup {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "deferred optional CDX lookup for {} because shared cooldown {} exceeds wait cap {}",
-            self.target,
-            format_retry_elapsed(self.cooldown),
-            format_retry_elapsed(self.max_wait)
-        )
-    }
-}
-
-impl std::error::Error for DeferredCdxLookup {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CdxRecord {
@@ -232,8 +201,55 @@ pub async fn fetch_all_records_with_policy(
     retry_policy: CdxRetryPolicy,
 ) -> Result<Vec<CdxRecord>> {
     let search_url = query.search_url()?;
-    let response = send_cdx_request(client, search_url, retry_policy).await?;
+    let mut attempt = 0usize;
+    let started_at = Instant::now();
+    let mut suppressed_retry_messages = 0usize;
 
+    loop {
+        let response = send_cdx_request(client, search_url.clone(), retry_policy).await?;
+        match read_all_cdx_records(response, query.strategy).await {
+            Ok(records) => return Ok(records),
+            Err(error)
+                if retry_policy.should_retry_after_attempt(attempt)
+                    && is_cdx_connectivity_error(&error) =>
+            {
+                let attempt_number = attempt + 1;
+                let elapsed = started_at.elapsed();
+                let mut delay = retry_after_delay(&HeaderMap::new(), attempt);
+                if try_switch_wayback_route(
+                    client,
+                    &format!("CDX API response read failed: {}", error),
+                ) {
+                    attempt = 0;
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                delay = remember_cdx_cooldown(delay, "CDX API response read failed");
+                if should_log_retry_attempt(attempt_number) {
+                    eprintln!(
+                        "Wayback CDX API response read failed on attempt {} after {}{}: {}; retrying in {} seconds",
+                        attempt_number,
+                        format_retry_elapsed(elapsed),
+                        format_suppressed_retries(suppressed_retry_messages),
+                        error,
+                        delay.as_secs()
+                    );
+                    suppressed_retry_messages = 0;
+                } else {
+                    suppressed_retry_messages = suppressed_retry_messages.saturating_add(1);
+                }
+                sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn read_all_cdx_records(
+    response: Response,
+    strategy: SnapshotStrategy,
+) -> Result<Vec<CdxRecord>> {
     let mut records = Vec::new();
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
@@ -252,15 +268,12 @@ pub async fn fetch_all_records_with_policy(
         ingest_all_cdx_line(&pending, &mut records)?;
     }
 
-    sort_records_for_strategy(&mut records, query.strategy);
+    sort_records_for_strategy(&mut records, strategy);
     Ok(records)
 }
 
 pub fn is_cdx_connectivity_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        if cause.downcast_ref::<DeferredCdxLookup>().is_some() {
-            return true;
-        }
         cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
             error.is_connect()
                 || error.is_timeout()
@@ -281,7 +294,7 @@ async fn send_cdx_request(
     let mut suppressed_retry_messages = 0usize;
     let mut next_connectivity_notice_after = FIRST_CONNECTIVITY_NOTICE_AFTER;
     loop {
-        wait_for_cdx_cooldown(&search_url, retry_policy).await?;
+        wait_for_cdx_cooldown().await;
 
         let response = match client.get(search_url.clone()).send().await {
             Ok(response) => response,
@@ -300,7 +313,6 @@ async fn send_cdx_request(
                 if is_reqwest_connectivity_error(&error) {
                     delay = remember_cdx_cooldown(delay, "CDX API connection failed");
                 }
-                enforce_cdx_cooldown_wait_cap(&search_url, retry_policy, delay, "retry delay")?;
                 if should_log_retry_attempt(attempt_number) {
                     eprintln!(
                         "Wayback CDX API request failed on attempt {} after {}{}: {}; retrying in {} seconds",
@@ -351,7 +363,6 @@ async fn send_cdx_request(
                 continue;
             }
             delay = remember_cdx_cooldown(delay, &format!("CDX API returned {status}"));
-            enforce_cdx_cooldown_wait_cap(&search_url, retry_policy, delay, "retry delay")?;
             if should_log_retry_attempt(attempt_number) {
                 eprintln!(
                     "Wayback CDX API returned {status} on attempt {} after {}{}; retrying in {} seconds",
@@ -385,44 +396,17 @@ async fn send_cdx_request(
     }
 }
 
-async fn wait_for_cdx_cooldown(search_url: &Url, retry_policy: CdxRetryPolicy) -> Result<()> {
+async fn wait_for_cdx_cooldown() {
     loop {
         let Some(remaining) = cdx_cooldown_remaining() else {
-            return Ok(());
+            return;
         };
-        enforce_cdx_cooldown_wait_cap(search_url, retry_policy, remaining, "shared cooldown")?;
         eprintln!(
             "Wayback CDX shared cooldown active; waiting {} before next CDX request",
             format_retry_elapsed(remaining)
         );
         sleep(remaining).await;
     }
-}
-
-fn enforce_cdx_cooldown_wait_cap(
-    search_url: &Url,
-    retry_policy: CdxRetryPolicy,
-    cooldown: Duration,
-    reason: &str,
-) -> Result<()> {
-    let Some(max_wait) = retry_policy.max_cooldown_wait else {
-        return Ok(());
-    };
-    if cooldown <= max_wait {
-        return Ok(());
-    }
-
-    eprintln!(
-        "Wayback CDX {reason} {} exceeds optional wait cap {}; deferring lookup {}",
-        format_retry_elapsed(cooldown),
-        format_retry_elapsed(max_wait),
-        search_url
-    );
-    Err(anyhow::Error::new(DeferredCdxLookup {
-        target: search_url.to_string(),
-        cooldown,
-        max_wait,
-    }))
 }
 
 fn remember_cdx_cooldown(delay: Duration, reason: &str) -> Duration {
@@ -844,42 +828,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_cdx_requests_are_bounded() {
+    fn recovery_cdx_requests_are_unbounded() {
         let policy = CdxRetryPolicy::recovery();
 
         assert!(policy.should_retry_after_attempt(0));
-        assert!(policy.should_retry_after_attempt(1));
-        assert!(!policy.should_retry_after_attempt(RECOVERY_CDX_MAX_ATTEMPTS - 1));
-    }
-
-    #[test]
-    fn recovery_cdx_requests_defer_when_shared_cooldown_is_too_long() {
-        let search_url = Url::parse("https://web.archive.org/cdx/search/cdx?url=example.com")
-            .expect("valid url");
-        let error = enforce_cdx_cooldown_wait_cap(
-            &search_url,
-            CdxRetryPolicy::recovery(),
-            RECOVERY_CDX_MAX_COOLDOWN_WAIT + Duration::from_secs(1),
-            "test cooldown",
-        )
-        .unwrap_err();
-
-        assert!(is_cdx_connectivity_error(&error));
-        assert!(error.to_string().contains("deferred optional CDX lookup"));
-    }
-
-    #[test]
-    fn primary_cdx_requests_ignore_recovery_cooldown_cap() {
-        let search_url = Url::parse("https://web.archive.org/cdx/search/cdx?url=example.com")
-            .expect("valid url");
-
-        enforce_cdx_cooldown_wait_cap(
-            &search_url,
-            CdxRetryPolicy::primary(),
-            Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS),
-            "test cooldown",
-        )
-        .expect("primary CDX should not have optional cooldown cap");
+        assert!(policy.should_retry_after_attempt(1_000_000));
     }
 
     #[test]

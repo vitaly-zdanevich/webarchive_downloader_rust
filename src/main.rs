@@ -333,10 +333,6 @@ fn print_repair_report(report: &webarchive_downloader_rust::downloader::RepairRe
         report.unavailable_static_assets
     );
     println!(
-        "  deferred static assets: {}",
-        report.deferred_static_assets
-    );
-    println!(
         "  removed download links: {}",
         report.download_links_removed
     );
@@ -375,7 +371,6 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
         "  linked files unavailable: {}",
         report.linked_files_unavailable
     );
-    println!("  linked files deferred: {}", report.linked_files_deferred);
     println!(
         "  recovered static assets: {}",
         report.recovered_static_assets
@@ -387,10 +382,6 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
     println!(
         "  unavailable static assets: {}",
         report.unavailable_static_assets
-    );
-    println!(
-        "  deferred static assets: {}",
-        report.deferred_static_assets
     );
     println!(
         "  removed download links: {}",

@@ -56,11 +56,9 @@ pub struct DownloadReport {
     pub aliases_created: usize,
     pub extra_downloads: usize,
     pub linked_files_unavailable: usize,
-    pub linked_files_deferred: usize,
     pub recovered_static_assets: usize,
     pub static_asset_aliases_created: usize,
     pub unavailable_static_assets: usize,
-    pub deferred_static_assets: usize,
     pub download_links_removed: usize,
     pub local_hrefs_removed: usize,
     pub local_resources_removed: usize,
@@ -90,7 +88,6 @@ pub struct RepairReport {
     pub recovered_static_assets: usize,
     pub static_asset_aliases_created: usize,
     pub unavailable_static_assets: usize,
-    pub deferred_static_assets: usize,
     pub download_links_removed: usize,
     pub local_hrefs_removed: usize,
     pub local_resources_removed: usize,
@@ -141,53 +138,24 @@ struct FallbackOptions {
 }
 
 const MAX_ALTERNATE_PAGE_CAPTURE_CHECKS: usize = 20;
-const MAX_EXTRA_CDX_CONNECTIVITY_FAILURES: usize = 3;
-const MAX_STATIC_ASSET_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const MAX_ALTERNATE_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS: usize = 5;
 const MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS: usize = 20;
-const OPTIONAL_SNAPSHOT_MAX_ATTEMPTS: usize = 5;
 const FIRST_VERBOSE_SNAPSHOT_RETRY_ATTEMPTS: usize = 5;
 const SNAPSHOT_RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SnapshotRetryPolicy {
-    max_attempts: Option<usize>,
-}
+struct SnapshotRetryPolicy;
 
 impl SnapshotRetryPolicy {
     const fn primary() -> Self {
-        Self { max_attempts: None }
+        Self
     }
 
-    const fn optional() -> Self {
-        Self {
-            max_attempts: Some(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS),
-        }
-    }
-
-    fn should_retry_after_attempt(self, attempt: usize) -> bool {
-        self.max_attempts.is_none_or(|max| attempt + 1 < max)
+    const fn recovery() -> Self {
+        Self
     }
 }
-
-#[derive(Debug)]
-struct DeferredSnapshotDownload {
-    original: String,
-    attempts: usize,
-}
-
-impl std::fmt::Display for DeferredSnapshotDownload {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "deferred snapshot download for {} after {} attempts",
-            self.original, self.attempts
-        )
-    }
-}
-
-impl std::error::Error for DeferredSnapshotDownload {}
 
 pub async fn download_site(
     client: WaybackClient,
@@ -316,14 +284,7 @@ pub async fn download_site(
                     extra_resolution.unavailable
                 );
             }
-            if extra_resolution.deferred > 0 {
-                println!(
-                    "linked files deferred because Wayback CDX was unreachable: {}",
-                    extra_resolution.deferred
-                );
-            }
             report.linked_files_unavailable = extra_resolution.unavailable;
-            report.linked_files_deferred = extra_resolution.deferred;
 
             for job in extra_resolution.jobs {
                 let result = download_one(
@@ -334,7 +295,7 @@ pub async fn download_site(
                     &fallback_options,
                     &known_paths,
                     job,
-                    SnapshotRetryPolicy::optional(),
+                    SnapshotRetryPolicy::recovery(),
                 )
                 .await;
                 match result {
@@ -348,10 +309,6 @@ pub async fn download_site(
                         report.unavailable_snapshots += 1;
                         report.linked_files_unavailable += 1;
                         eprintln!("linked file snapshot unavailable: {error:#}");
-                    }
-                    Err(error) if is_deferred_snapshot_error(&error) => {
-                        report.linked_files_deferred += 1;
-                        eprintln!("linked file snapshot deferred: {error:#}");
                     }
                     Err(error) => {
                         report.failed += 1;
@@ -390,7 +347,6 @@ pub async fn download_site(
             }
             report.recovered_static_assets = recovery_report.recovered;
             report.unavailable_static_assets = recovery_report.unavailable;
-            report.deferred_static_assets = recovery_report.deferred;
         }
 
         let alternate_page_aliases = create_missing_static_asset_aliases_from_alternate_pages(
@@ -425,12 +381,7 @@ pub async fn download_site(
                 report.unavailable_static_assets
             );
         }
-        if report.deferred_static_assets > 0 {
-            println!(
-                "missing static assets deferred because Wayback CDX was unreachable: {}",
-                report.deferred_static_assets
-            );
-        } else if options.extra_download_max_bytes.is_some() {
+        if options.extra_download_max_bytes.is_some() {
             let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
             if removed_resources > 0 {
                 println!(
@@ -574,7 +525,6 @@ pub async fn repair_output_dir(
         }
         report.recovered_static_assets = recovery_report.recovered;
         report.unavailable_static_assets = recovery_report.unavailable;
-        report.deferred_static_assets = recovery_report.deferred;
 
         if !options.cancellation.is_cancelled() {
             let alternate_page_aliases = create_missing_static_asset_aliases_from_alternate_pages(
@@ -613,12 +563,7 @@ pub async fn repair_output_dir(
                 report.unavailable_static_assets
             );
         }
-        if report.deferred_static_assets > 0 {
-            println!(
-                "missing static assets deferred because Wayback CDX was unreachable: {}",
-                report.deferred_static_assets
-            );
-        } else if options.extra_download_max_bytes.is_some() {
+        if options.extra_download_max_bytes.is_some() {
             let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
             if removed_resources > 0 {
                 println!(
@@ -905,7 +850,6 @@ async fn download_one(
 struct ExtraDownloadResolution {
     jobs: Vec<DownloadJob>,
     unavailable: usize,
-    deferred: usize,
 }
 
 async fn resolve_extra_download_jobs(
@@ -921,10 +865,8 @@ async fn resolve_extra_download_jobs(
     let mut resolution = ExtraDownloadResolution::default();
     let mut references = references.iter().cloned().collect::<Vec<_>>();
     references.sort();
-    let references_len = references.len();
-    let mut consecutive_connectivity_failures = 0;
 
-    for (index, reference) in references.into_iter().enumerate() {
+    for reference in references {
         let lookup_key = normalize_lookup_url(&reference);
         if known_paths.contains_key(&lookup_key) {
             continue;
@@ -940,7 +882,6 @@ async fn resolve_extra_download_jobs(
         .await?;
         match lookup.record {
             Some(record) => {
-                consecutive_connectivity_failures = 0;
                 let local_path = mapper.local_path_for_url(&record.original, &record.mimetype)?;
                 known_paths.insert(lookup_key, local_path.clone());
                 known_paths.insert(normalize_lookup_url(&record.original), local_path.clone());
@@ -949,21 +890,7 @@ async fn resolve_extra_download_jobs(
                 }
             }
             None => {
-                if lookup.connectivity_failed && !lookup.cdx_query_succeeded {
-                    resolution.deferred += 1;
-                    consecutive_connectivity_failures += 1;
-                    if consecutive_connectivity_failures >= MAX_EXTRA_CDX_CONNECTIVITY_FAILURES {
-                        let remaining = references_len.saturating_sub(index + 1);
-                        resolution.deferred += remaining;
-                        eprintln!(
-                            "stopping linked-file CDX lookups after {consecutive_connectivity_failures} consecutive network failures; deferred {remaining} remaining linked files"
-                        );
-                        break;
-                    }
-                } else {
-                    resolution.unavailable += 1;
-                    consecutive_connectivity_failures = 0;
-                }
+                resolution.unavailable += 1;
             }
         }
     }
@@ -975,7 +902,6 @@ async fn resolve_extra_download_jobs(
 struct StaticAssetRecoveryReport {
     recovered: usize,
     unavailable: usize,
-    deferred: usize,
 }
 
 async fn recover_missing_static_assets(
@@ -999,9 +925,7 @@ async fn recover_missing_static_assets(
     );
 
     let mut report = StaticAssetRecoveryReport::default();
-    let targets_len = targets.len();
-    let mut consecutive_connectivity_failures = 0;
-    for (index, target) in targets.into_iter().enumerate() {
+    for target in targets {
         if cancellation.is_cancelled() {
             break;
         }
@@ -1012,7 +936,6 @@ async fn recover_missing_static_assets(
         }
 
         let record = if let Some(record) = records_by_path.get(&target) {
-            consecutive_connectivity_failures = 0;
             record.clone()
         } else {
             let lookup = find_missing_static_asset_record(
@@ -1025,28 +948,9 @@ async fn recover_missing_static_assets(
             )
             .await?;
             match lookup.record {
-                Some(record) => {
-                    consecutive_connectivity_failures = 0;
-                    record
-                }
+                Some(record) => record,
                 None => {
-                    if lookup.connectivity_failed && !lookup.cdx_query_succeeded {
-                        report.deferred += 1;
-                        consecutive_connectivity_failures += 1;
-                        if consecutive_connectivity_failures
-                            >= MAX_STATIC_ASSET_CDX_CONNECTIVITY_FAILURES
-                        {
-                            let remaining = targets_len.saturating_sub(index + 1);
-                            report.deferred += remaining;
-                            eprintln!(
-                                "stopping static-asset CDX lookups after {consecutive_connectivity_failures} consecutive network failures; deferred {remaining} remaining static assets"
-                            );
-                            break;
-                        }
-                    } else {
-                        report.unavailable += 1;
-                        consecutive_connectivity_failures = 0;
-                    }
+                    report.unavailable += 1;
                     continue;
                 }
             }
@@ -1070,17 +974,12 @@ async fn recover_missing_static_assets(
             &destination,
             max_bytes,
             Some(fallback_options),
-            SnapshotRetryPolicy::optional(),
+            SnapshotRetryPolicy::recovery(),
             cancellation,
         )
         .await
         {
             Ok(downloaded) => downloaded,
-            Err(error) if is_deferred_snapshot_error(&error) => {
-                report.deferred += 1;
-                eprintln!("static asset snapshot deferred: {error:#}");
-                continue;
-            }
             Err(error) => return Err(error),
         };
         if downloaded {
@@ -1482,16 +1381,12 @@ async fn ensure_static_asset_alias_source(
         &source,
         max_bytes,
         Some(fallback_options),
-        SnapshotRetryPolicy::optional(),
+        SnapshotRetryPolicy::recovery(),
         cancellation,
     )
     .await
     {
         Ok(downloaded) => downloaded,
-        Err(error) if is_deferred_snapshot_error(&error) => {
-            eprintln!("static asset alias source snapshot deferred: {error:#}");
-            return Ok(None);
-        }
         Err(error) => return Err(error),
     };
     if downloaded {
@@ -1727,8 +1622,6 @@ fn is_recoverable_static_asset(path: &Path) -> bool {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ExtraDownloadLookup {
     record: Option<CdxRecord>,
-    cdx_query_succeeded: bool,
-    connectivity_failed: bool,
 }
 
 async fn find_missing_static_asset_record(
@@ -1756,14 +1649,9 @@ async fn find_missing_static_asset_record(
                 match fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery())
                     .await
                 {
-                    Ok(records) => {
-                        lookup.cdx_query_succeeded = true;
-                        records
-                    }
+                    Ok(records) => records,
+                    Err(error) if is_cdx_connectivity_error(&error) => return Err(error),
                     Err(error) => {
-                        if is_cdx_connectivity_error(&error) {
-                            lookup.connectivity_failed = true;
-                        }
                         eprintln!("static asset CDX lookup failed for {target}: {error:#}");
                         continue;
                     }
@@ -1802,14 +1690,9 @@ async fn find_extra_download_record(
 
         let records =
             match fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery()).await {
-                Ok(records) => {
-                    lookup.cdx_query_succeeded = true;
-                    records
-                }
+                Ok(records) => records,
+                Err(error) if is_cdx_connectivity_error(&error) => return Err(error),
                 Err(error) => {
-                    if is_cdx_connectivity_error(&error) {
-                        lookup.connectivity_failed = true;
-                    }
                     eprintln!("extra download CDX lookup failed for {target}: {error:#}");
                     continue;
                 }
@@ -2370,23 +2253,10 @@ async fn retry_snapshot_after_status(
     suppressed_retry_messages: &mut usize,
     headers: &HeaderMap,
     status: StatusCode,
-    snapshot_retry_policy: SnapshotRetryPolicy,
+    _snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
-    if !snapshot_retry_policy.should_retry_after_attempt(*attempt) {
-        eprintln!(
-            "Wayback snapshot for {} returned {status} on attempt {} after {}; deferring optional snapshot download",
-            record.original,
-            attempt_number,
-            format_snapshot_retry_elapsed(started_at.elapsed())
-        );
-        return Err(anyhow::Error::new(DeferredSnapshotDownload {
-            original: record.original.clone(),
-            attempts: attempt_number,
-        }));
-    }
-
     let delay = snapshot_retry_after_delay(headers, *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
@@ -2412,26 +2282,10 @@ async fn retry_snapshot_after_error(
     started_at: Instant,
     suppressed_retry_messages: &mut usize,
     error: &anyhow::Error,
-    snapshot_retry_policy: SnapshotRetryPolicy,
+    _snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
-    if !snapshot_retry_policy.should_retry_after_attempt(*attempt) {
-        eprintln!(
-            "Wayback snapshot for {} failed on attempt {} after {}{}: {}; deferring optional snapshot download",
-            record.original,
-            attempt_number,
-            format_snapshot_retry_elapsed(started_at.elapsed()),
-            format_snapshot_suppressed_retries(*suppressed_retry_messages),
-            format_anyhow_error_chain(error)
-        );
-        *suppressed_retry_messages = 0;
-        return Err(anyhow::Error::new(DeferredSnapshotDownload {
-            original: record.original.clone(),
-            attempts: attempt_number,
-        }));
-    }
-
     let delay = snapshot_retry_after_delay(&HeaderMap::new(), *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
@@ -2487,12 +2341,6 @@ fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
             .and_then(reqwest::Error::status)
             .is_some_and(is_unavailable_snapshot_status)
     })
-}
-
-fn is_deferred_snapshot_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<DeferredSnapshotDownload>().is_some())
 }
 
 fn try_activate_ssh_for_snapshot_status(
@@ -3074,22 +2922,11 @@ mod tests {
     }
 
     #[test]
-    fn primary_snapshot_retries_are_unbounded_but_optional_retries_are_bounded() {
-        assert!(SnapshotRetryPolicy::primary().should_retry_after_attempt(1_000_000));
-
-        let optional = SnapshotRetryPolicy::optional();
-        assert!(optional.should_retry_after_attempt(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS - 2));
-        assert!(!optional.should_retry_after_attempt(OPTIONAL_SNAPSHOT_MAX_ATTEMPTS - 1));
-    }
-
-    #[test]
-    fn detects_deferred_snapshot_errors() {
-        let error = anyhow::Error::new(DeferredSnapshotDownload {
-            original: "http://example.com/file.zip".to_owned(),
-            attempts: OPTIONAL_SNAPSHOT_MAX_ATTEMPTS,
-        });
-
-        assert!(is_deferred_snapshot_error(&error));
+    fn recovery_snapshot_policy_matches_primary_patience() {
+        assert_eq!(
+            SnapshotRetryPolicy::recovery(),
+            SnapshotRetryPolicy::primary()
+        );
     }
 
     #[test]

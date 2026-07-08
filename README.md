@@ -43,7 +43,7 @@ This is an early but working Rust CLI. It:
 - can repair an existing output directory by fetching missing static assets that are present in Wayback
 - queries Wayback directly for missing local static assets that were not present in the initial CDX result
 - creates conservative local aliases for obvious static asset filename variants, such as `screen4.jpg` to an archived `screenshot4.jpg`
-- removes broken local resource references after recovery finishes without deferred Wayback lookups
+- removes broken local resource references after recovery finishes
 - removes generated local anchor links when their target was not captured
 - validates generated local links after download and reports missing files
 - writes to `public/` by default, which matches GitLab Pages conventions
@@ -206,12 +206,12 @@ without crawling the whole subdomain. These extra files are stored under
 so the output stays below common Git hosting per-file limits. Use
 `--max-extra-download-size-mib 0` to disable this pass.
 
-Primary CDX discovery retries patiently because the archive cannot be built
-without it. Optional enrichment work, such as extra linked files and static
-asset recovery, is best effort: if Wayback is already forcing a long shared CDX
-cooldown, the downloader defers that optional lookup so the run can finish.
-Rerun later against the same output directory to pick up deferred files when
-Wayback allows more requests.
+Primary CDX discovery, extra linked files, and static asset recovery all retry
+patiently because preservation completeness matters more than short run time.
+If Wayback starts returning 429s, 5xx responses, timeouts, or TCP-level
+connection failures, the downloader backs off with a shared cooldown and keeps
+waiting. Long preservation runs may wait for many hours or days before retrying
+the next request.
 
 The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes.
 
@@ -260,8 +260,8 @@ tunnels are started lazily only after a Wayback request hits a retryable failure
 such as a timeout, HTTP 429, HTTP 403, or server error. The fallback uses OpenSSH
 dynamic forwarding (`ssh -N -D`) and requires non-interactive key or SSH agent
 authentication; configure host keys and jump hosts in your normal SSH config. If
-recovery finishes without deferred static assets, remaining broken local
-resource references are removed instead of inventing placeholder content.
+recovery finishes, remaining broken local resource references are removed
+instead of inventing placeholder content.
 
 For large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
 
