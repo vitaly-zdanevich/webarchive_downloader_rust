@@ -7,13 +7,6 @@ use url::Url;
 
 use crate::pathmap::SiteMapper;
 
-// Keep the default below common Git hosting per-file limits:
-// GitHub blocks files larger than 100 MiB:
-// https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github
-// GitLab Free rejects files that are 100 MiB or larger:
-// https://docs.gitlab.com/user/free_push_limit/
-pub const DEFAULT_EXTRA_DOWNLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024 - 1;
-
 pub fn is_downloadable_file_url(url: &Url) -> bool {
     let Some(extension) = url
         .path_segments()

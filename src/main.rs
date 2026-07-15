@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use url::Url;
 use webarchive_downloader_rust::cdx::{CdxQuery, MatchType, SnapshotStrategy};
-use webarchive_downloader_rust::download_refs::DEFAULT_EXTRA_DOWNLOAD_MAX_BYTES;
 use webarchive_downloader_rust::downloader::{
     CancellationFlag, DownloadOptions, RepairOptions, build_client, download_site, list_records,
     repair_output_dir,
@@ -15,7 +14,7 @@ use webarchive_downloader_rust::link_validation::validate_local_links;
 use webarchive_downloader_rust::output_summary::{format_bytes, summarize_output_dir};
 use webarchive_downloader_rust::pathmap::SiteMapper;
 
-const DEFAULT_EXTRA_DOWNLOAD_MAX_MIB: u64 = 100;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Parser)]
@@ -80,9 +79,10 @@ struct Cli {
     #[arg(long, conflicts_with = "no_validate_links")]
     strict_validate_links: bool,
 
-    /// Maximum size, in MiB, for extra linked downloads from related subdomains. Use 0 to disable.
-    #[arg(long, default_value_t = DEFAULT_EXTRA_DOWNLOAD_MAX_MIB)]
-    max_extra_download_size_mib: u64,
+    /// Maximum size, in MiB, for extra linked downloads from related subdomains.
+    /// Omit for no cap. Use 0 to disable the pass.
+    #[arg(long, value_name = "MIB")]
+    max_extra_download_size_mib: Option<u64>,
 
     /// Wayback root URL.
     #[arg(long, default_value = "https://web.archive.org")]
@@ -146,11 +146,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
         cli.ssh,
     )?;
 
-    let extra_download_max_bytes = match cli.max_extra_download_size_mib {
-        0 => None,
-        DEFAULT_EXTRA_DOWNLOAD_MAX_MIB => Some(DEFAULT_EXTRA_DOWNLOAD_MAX_BYTES),
-        mib => Some(mib.saturating_mul(1024).saturating_mul(1024)),
-    };
+    let extra_download_max_bytes = extra_download_max_bytes(cli.max_extra_download_size_mib);
 
     if cli.list {
         let records = list_records(&client, &query).await?;
@@ -299,6 +295,14 @@ fn validate_output_dir(output_dir: &Path, strict: bool) -> Result<ExitCode> {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn extra_download_max_bytes(max_extra_download_size_mib: Option<u64>) -> Option<u64> {
+    match max_extra_download_size_mib {
+        None => Some(u64::MAX),
+        Some(0) => None,
+        Some(mib) => Some(mib.saturating_mul(BYTES_PER_MIB)),
     }
 }
 
@@ -477,6 +481,30 @@ mod tests {
                 "ubuntu@151.145.94.114".to_owned(),
                 "ubuntu@203.0.113.10".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn extra_downloads_are_uncapped_by_default() {
+        let cli = Cli::try_parse_from(["webarchive-downloader-rust", "example.com"]).unwrap();
+
+        assert_eq!(cli.max_extra_download_size_mib, None);
+        assert_eq!(
+            extra_download_max_bytes(cli.max_extra_download_size_mib),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn zero_extra_download_size_disables_extra_downloads() {
+        assert_eq!(extra_download_max_bytes(Some(0)), None);
+    }
+
+    #[test]
+    fn explicit_extra_download_size_sets_byte_cap() {
+        assert_eq!(
+            extra_download_max_bytes(Some(128)),
+            Some(128 * BYTES_PER_MIB)
         );
     }
 

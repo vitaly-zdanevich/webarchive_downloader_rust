@@ -202,9 +202,9 @@ Even with `--match-type host`, the downloader follows explicit binary download
 links and static assets to related subdomains, such as
 `downloads.example.com/file.exe` or `downloads.example.com/preview/shot.jpg`,
 without crawling the whole subdomain. These extra files are stored under
-`_hosts/<hostname>/`. The default cap is 1 byte under 100 MiB per extra download
-so the output stays below common Git hosting per-file limits. Use
-`--max-extra-download-size-mib 0` to disable this pass.
+`_hosts/<hostname>/`. By default there is no size cap for preservation
+completeness. Use `--max-extra-download-size-mib N` to cap each extra download
+at `N` MiB, or `--max-extra-download-size-mib 0` to disable this pass.
 
 Primary CDX discovery, extra linked files, and static asset recovery all retry
 patiently because preservation completeness matters more than short run time.

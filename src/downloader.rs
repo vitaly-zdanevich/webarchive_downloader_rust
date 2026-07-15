@@ -272,17 +272,31 @@ pub async fn download_site(
             )
             .await?;
             if !extra_resolution.jobs.is_empty() {
-                println!(
-                    "selected {} linked files under {} bytes",
-                    extra_resolution.jobs.len(),
-                    max_bytes
-                );
+                if is_unlimited_extra_download_size(max_bytes) {
+                    println!(
+                        "selected {} linked files without size cap",
+                        extra_resolution.jobs.len()
+                    );
+                } else {
+                    println!(
+                        "selected {} linked files under {} bytes",
+                        extra_resolution.jobs.len(),
+                        max_bytes
+                    );
+                }
             }
             if extra_resolution.unavailable > 0 {
-                println!(
-                    "linked files unavailable in Wayback or over size limit: {}",
-                    extra_resolution.unavailable
-                );
+                if is_unlimited_extra_download_size(max_bytes) {
+                    println!(
+                        "linked files unavailable in Wayback: {}",
+                        extra_resolution.unavailable
+                    );
+                } else {
+                    println!(
+                        "linked files unavailable in Wayback or over size limit: {}",
+                        extra_resolution.unavailable
+                    );
+                }
             }
             report.linked_files_unavailable = extra_resolution.unavailable;
 
@@ -376,10 +390,20 @@ pub async fn download_site(
             .unavailable_static_assets
             .saturating_sub(report.static_asset_aliases_created);
         if report.unavailable_static_assets > 0 {
-            println!(
-                "missing static assets unavailable in Wayback or over size limit: {}",
-                report.unavailable_static_assets
-            );
+            if options
+                .extra_download_max_bytes
+                .is_some_and(is_unlimited_extra_download_size)
+            {
+                println!(
+                    "missing static assets unavailable in Wayback: {}",
+                    report.unavailable_static_assets
+                );
+            } else {
+                println!(
+                    "missing static assets unavailable in Wayback or over size limit: {}",
+                    report.unavailable_static_assets
+                );
+            }
         }
         if options.extra_download_max_bytes.is_some() {
             let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
@@ -558,10 +582,20 @@ pub async fn repair_output_dir(
             .unavailable_static_assets
             .saturating_sub(report.static_asset_aliases_created);
         if report.unavailable_static_assets > 0 {
-            println!(
-                "missing static assets unavailable in Wayback or over size limit: {}",
-                report.unavailable_static_assets
-            );
+            if options
+                .extra_download_max_bytes
+                .is_some_and(is_unlimited_extra_download_size)
+            {
+                println!(
+                    "missing static assets unavailable in Wayback: {}",
+                    report.unavailable_static_assets
+                );
+            } else {
+                println!(
+                    "missing static assets unavailable in Wayback or over size limit: {}",
+                    report.unavailable_static_assets
+                );
+            }
         }
         if options.extra_download_max_bytes.is_some() {
             let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
@@ -2775,6 +2809,10 @@ async fn stream_response_to_file_limited(
     }
 
     result
+}
+
+fn is_unlimited_extra_download_size(max_bytes: u64) -> bool {
+    max_bytes == u64::MAX
 }
 
 async fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
