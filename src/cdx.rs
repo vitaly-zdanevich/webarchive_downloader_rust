@@ -12,6 +12,7 @@ use reqwest::{
 use tokio::time::sleep;
 use url::Url;
 
+use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::wayback_client::WaybackClient;
 
 pub const MAX_WAYBACK_RETRY_DELAY_SECONDS: u64 = 24 * 60 * 60;
@@ -19,20 +20,31 @@ const FIRST_VERBOSE_RETRY_ATTEMPTS: usize = 5;
 const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
 const CONNECTIVITY_NOTICE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const CDX_THROTTLE_DECAY_AFTER: Duration = Duration::from_secs(10 * 60);
+const MIN_CDX_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_CDX_REQUEST_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CDX_SUCCESSES_BEFORE_SPEEDUP: usize = 20;
 
 static CDX_COOLDOWN: Mutex<CdxCooldown> = Mutex::new(CdxCooldown {
     next_allowed_at: None,
+    next_request_at: None,
     throttle_score: 0,
-    last_throttle_at: None,
-    last_success_at: None,
+    reset_backoff_after_cooldown: false,
+    request_interval: MIN_CDX_REQUEST_INTERVAL,
+    successes_at_interval: 0,
 });
 
 struct CdxCooldown {
     next_allowed_at: Option<Instant>,
+    next_request_at: Option<Instant>,
     throttle_score: usize,
-    last_throttle_at: Option<Instant>,
-    last_success_at: Option<Instant>,
+    reset_backoff_after_cooldown: bool,
+    request_interval: Duration,
+    successes_at_interval: usize,
+}
+
+struct CdxSuccessUpdate {
+    reset_backoff: bool,
+    reduced_interval: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +221,7 @@ pub async fn fetch_all_records_with_policy(
 
     loop {
         let response = send_cdx_request(client, search_url.clone(), retry_policy).await?;
+        let route = client.active_route_label();
         match read_all_cdx_records(response, query.strategy).await {
             Ok(records) => return Ok(records),
             Err(error)
@@ -216,7 +229,6 @@ pub async fn fetch_all_records_with_policy(
                     && is_cdx_connectivity_error(&error) =>
             {
                 let attempt_number = attempt + 1;
-                let elapsed = started_at.elapsed();
                 let mut delay = retry_after_delay(&HeaderMap::new(), attempt);
                 if try_switch_wayback_route(
                     client,
@@ -227,14 +239,15 @@ pub async fn fetch_all_records_with_policy(
                     continue;
                 }
                 delay = remember_cdx_cooldown(delay, "CDX API response read failed");
+                let elapsed = started_at.elapsed();
                 if should_log_retry_attempt(attempt_number) {
                     eprintln!(
-                        "Wayback CDX API response read failed on attempt {} after {}{}: {}; retrying in {} seconds",
+                        "Wayback CDX API response read failed via {route} on attempt {} after {}{}: {}; retrying in {}",
                         attempt_number,
                         format_retry_elapsed(elapsed),
                         format_suppressed_retries(suppressed_retry_messages),
                         error,
-                        delay.as_secs()
+                        format_retry_delay(delay)
                     );
                     suppressed_retry_messages = 0;
                 } else {
@@ -296,13 +309,13 @@ async fn send_cdx_request(
     let mut suppressed_retry_messages = 0usize;
     let mut next_connectivity_notice_after = FIRST_CONNECTIVITY_NOTICE_AFTER;
     loop {
-        wait_for_cdx_cooldown().await;
+        wait_for_cdx_request_slot().await;
+        let route = client.active_route_label();
 
         let response = match client.get(search_url.clone()).send().await {
             Ok(response) => response,
             Err(error) if retry_policy.should_retry_after_attempt(attempt) => {
                 let attempt_number = attempt + 1;
-                let elapsed = started_at.elapsed();
                 let mut delay = retry_after_delay(&HeaderMap::new(), attempt);
                 if try_switch_wayback_route(
                     client,
@@ -315,14 +328,15 @@ async fn send_cdx_request(
                 if is_reqwest_connectivity_error(&error) {
                     delay = remember_cdx_cooldown(delay, "CDX API connection failed");
                 }
+                let elapsed = started_at.elapsed();
                 if should_log_retry_attempt(attempt_number) {
                     eprintln!(
-                        "Wayback CDX API request failed on attempt {} after {}{}: {}; retrying in {} seconds",
+                        "Wayback CDX API request failed via {route} on attempt {} after {}{}: {}; retrying in {}",
                         attempt_number,
                         format_retry_elapsed(elapsed),
                         format_suppressed_retries(suppressed_retry_messages),
                         format_error_chain(&error),
-                        delay.as_secs()
+                        format_retry_delay(delay)
                     );
                     suppressed_retry_messages = 0;
                 } else {
@@ -352,11 +366,17 @@ async fn send_cdx_request(
             && retry_policy.should_retry_after_attempt(attempt)
         {
             let attempt_number = attempt + 1;
-            let elapsed = started_at.elapsed();
             let status = response.status();
             let mut delay = retry_after_delay(response.headers(), attempt);
-            let should_switch_route =
-                !client.is_using_ssh() || matches!(status, StatusCode::TOO_MANY_REQUESTS);
+            if status == StatusCode::TOO_MANY_REQUESTS
+                && let Some(interval) = remember_cdx_rate_limit()
+            {
+                eprintln!(
+                    "Wayback CDX API rate-limited {route}; minimum request spacing increased to {}",
+                    format_retry_delay(interval)
+                );
+            }
+            let should_switch_route = should_try_ssh_after_status(status, attempt, client.is_using_ssh());
             if should_switch_route
                 && try_switch_wayback_route(client, &format!("CDX API returned {status}"))
             {
@@ -365,13 +385,14 @@ async fn send_cdx_request(
                 continue;
             }
             delay = remember_cdx_cooldown(delay, &format!("CDX API returned {status}"));
+            let elapsed = started_at.elapsed();
             if should_log_retry_attempt(attempt_number) {
                 eprintln!(
-                    "Wayback CDX API returned {status} on attempt {} after {}{}; retrying in {} seconds",
+                    "Wayback CDX API returned {status} via {route} on attempt {} after {}{}; retrying in {}",
                     attempt_number,
                     format_retry_elapsed(elapsed),
                     format_suppressed_retries(suppressed_retry_messages),
-                    delay.as_secs()
+                    format_retry_delay(delay)
                 );
                 suppressed_retry_messages = 0;
             } else {
@@ -393,32 +414,69 @@ async fn send_cdx_request(
         let response = response
             .error_for_status()
             .context("Wayback CDX API returned an error")?;
-        remember_cdx_success();
+        let update = remember_cdx_success();
+        if update.reset_backoff {
+            eprintln!(
+                "Wayback CDX API available again via {route}; exponential retry backoff reset"
+            );
+        }
+        if let Some(interval) = update.reduced_interval {
+            eprintln!(
+                "Wayback CDX API remained available; minimum request spacing reduced to {}",
+                format_retry_delay(interval)
+            );
+        }
         return Ok(response);
     }
 }
 
-async fn wait_for_cdx_cooldown() {
+async fn wait_for_cdx_request_slot() {
     loop {
-        let Some(remaining) = cdx_cooldown_remaining() else {
+        let Some(remaining) = reserve_cdx_request_at(Instant::now()) else {
             return;
         };
-        eprintln!(
-            "Wayback CDX shared cooldown active; waiting {} before next CDX request",
-            format_retry_elapsed(remaining)
-        );
         sleep(remaining).await;
     }
+}
+
+fn reserve_cdx_request_at(now: Instant) -> Option<Duration> {
+    let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
+    if cooldown
+        .next_allowed_at
+        .is_some_and(|next_allowed_at| next_allowed_at <= now)
+    {
+        cooldown.next_allowed_at = None;
+        if cooldown.reset_backoff_after_cooldown {
+            cooldown.throttle_score = 0;
+            cooldown.reset_backoff_after_cooldown = false;
+            eprintln!(
+                "Wayback CDX day-long cooldown completed; exponential retry backoff reset for a recovery probe"
+            );
+        }
+    }
+    let next_request_at = match (cooldown.next_allowed_at, cooldown.next_request_at) {
+        (Some(cooldown_at), Some(pacing_at)) => Some(cooldown_at.max(pacing_at)),
+        (Some(next_at), None) | (None, Some(next_at)) => Some(next_at),
+        (None, None) => None,
+    };
+    if let Some(remaining) = next_request_at
+        .and_then(|next_at| next_at.checked_duration_since(now))
+        .filter(|remaining| !remaining.is_zero())
+    {
+        return Some(remaining);
+    }
+
+    cooldown.next_request_at = Some(now + cooldown.request_interval);
+    None
 }
 
 fn remember_cdx_cooldown(delay: Duration, reason: &str) -> Duration {
     let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
     let now = Instant::now();
-    decay_cdx_throttle(&mut cooldown, now);
 
     let throttle_index = cooldown.throttle_score;
     cooldown.throttle_score = cooldown.throttle_score.saturating_add(1);
-    cooldown.last_throttle_at = Some(now);
+    cooldown.successes_at_interval = 0;
 
     let global_delay = retry_after_delay(&HeaderMap::new(), throttle_index);
     let delay = delay.max(global_delay);
@@ -432,9 +490,11 @@ fn remember_cdx_cooldown(delay: Duration, reason: &str) -> Duration {
         .is_none_or(|current| next_allowed_at > current)
     {
         cooldown.next_allowed_at = Some(next_allowed_at);
+        cooldown.reset_backoff_after_cooldown =
+            delay >= Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS);
         eprintln!(
             "Wayback CDX shared cooldown set to {} because {reason}",
-            format_retry_elapsed(delay)
+            format_retry_delay(delay)
         );
     }
     effective_next_allowed_at
@@ -442,44 +502,46 @@ fn remember_cdx_cooldown(delay: Duration, reason: &str) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-fn remember_cdx_success() {
-    let now = Instant::now();
+fn remember_cdx_success() -> CdxSuccessUpdate {
     let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
-    decay_cdx_throttle(&mut cooldown, now);
-    cooldown.last_success_at = Some(now);
-    if cooldown
-        .next_allowed_at
-        .is_some_and(|next_allowed_at| next_allowed_at <= now)
-    {
-        cooldown.next_allowed_at = None;
+    let reset_backoff = cooldown.throttle_score > 0 || cooldown.next_allowed_at.is_some();
+    cooldown.throttle_score = 0;
+    cooldown.next_allowed_at = None;
+    cooldown.reset_backoff_after_cooldown = false;
+
+    let mut reduced_interval = None;
+    if cooldown.request_interval > MIN_CDX_REQUEST_INTERVAL {
+        cooldown.successes_at_interval = cooldown.successes_at_interval.saturating_add(1);
+        if cooldown.successes_at_interval >= CDX_SUCCESSES_BEFORE_SPEEDUP {
+            let seconds =
+                (cooldown.request_interval.as_secs() / 2).max(MIN_CDX_REQUEST_INTERVAL.as_secs());
+            cooldown.request_interval = Duration::from_secs(seconds);
+            cooldown.successes_at_interval = 0;
+            reduced_interval = Some(cooldown.request_interval);
+        }
+    } else {
+        cooldown.successes_at_interval = 0;
+    }
+
+    CdxSuccessUpdate {
+        reset_backoff,
+        reduced_interval,
     }
 }
 
-fn decay_cdx_throttle(cooldown: &mut CdxCooldown, now: Instant) {
-    let Some(last_success_at) = cooldown.last_success_at else {
-        return;
-    };
-    if cooldown
-        .last_throttle_at
-        .is_some_and(|last_throttle_at| last_success_at <= last_throttle_at)
-    {
-        return;
+fn remember_cdx_rate_limit() -> Option<Duration> {
+    let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
+    cooldown.successes_at_interval = 0;
+    let increased = cooldown
+        .request_interval
+        .saturating_mul(2)
+        .min(MAX_CDX_REQUEST_INTERVAL);
+    if increased > cooldown.request_interval {
+        cooldown.request_interval = increased;
+        Some(increased)
+    } else {
+        None
     }
-    if now
-        .checked_duration_since(last_success_at)
-        .is_some_and(|elapsed| elapsed >= CDX_THROTTLE_DECAY_AFTER)
-    {
-        cooldown.throttle_score = 0;
-        cooldown.last_throttle_at = None;
-        cooldown.last_success_at = None;
-    }
-}
-
-fn cdx_cooldown_remaining() -> Option<Duration> {
-    lock_unpoisoned(&CDX_COOLDOWN)
-        .next_allowed_at
-        .and_then(|next_allowed_at| next_allowed_at.checked_duration_since(Instant::now()))
-        .filter(|remaining| !remaining.is_zero())
 }
 
 fn is_retryable_cdx_status(status: StatusCode) -> bool {
@@ -745,6 +807,23 @@ mod tests {
     }
 
     #[test]
+    fn formats_retry_delays_with_readable_large_durations() {
+        assert_eq!(format_retry_delay(Duration::from_secs(5)), "5 seconds");
+        assert_eq!(
+            format_retry_delay(Duration::from_secs(640)),
+            "640 seconds (around 10m)"
+        );
+        assert_eq!(
+            format_retry_delay(Duration::from_secs(10_240)),
+            "10240 seconds (around 2h 50m)"
+        );
+        assert_eq!(
+            format_retry_delay(Duration::from_secs(86_400)),
+            "86400 seconds (24 hours)"
+        );
+    }
+
+    #[test]
     fn shared_cdx_cooldown_extends_but_does_not_shorten() {
         let _guard = CDX_COOLDOWN_TEST_LOCK
             .lock()
@@ -783,35 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_cdx_cooldown_escalates_across_intermittent_successes() {
-        let _guard = CDX_COOLDOWN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        reset_cdx_cooldown_for_test();
-
-        remember_cdx_cooldown(Duration::from_secs(5), "test");
-        assert_eq!(cdx_cooldown_throttle_score_for_test(), 1);
-        let first_remaining = cdx_cooldown_remaining().unwrap();
-        assert!(first_remaining <= Duration::from_secs(5));
-
-        remember_cdx_success();
-        assert_eq!(cdx_cooldown_throttle_score_for_test(), 1);
-
-        remember_cdx_cooldown(Duration::from_secs(5), "test");
-        assert_eq!(cdx_cooldown_throttle_score_for_test(), 2);
-        let second_remaining = cdx_cooldown_remaining().unwrap();
-        assert!(second_remaining > first_remaining);
-
-        remember_cdx_success();
-        age_cdx_success_for_test(CDX_THROTTLE_DECAY_AFTER + Duration::from_secs(1));
-        remember_cdx_success();
-        assert_eq!(cdx_cooldown_throttle_score_for_test(), 0);
-
-        reset_cdx_cooldown_for_test();
-    }
-
-    #[test]
-    fn shared_cdx_cooldown_does_not_decay_just_because_backoff_elapsed() {
+    fn successful_cdx_request_resets_accumulated_backoff() {
         let _guard = CDX_COOLDOWN_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -822,10 +873,86 @@ mod tests {
         }
         assert_eq!(cdx_cooldown_throttle_score_for_test(), 8);
 
-        age_cdx_throttle_for_test(CDX_THROTTLE_DECAY_AFTER + Duration::from_secs(1));
-        let retry_delay = remember_cdx_cooldown(Duration::from_secs(5), "test");
+        remember_cdx_success();
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 0);
+        assert_eq!(
+            remember_cdx_cooldown(Duration::from_secs(5), "test"),
+            Duration::from_secs(5)
+        );
 
-        assert!(retry_delay >= Duration::from_secs(1280));
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
+    fn completed_day_long_cooldown_resets_backoff_but_keeps_slow_pacing() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+        remember_cdx_rate_limit();
+        let throttled_interval = cdx_request_interval_for_test();
+        remember_cdx_cooldown(Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS), "test");
+        expire_cdx_cooldown_for_test();
+
+        assert_eq!(reserve_cdx_request_at(Instant::now()), None);
+        assert_eq!(cdx_cooldown_throttle_score_for_test(), 0);
+        assert_eq!(cdx_request_interval_for_test(), throttled_interval);
+        assert_eq!(
+            remember_cdx_cooldown(Duration::from_secs(5), "test"),
+            Duration::from_secs(5)
+        );
+
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
+    fn cdx_rate_limit_increases_request_spacing() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+
+        let initial_interval = cdx_request_interval_for_test();
+        assert_eq!(initial_interval, Duration::from_secs(5));
+        remember_cdx_rate_limit();
+
+        assert!(cdx_request_interval_for_test() > initial_interval);
+
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
+    fn sustained_cdx_success_gradually_reduces_request_spacing() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+        remember_cdx_rate_limit();
+        remember_cdx_rate_limit();
+        let throttled_interval = cdx_request_interval_for_test();
+
+        for _ in 0..CDX_SUCCESSES_BEFORE_SPEEDUP {
+            remember_cdx_success();
+        }
+
+        assert!(cdx_request_interval_for_test() < throttled_interval);
+
+        reset_cdx_cooldown_for_test();
+    }
+
+    #[test]
+    fn cdx_request_pacing_reserves_non_overlapping_slots() {
+        let _guard = CDX_COOLDOWN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_cdx_cooldown_for_test();
+        let now = Instant::now();
+
+        assert_eq!(reserve_cdx_request_at(now), None);
+        assert_eq!(
+            reserve_cdx_request_at(now),
+            Some(cdx_request_interval_for_test())
+        );
 
         reset_cdx_cooldown_for_test();
     }
@@ -893,22 +1020,21 @@ mod tests {
         lock_unpoisoned(&CDX_COOLDOWN).throttle_score
     }
 
-    fn age_cdx_throttle_for_test(age: Duration) {
-        lock_unpoisoned(&CDX_COOLDOWN).last_throttle_at = Some(Instant::now() - age);
+    fn cdx_request_interval_for_test() -> Duration {
+        lock_unpoisoned(&CDX_COOLDOWN).request_interval
     }
 
-    fn age_cdx_success_for_test(age: Duration) {
-        let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
-        let success_at = Instant::now() - age;
-        cooldown.last_success_at = Some(success_at);
-        cooldown.last_throttle_at = Some(success_at - Duration::from_secs(1));
+    fn expire_cdx_cooldown_for_test() {
+        lock_unpoisoned(&CDX_COOLDOWN).next_allowed_at = Some(Instant::now());
     }
 
     fn reset_cdx_cooldown_for_test() {
         let mut cooldown = lock_unpoisoned(&CDX_COOLDOWN);
         cooldown.next_allowed_at = None;
+        cooldown.next_request_at = None;
         cooldown.throttle_score = 0;
-        cooldown.last_throttle_at = None;
-        cooldown.last_success_at = None;
+        cooldown.reset_backoff_after_cooldown = false;
+        cooldown.request_interval = MIN_CDX_REQUEST_INTERVAL;
+        cooldown.successes_at_interval = 0;
     }
 }

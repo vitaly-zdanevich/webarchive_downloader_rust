@@ -5,7 +5,39 @@ use anyhow::{Context, Result};
 use lol_html::{HtmlRewriter, Settings, element};
 use url::Url;
 
-use crate::pathmap::SiteMapper;
+use crate::link_validation::extract_document_references;
+use crate::noise::is_archive_noise_reference;
+use crate::pathmap::{SiteMapper, unwrap_wayback_url};
+
+/// Finds related archived pages and resources without restricting file extensions.
+/// Only HTTP(S) URLs are returned; the caller queries Wayback, never the live site.
+pub(crate) fn extract_related_references(
+	input: &str,
+	base_url: &Url,
+	mapper: &SiteMapper,
+	is_css: bool,
+) -> Result<Vec<String>> {
+	let mut references = Vec::new();
+	for value in extract_document_references(input, is_css)? {
+		let value = value.trim();
+		if value.is_empty() || value.starts_with('#') {
+			continue;
+		}
+		let Ok(mut url) = base_url.join(&unwrap_wayback_url(value)) else {
+			continue;
+		};
+		url.set_fragment(None);
+		if matches!(url.scheme(), "http" | "https")
+			&& url.host_str().is_some_and(|host| mapper.is_related_host(host))
+			&& !is_archive_noise_reference(url.as_str())
+		{
+			references.push(url.to_string());
+		}
+	}
+	references.sort();
+	references.dedup();
+	Ok(references)
+}
 
 pub fn is_downloadable_file_url(url: &Url) -> bool {
     let Some(extension) = url
@@ -193,27 +225,6 @@ fn resolve_reference(base_url: &Url, value: &str) -> Option<Url> {
     base_url.join(&unwrap_wayback_url(without_fragment)).ok()
 }
 
-fn unwrap_wayback_url(value: &str) -> String {
-    let Ok(url) = Url::parse(value) else {
-        return value.to_owned();
-    };
-    let Some(host) = url.host_str() else {
-        return value.to_owned();
-    };
-    if !host.eq_ignore_ascii_case("web.archive.org") {
-        return value.to_owned();
-    }
-
-    let path = url.path();
-    let Some(rest) = path.strip_prefix("/web/") else {
-        return value.to_owned();
-    };
-    let Some((_, original)) = rest.split_once('/') else {
-        return value.to_owned();
-    };
-    original.to_owned()
-}
-
 fn collect_html_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_html_files_into(root, &mut files)?;
@@ -390,6 +401,22 @@ fn is_html_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Uses the same HTML/CSS parser as validation, including unquoted and wrapped URLs.
+	#[test]
+	fn discovers_pages_srcset_css_and_wrapped_queries() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://example.com/pages/index.html").unwrap();
+		let refs = extract_related_references(
+			r#"<a href=next>Next</a><img srcset='//assets.example.com/a.gif 1x, /b.gif 2x'><a href='https://web.archive.org/web/20080101000000/http://example.com/viewtopic.php?t=7&amp;p=9'>Topic</a><a href='javascript:alert(1)'>JS</a><a href='https://unrelated.invalid/a.html'>External</a>"#,
+			&base, &mapper, false).unwrap();
+		assert!(refs.contains(&"http://example.com/pages/next".to_owned()));
+		assert!(refs.contains(&"http://assets.example.com/a.gif".to_owned()));
+		assert!(refs.contains(&"http://example.com/b.gif".to_owned()));
+		assert!(refs.iter().any(|url| url.contains("viewtopic.php?t=7") && url.contains("p=9")));
+		assert_eq!(refs.len(), 4);
+		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, true).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
+	}
 
     #[test]
     fn extracts_related_download_links() {

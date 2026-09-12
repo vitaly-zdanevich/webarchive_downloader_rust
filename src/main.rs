@@ -3,8 +3,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset, Local};
 use clap::Parser;
 use url::Url;
+use webarchive_downloader_rust::DEFAULT_USER_AGENT;
 use webarchive_downloader_rust::cdx::{CdxQuery, MatchType, SnapshotStrategy};
 use webarchive_downloader_rust::downloader::{
     CancellationFlag, DownloadOptions, RepairOptions, build_client, download_site, list_records,
@@ -79,7 +81,7 @@ struct Cli {
     #[arg(long, conflicts_with = "no_validate_links")]
     strict_validate_links: bool,
 
-    /// Maximum size, in MiB, for extra linked downloads from related subdomains.
+    /// Maximum size, in MiB, for linked pages and resources on related hosts.
     /// Omit for no cap. Use 0 to disable the pass.
     #[arg(long, value_name = "MIB")]
     max_extra_download_size_mib: Option<u64>,
@@ -89,7 +91,7 @@ struct Cli {
     archive_root: Url,
 
     /// User-Agent sent to the Internet Archive.
-    #[arg(long, default_value = "webarchive-downloader-rust/0.1")]
+    #[arg(long, default_value = DEFAULT_USER_AGENT)]
     user_agent: String,
 
     /// Request timeout in seconds.
@@ -245,9 +247,10 @@ fn validate_output_dir(output_dir: &Path, strict: bool) -> Result<ExitCode> {
     })?;
 
     println!(
-        "validated {} local links; missing {}; images without source {}",
+        "validated {} local links; missing {}; unique missing targets {}; images without source {}",
         report.checked,
         report.missing.len(),
+        report.unique_missing_targets(),
         report.missing_image_sources.len()
     );
 
@@ -336,18 +339,10 @@ fn print_repair_report(report: &webarchive_downloader_rust::downloader::RepairRe
         "  unavailable static assets: {}",
         report.unavailable_static_assets
     );
-    println!(
-        "  removed download links: {}",
-        report.download_links_removed
-    );
-    println!("  removed local hrefs: {}", report.local_hrefs_removed);
-    println!(
-        "  removed local resources: {}",
-        report.local_resources_removed
-    );
     println!("  aliases: {}", report.aliases_created);
     println!("  checked links: {}", report.local_links_checked);
     println!("  missing links: {}", report.missing_local_links);
+    println!("  unique missing targets: {}", report.unique_missing_targets);
     println!("  images without source: {}", report.missing_image_sources);
     println!("  output: {}", report.output_dir.display());
 }
@@ -360,6 +355,7 @@ fn print_stopped_report(report: &webarchive_downloader_rust::downloader::Downloa
     println!("  cancelled: {}", report.cancelled);
     println!("  failed: {}", report.failed);
     println!("  unavailable snapshots: {}", report.unavailable_snapshots);
+    println!("  retained unusable captures: {}", report.retained_unusable_captures);
     println!("  output: {}", report.output_dir.display());
 }
 
@@ -370,6 +366,7 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
     println!("  skipped: {}", report.skipped);
     println!("  failed: {}", report.failed);
     println!("  unavailable snapshots: {}", report.unavailable_snapshots);
+    println!("  retained unusable captures: {}", report.retained_unusable_captures);
     println!("  linked files downloaded: {}", report.extra_downloads);
     println!(
         "  linked files unavailable: {}",
@@ -387,18 +384,10 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
         "  unavailable static assets: {}",
         report.unavailable_static_assets
     );
-    println!(
-        "  removed download links: {}",
-        report.download_links_removed
-    );
-    println!("  removed local hrefs: {}", report.local_hrefs_removed);
-    println!(
-        "  removed local resources: {}",
-        report.local_resources_removed
-    );
     println!("  aliases: {}", report.aliases_created);
     println!("  checked links: {}", report.local_links_checked);
     println!("  missing links: {}", report.missing_local_links);
+    println!("  unique missing targets: {}", report.unique_missing_targets);
     println!("  images without source: {}", report.missing_image_sources);
     println!("  output: {}", report.output_dir.display());
 }
@@ -433,11 +422,21 @@ fn print_output_summary(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Prints elapsed runtime followed by the completion timestamp in the machine's timezone.
 fn print_elapsed_time(started_at: Instant) {
     println!(
-        "elapsed time: {}",
-        format_elapsed_time(started_at.elapsed())
+        "{}",
+        format_completion_summary(started_at.elapsed(), Local::now().fixed_offset())
     );
+}
+
+/// Formats the completion footer using the timestamp's local date and weekday.
+fn format_completion_summary(duration: Duration, finished_at: DateTime<FixedOffset>) -> String {
+    format!(
+        "elapsed time: {}\nFinished at {}",
+        format_elapsed_time(duration),
+        finished_at.format("%Y %B %-d, %A, %H:%M")
+    )
 }
 
 fn format_elapsed_time(duration: Duration) -> String {
@@ -462,6 +461,13 @@ fn format_elapsed_time(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Release metadata and the default HTTP identity must use the same package version.
+	#[test]
+	fn default_user_agent_matches_package_version() {
+		let cli = Cli::try_parse_from(["webarchive-downloader-rust", "example.com"]).unwrap();
+		assert_eq!(cli.user_agent, concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")));
+	}
 
     #[test]
     fn parses_repeated_ssh_destinations() {
@@ -514,5 +520,27 @@ mod tests {
         assert_eq!(format_elapsed_time(Duration::from_secs(9)), "9s");
         assert_eq!(format_elapsed_time(Duration::from_secs(125)), "2m 5s");
         assert_eq!(format_elapsed_time(Duration::from_secs(3661)), "1h 1m 1s");
+    }
+
+    #[test]
+    fn prints_finish_time_directly_after_elapsed_time() {
+        let finished_at =
+            chrono::DateTime::parse_from_rfc3339("2026-09-11T23:59:00+04:00").unwrap();
+
+        assert_eq!(
+            format_completion_summary(Duration::from_secs(30_539), finished_at),
+            "elapsed time: 8h 28m 59s\nFinished at 2026 September 11, Friday, 23:59"
+        );
+    }
+
+    #[test]
+    fn finish_time_preserves_local_date_across_utc_midnight() {
+        let finished_at =
+            chrono::DateTime::parse_from_rfc3339("2026-09-12T00:05:00+04:00").unwrap();
+
+        assert_eq!(
+            format_completion_summary(Duration::from_secs(1), finished_at),
+            "elapsed time: 1s\nFinished at 2026 September 12, Saturday, 00:05"
+        );
     }
 }

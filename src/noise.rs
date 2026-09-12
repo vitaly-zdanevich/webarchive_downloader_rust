@@ -28,10 +28,6 @@ pub fn is_archive_noise_url_with_mimetype(original: &str, mimetype: &str) -> boo
         return true;
     }
 
-    if is_forum_action_noise_path(&path) {
-        return true;
-    }
-
     if is_static_asset_mimetype(mimetype) {
         return false;
     }
@@ -114,22 +110,6 @@ fn is_static_asset_mimetype(mimetype: &str) -> bool {
         )
 }
 
-fn is_forum_action_noise_path(path: &str) -> bool {
-    [
-        "/cron.php",
-        "/groupcp.php",
-        "/login.php",
-        "/memberlist.php",
-        "/posting.php",
-        "/profile.php",
-        "/search.php",
-        "/ucp.php",
-        "/viewonline.php",
-    ]
-    .into_iter()
-    .any(|suffix| path.ends_with(suffix))
-}
-
 fn is_hosting_placeholder_path(path: &str) -> bool {
     matches!(path, "/welcome.png")
         || path.ends_with("/defaultwebpage.cgi")
@@ -178,25 +158,38 @@ mod tests {
     }
 
     #[test]
-    fn detects_archive_noise() {
-        assert!(is_archive_noise_url(
+    fn preserves_forum_pages_that_contain_historical_content() {
+        assert!(!is_archive_noise_url(
+            "http://smallrockets.com/forums/memberlist.php?mode=viewprofile&u=102&sid=abcdef"
+        ));
+        assert!(!is_archive_noise_url(
             "http://smallrockets.com/forums/memberlist.php?first_char=a"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
+            "http://smallrockets.com/forums/search.php?search_id=active_topics"
+        ));
+        assert!(!is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/groupcp.php"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/login.php"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/memberlist.php"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/posting.php"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/search.php"
         ));
+        assert!(!is_archive_noise_url(
+            "http://smallrockets.com/forums/profile.php?mode=viewprofile&u=2"
+        ));
+    }
+
+    #[test]
+    fn detects_archive_noise() {
         assert!(is_archive_noise_url(
             "http://www.smallrockets.com:80/forums/viewforum.php"
         ));
@@ -212,14 +205,14 @@ mod tests {
         assert!(is_archive_noise_url(
             "http://smallrockets.com/forums/cron.php?cron_type=tidy_cache"
         ));
-        assert!(is_archive_noise_url_with_mimetype(
+        assert!(!is_archive_noise_url_with_mimetype(
             "http://example.com/forums/cron.php?cron_type=tidy_cache&sid=abcdef",
             "image/gif"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://smallrockets.com/forums/login.php?redirect=posting.php&mode=quote&p=21728"
         ));
-        assert!(is_archive_noise_url(
+        assert!(!is_archive_noise_url(
             "http://smallrockets.com/forums/posting.php?mode=reply&t=1"
         ));
         assert!(is_archive_noise_url(
@@ -256,12 +249,6 @@ mod tests {
         ));
         assert!(!is_archive_noise_reference(
             "http://example.com/assets/logo.png?sid=abcdef"
-        ));
-        assert!(is_archive_noise_url(
-            "http://smallrockets.com/forums/profile.php?mode=viewprofile&u=2"
-        ));
-        assert!(is_archive_noise_url(
-            "http://smallrockets.com/forums/search.php?search_id=active_topics"
         ));
         assert!(is_archive_noise_url(
             "http://smallrockets.com/basket.htm?action=add&skuid=ArtIsDeadPC1&ticket=0.123"

@@ -23,14 +23,13 @@ use crate::cdx::{
     SnapshotStrategy, fetch_all_records, fetch_all_records_with_policy, fetch_latest_records,
     is_cdx_connectivity_error,
 };
-use crate::download_refs::{extract_downloadable_references, remove_missing_download_links};
-use crate::link_validation::{
-    remove_missing_local_href_links, remove_missing_local_resource_references, validate_local_links,
-};
+use crate::download_refs::extract_related_references;
+use crate::link_validation::validate_local_links;
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
 };
+use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::rewrite::{RewriteContext, rewrite_css, rewrite_html};
 use crate::soft_redirect::is_unusable_html_capture;
 use crate::wayback_client::WaybackClient;
@@ -53,17 +52,18 @@ pub struct DownloadReport {
     pub cancelled: usize,
     pub failed: usize,
     pub unavailable_snapshots: usize,
+    /// Captures saved during this run that still matched the unusable-HTML detector.
+    pub retained_unusable_captures: usize,
     pub aliases_created: usize,
     pub extra_downloads: usize,
     pub linked_files_unavailable: usize,
     pub recovered_static_assets: usize,
     pub static_asset_aliases_created: usize,
     pub unavailable_static_assets: usize,
-    pub download_links_removed: usize,
-    pub local_hrefs_removed: usize,
-    pub local_resources_removed: usize,
     pub local_links_checked: usize,
     pub missing_local_links: usize,
+    /// Distinct missing filesystem targets, not reference occurrences.
+    pub unique_missing_targets: usize,
     pub missing_image_sources: usize,
     pub output_dir: PathBuf,
 }
@@ -88,11 +88,10 @@ pub struct RepairReport {
     pub recovered_static_assets: usize,
     pub static_asset_aliases_created: usize,
     pub unavailable_static_assets: usize,
-    pub download_links_removed: usize,
-    pub local_hrefs_removed: usize,
-    pub local_resources_removed: usize,
     pub local_links_checked: usize,
     pub missing_local_links: usize,
+    /// Distinct missing filesystem targets, not reference occurrences.
+    pub unique_missing_targets: usize,
     pub missing_image_sources: usize,
     pub output_dir: PathBuf,
 }
@@ -128,6 +127,8 @@ impl Default for CancellationFlag {
 struct DownloadJob {
     record: CdxRecord,
     local_path: PathBuf,
+    /// Actual response-byte limit for a linked download; primary captures are uncapped.
+    max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,25 +138,10 @@ struct FallbackOptions {
     strategy: SnapshotStrategy,
 }
 
-const MAX_ALTERNATE_PAGE_CAPTURE_CHECKS: usize = 20;
 const MAX_ALTERNATE_CDX_CONNECTIVITY_FAILURES: usize = 3;
 const SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS: usize = 5;
-const MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS: usize = 20;
 const FIRST_VERBOSE_SNAPSHOT_RETRY_ATTEMPTS: usize = 5;
 const SNAPSHOT_RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SnapshotRetryPolicy;
-
-impl SnapshotRetryPolicy {
-    const fn primary() -> Self {
-        Self
-    }
-
-    const fn recovery() -> Self {
-        Self
-    }
-}
 
 pub async fn download_site(
     client: WaybackClient,
@@ -195,7 +181,11 @@ pub async fn download_site(
         };
 
         if seen_paths.insert(local_path.clone()) {
-            jobs.push(DownloadJob { record, local_path });
+            jobs.push(DownloadJob {
+                record,
+                local_path,
+                max_bytes: None,
+            });
         } else {
             duplicate_paths += 1;
         }
@@ -226,7 +216,8 @@ pub async fn download_site(
     };
     let mut extra_download_refs = HashSet::new();
 
-    for job in jobs {
+    let primary_total = jobs.len();
+    for (index, job) in jobs.into_iter().enumerate() {
         let result = download_one(
             &client,
             &mapper,
@@ -235,17 +226,22 @@ pub async fn download_site(
             &fallback_options,
             &known_paths,
             job,
-            SnapshotRetryPolicy::primary(),
         )
         .await;
         match result {
             Ok(DownloadStatus::Downloaded {
                 extra_download_refs: refs,
+                retained_unusable,
             }) => {
                 report.downloaded += 1;
+                report.retained_unusable_captures += usize::from(retained_unusable);
                 extra_download_refs.extend(refs);
             }
-            Ok(DownloadStatus::Skipped) => report.skipped += 1,
+            Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
+                report.skipped += 1;
+                extra_download_refs.extend(refs);
+            }
+            Ok(DownloadStatus::SizeLimitExceeded) => report.skipped += 1,
             Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
             Err(error) if is_unavailable_snapshot_error(&error) => {
                 report.unavailable_snapshots += 1;
@@ -256,80 +252,91 @@ pub async fn download_site(
                 eprintln!("download failed: {error:#}");
             }
         }
+        if (index + 1).is_multiple_of(100) || index + 1 == primary_total {
+            println!("primary progress: {}/{}; downloaded {}; skipped {}; failed {}; unavailable {}",
+                index + 1, primary_total, report.downloaded, report.skipped,
+                report.failed, report.unavailable_snapshots);
+        }
     }
 
     if options.rewrite_links && report.cancelled == 0 {
         if let Some(max_bytes) = options.extra_download_max_bytes {
-            let extra_resolution = resolve_extra_download_jobs(
-                &client,
-                &archive_root,
-                &mapper,
-                &fallback_options,
-                &extra_download_refs,
-                &mut known_paths,
-                &mut seen_paths,
-                max_bytes,
-            )
-            .await?;
-            if !extra_resolution.jobs.is_empty() {
-                if is_unlimited_extra_download_size(max_bytes) {
-                    println!(
-                        "selected {} linked files without size cap",
-                        extra_resolution.jobs.len()
-                    );
-                } else {
-                    println!(
-                        "selected {} linked files under {} bytes",
-                        extra_resolution.jobs.len(),
-                        max_bytes
-                    );
-                }
-            }
-            if extra_resolution.unavailable > 0 {
-                if is_unlimited_extra_download_size(max_bytes) {
-                    println!(
-                        "linked files unavailable in Wayback: {}",
-                        extra_resolution.unavailable
-                    );
-                } else {
-                    println!(
-                        "linked files unavailable in Wayback or over size limit: {}",
-                        extra_resolution.unavailable
-                    );
-                }
-            }
-            report.linked_files_unavailable = extra_resolution.unavailable;
+			let mut checked_references = HashSet::new();
+			while !extra_download_refs.is_empty() && !options.cancellation.is_cancelled() {
+				extra_download_refs.retain(|reference| {
+					checked_references.insert(normalize_lookup_url(reference))
+				});
+				if extra_download_refs.is_empty() {
+					break;
+				}
+				let extra_resolution = resolve_extra_download_jobs(
+					&client,
+					&archive_root,
+					&mapper,
+					&fallback_options,
+					&extra_download_refs,
+					&mut known_paths,
+					&mut seen_paths,
+					max_bytes,
+					&options.cancellation,
+				)
+				.await?;
+				extra_download_refs.clear();
+				if !extra_resolution.jobs.is_empty() {
+					if is_unlimited_extra_download_size(max_bytes) {
+						println!("selected {} linked files without size cap", extra_resolution.jobs.len());
+					} else {
+						println!("selected {} linked files under {} bytes", extra_resolution.jobs.len(), max_bytes);
+					}
+				}
+				if extra_resolution.unavailable > 0 {
+					if is_unlimited_extra_download_size(max_bytes) {
+						println!("linked files unavailable in Wayback: {}", extra_resolution.unavailable);
+					} else {
+						println!("linked files unavailable in Wayback or over size limit: {}", extra_resolution.unavailable);
+					}
+				}
+				report.linked_files_unavailable += extra_resolution.unavailable;
 
-            for job in extra_resolution.jobs {
-                let result = download_one(
-                    &client,
-                    &mapper,
-                    &archive_root,
-                    &options,
-                    &fallback_options,
-                    &known_paths,
-                    job,
-                    SnapshotRetryPolicy::recovery(),
-                )
-                .await;
-                match result {
-                    Ok(DownloadStatus::Downloaded { .. }) => {
-                        report.downloaded += 1;
-                        report.extra_downloads += 1;
-                    }
-                    Ok(DownloadStatus::Skipped) => report.skipped += 1,
-                    Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
-                    Err(error) if is_unavailable_snapshot_error(&error) => {
-                        report.unavailable_snapshots += 1;
-                        report.linked_files_unavailable += 1;
-                        eprintln!("linked file snapshot unavailable: {error:#}");
-                    }
-                    Err(error) => {
-                        report.failed += 1;
-                        eprintln!("download failed: {error:#}");
-                    }
-                }
-            }
+				for job in extra_resolution.jobs {
+					let result = download_one(
+						&client,
+						&mapper,
+						&archive_root,
+						&options,
+						&fallback_options,
+						&known_paths,
+						job,
+					)
+					.await;
+					match result {
+						Ok(DownloadStatus::Downloaded { retained_unusable, extra_download_refs: refs }) => {
+							report.downloaded += 1;
+							report.retained_unusable_captures += usize::from(retained_unusable);
+							report.extra_downloads += 1;
+							extra_download_refs.extend(refs);
+						}
+						Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
+							report.skipped += 1;
+							extra_download_refs.extend(refs);
+						}
+						Ok(DownloadStatus::SizeLimitExceeded) => {
+							report.skipped += 1;
+							report.linked_files_unavailable += 1;
+						}
+						Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
+						Err(error) if is_unavailable_snapshot_error(&error) => {
+							report.unavailable_snapshots += 1;
+							report.linked_files_unavailable += 1;
+							eprintln!("linked file snapshot unavailable: {error:#}");
+						}
+						Err(error) => {
+							report.failed += 1;
+							eprintln!("download failed: {error:#}");
+						}
+					}
+				}
+			}
         }
 
         let alias_report = create_missing_topic_aliases(&options.output_dir)?;
@@ -405,43 +412,23 @@ pub async fn download_site(
                 );
             }
         }
-        if options.extra_download_max_bytes.is_some() {
-            let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
-            if removed_resources > 0 {
-                println!(
-                    "removed {removed_resources} local resource references with no captured file"
-                );
-            }
-            report.local_resources_removed = removed_resources;
-        }
-
         if options.cancellation.is_cancelled() {
             report.cancelled += 1;
             return Ok(report);
         }
-
-        let removed_download_links = remove_missing_download_links(&options.output_dir)?;
-        if removed_download_links > 0 {
-            println!("removed {removed_download_links} local download links with no captured file");
-        }
-        report.download_links_removed = removed_download_links;
-
-        let removed_local_hrefs = remove_missing_local_href_links(&options.output_dir)?;
-        if removed_local_hrefs > 0 {
-            println!("removed {removed_local_hrefs} local hrefs with no captured file");
-        }
-        report.local_hrefs_removed = removed_local_hrefs;
     }
 
     if options.validate_links && report.cancelled == 0 {
         let validation_report = validate_local_links(&options.output_dir)?;
         report.local_links_checked = validation_report.checked;
         report.missing_local_links = validation_report.missing.len();
+        report.unique_missing_targets = validation_report.unique_missing_targets();
         report.missing_image_sources = validation_report.missing_image_sources.len();
         println!(
-            "validated {} local links; missing {}; images without source {}",
+            "validated {} local links; missing {}; unique missing targets {}; images without source {}",
             validation_report.checked,
             validation_report.missing.len(),
+            report.unique_missing_targets,
             validation_report.missing_image_sources.len()
         );
 
@@ -597,38 +584,19 @@ pub async fn repair_output_dir(
                 );
             }
         }
-        if options.extra_download_max_bytes.is_some() {
-            let removed_resources = remove_missing_local_resource_references(&options.output_dir)?;
-            if removed_resources > 0 {
-                println!(
-                    "removed {removed_resources} local resource references with no captured file"
-                );
-            }
-            report.local_resources_removed = removed_resources;
-        }
-
-        let removed_download_links = remove_missing_download_links(&options.output_dir)?;
-        if removed_download_links > 0 {
-            println!("removed {removed_download_links} local download links with no captured file");
-        }
-        report.download_links_removed = removed_download_links;
-
-        let removed_local_hrefs = remove_missing_local_href_links(&options.output_dir)?;
-        if removed_local_hrefs > 0 {
-            println!("removed {removed_local_hrefs} local hrefs with no captured file");
-        }
-        report.local_hrefs_removed = removed_local_hrefs;
     }
 
     if options.validate_links && !options.cancellation.is_cancelled() {
         let validation_report = validate_local_links(&options.output_dir)?;
         report.local_links_checked = validation_report.checked;
         report.missing_local_links = validation_report.missing.len();
+        report.unique_missing_targets = validation_report.unique_missing_targets();
         report.missing_image_sources = validation_report.missing_image_sources.len();
         println!(
-            "validated {} local links; missing {}; images without source {}",
+            "validated {} local links; missing {}; unique missing targets {}; images without source {}",
             validation_report.checked,
             validation_report.missing.len(),
+            report.unique_missing_targets,
             validation_report.missing_image_sources.len()
         );
 
@@ -790,8 +758,9 @@ fn filter_archive_noise(records: &mut Vec<CdxRecord>) -> usize {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DownloadStatus {
-    Downloaded { extra_download_refs: Vec<String> },
-    Skipped,
+    Downloaded { extra_download_refs: Vec<String>, retained_unusable: bool },
+    Skipped { extra_download_refs: Vec<String> },
+    SizeLimitExceeded,
     Cancelled,
 }
 
@@ -803,15 +772,16 @@ async fn download_one(
     fallback_options: &FallbackOptions,
     known_paths: &HashMap<String, PathBuf>,
     job: DownloadJob,
-    snapshot_retry_policy: SnapshotRetryPolicy,
 ) -> Result<DownloadStatus> {
     if options.cancellation.is_cancelled() {
         return Ok(DownloadStatus::Cancelled);
     }
 
     let destination = options.output_dir.join(&job.local_path);
-    if options.no_clobber && has_non_empty_file(&destination).await? {
-        return Ok(DownloadStatus::Skipped);
+    let skip_existing = options.no_clobber && has_non_empty_file(&destination).await?;
+    if skip_existing && !(options.rewrite_links && options.extra_download_max_bytes.is_some()
+        && should_rewrite_as_text(&job.record, &job.local_path)) {
+        return Ok(DownloadStatus::Skipped { extra_download_refs: Vec::new() });
     }
 
     if let Some(parent) = destination.parent() {
@@ -820,17 +790,25 @@ async fn download_one(
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    println!("{}", job.record.original);
+    println!("capture {}: {} -> {}", job.record.timestamp, job.record.original, job.local_path.display());
+
+    let mut retained_unusable = false;
 
     if should_buffer_response(&job.record, &job.local_path, options.rewrite_links) {
-        let bytes =
-            fetch_record_bytes(client, archive_root, &job.record, &options.cancellation).await?;
+        let (available_record, bytes) = fetch_record_bytes_with_alternate_capture(
+            client,
+            archive_root,
+            fallback_options,
+            &job.record,
+            &options.cancellation,
+        )
+        .await?;
         let (record, bytes) = maybe_replace_unusable_capture(
             client,
             archive_root,
             fallback_options,
             &options.cancellation,
-            &job.record,
+            &available_record,
             bytes,
             &job.local_path,
         )
@@ -840,10 +818,32 @@ async fn download_one(
             return Ok(DownloadStatus::Cancelled);
         }
 
+        retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
+            && is_unusable_html_capture(&String::from_utf8_lossy(&bytes));
+
+        let extra_download_refs = if options.rewrite_links && options.extra_download_max_bytes.is_some()
+            && should_rewrite_as_text(&record, &job.local_path) {
+            extract_related_references(&String::from_utf8_lossy(&bytes), &Url::parse(&record.original)?, mapper, is_css_mimetype(&record.mimetype))?
+        } else {
+            Vec::new()
+        };
+        if skip_existing {
+            return Ok(DownloadStatus::Skipped { extra_download_refs });
+        }
+
+        if job
+            .max_bytes
+            .is_some_and(|limit| bytes.len() as u64 > limit)
+        {
+            eprintln!(
+                "linked file exceeds configured size limit: {}",
+                record.original
+            );
+            return Ok(DownloadStatus::SizeLimitExceeded);
+        }
+
         if options.rewrite_links && should_rewrite_as_text(&record, &job.local_path) {
             let text = String::from_utf8_lossy(&bytes);
-            let extra_download_refs =
-                extract_downloadable_references(&text, &Url::parse(&record.original)?, mapper);
             let context = RewriteContext::new_with_mapper(
                 &record.original,
                 job.local_path.clone(),
@@ -858,9 +858,28 @@ async fn download_one(
             write_bytes_atomic(&destination, rewritten.as_bytes()).await?;
             return Ok(DownloadStatus::Downloaded {
                 extra_download_refs,
+                retained_unusable,
             });
         } else {
             write_bytes_atomic(&destination, &bytes).await?;
+        }
+    } else if let Some(max_bytes) = job.max_bytes {
+        if !download_record_to_file_limited(
+            client,
+            archive_root,
+            &job.record,
+            &destination,
+            max_bytes,
+            Some(fallback_options),
+            &options.cancellation,
+        )
+        .await?
+        {
+            eprintln!(
+                "linked file exceeds configured size limit: {}",
+                job.record.original
+            );
+            return Ok(DownloadStatus::SizeLimitExceeded);
         }
     } else {
         download_record_to_file(
@@ -869,7 +888,6 @@ async fn download_one(
             &job.record,
             &destination,
             fallback_options,
-            snapshot_retry_policy,
             &options.cancellation,
         )
         .await?;
@@ -877,6 +895,7 @@ async fn download_one(
 
     Ok(DownloadStatus::Downloaded {
         extra_download_refs: Vec::new(),
+        retained_unusable,
     })
 }
 
@@ -895,16 +914,23 @@ async fn resolve_extra_download_jobs(
     known_paths: &mut HashMap<String, PathBuf>,
     seen_paths: &mut HashSet<PathBuf>,
     max_bytes: u64,
+    cancellation: &CancellationFlag,
 ) -> Result<ExtraDownloadResolution> {
     let mut resolution = ExtraDownloadResolution::default();
     let mut references = references.iter().cloned().collect::<Vec<_>>();
     references.sort();
 
-    for reference in references {
+    let total = references.len();
+    for (index, reference) in references.into_iter().enumerate() {
+        if cancellation.is_cancelled() {
+            break;
+        }
         let lookup_key = normalize_lookup_url(&reference);
         if known_paths.contains_key(&lookup_key) {
             continue;
         }
+
+        println!("linked lookup [{}/{}]: {}", index + 1, total, reference);
 
         let lookup = find_extra_download_record(
             client,
@@ -920,7 +946,11 @@ async fn resolve_extra_download_jobs(
                 known_paths.insert(lookup_key, local_path.clone());
                 known_paths.insert(normalize_lookup_url(&record.original), local_path.clone());
                 if seen_paths.insert(local_path.clone()) {
-                    resolution.jobs.push(DownloadJob { record, local_path });
+                    resolution.jobs.push(DownloadJob {
+                        record,
+                        local_path,
+                        max_bytes: Some(max_bytes),
+                    });
                 }
             }
             None => {
@@ -1008,7 +1038,6 @@ async fn recover_missing_static_assets(
             &destination,
             max_bytes,
             Some(fallback_options),
-            SnapshotRetryPolicy::recovery(),
             cancellation,
         )
         .await
@@ -1319,9 +1348,6 @@ async fn alternate_text_records_for_source(
             }
 
             alternate_records.push(record);
-            if alternate_records.len() >= MAX_ALTERNATE_PAGE_CAPTURE_CHECKS {
-                return Ok(alternate_records);
-            }
         }
     }
 
@@ -1415,7 +1441,6 @@ async fn ensure_static_asset_alias_source(
         &source,
         max_bytes,
         Some(fallback_options),
-        SnapshotRetryPolicy::recovery(),
         cancellation,
     )
     .await
@@ -1658,6 +1683,11 @@ struct ExtraDownloadLookup {
     record: Option<CdxRecord>,
 }
 
+/// Keeps unknown-length captures eligible; actual response sizes are checked on download.
+fn extra_download_record_fits_limit(record: &CdxRecord, max_bytes: u64) -> bool {
+    record.length.is_none_or(|length| length <= max_bytes)
+}
+
 async fn find_missing_static_asset_record(
     client: &WaybackClient,
     archive_root: &Url,
@@ -1733,7 +1763,7 @@ async fn find_extra_download_record(
             };
 
         for record in records {
-            if record.length.is_some_and(|length| length <= max_bytes) {
+            if extra_download_record_fits_limit(&record, max_bytes) {
                 lookup.record = Some(record);
                 return Ok(lookup);
             }
@@ -1760,6 +1790,7 @@ async fn fetch_record_bytes(
     let mut suppressed_retry_messages = 0usize;
 
     loop {
+        let route = client.active_route_label();
         match fetch_snapshot_response_once(client, &snapshot_url, record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
                 match response
@@ -1776,11 +1807,11 @@ async fn fetch_record_bytes(
                         }
                         retry_snapshot_after_error(
                             record,
+                            &route,
                             &mut attempt,
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
-                            SnapshotRetryPolicy::primary(),
                             cancellation,
                         )
                         .await?;
@@ -1789,25 +1820,25 @@ async fn fetch_record_bytes(
                 }
             }
             Ok(SnapshotResponseAttempt::RetryStatus { status, headers }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_status(
                     record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
-                    SnapshotRetryPolicy::primary(),
                     cancellation,
                 )
                 .await?;
             }
             Ok(SnapshotResponseAttempt::SshFallbackStatus { status }) => {
-                if try_activate_ssh_for_snapshot_status(client, record, status) {
+                if try_activate_ssh_for_snapshot_status(client, record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
@@ -1822,16 +1853,63 @@ async fn fetch_record_bytes(
                 }
                 retry_snapshot_after_error(
                     record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
-                    SnapshotRetryPolicy::primary(),
                     cancellation,
                 )
                 .await?;
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Fetches buffered bytes and changes captures when a CDX-selected replay is unavailable.
+async fn fetch_record_bytes_with_alternate_capture(
+    client: &WaybackClient,
+    archive_root: &Url,
+    fallback_options: &FallbackOptions,
+    record: &CdxRecord,
+    cancellation: &CancellationFlag,
+) -> Result<(CdxRecord, Vec<u8>)> {
+    let mut current_record = record.clone();
+    let mut current_snapshot_url = snapshot_url(archive_root, &current_record)?;
+    let mut seen_records = HashSet::new();
+    let mut alternate_switches = 0usize;
+    remember_snapshot_record(&mut seen_records, &current_record);
+
+    loop {
+        match fetch_record_bytes(client, archive_root, &current_record, cancellation).await {
+            Ok(bytes) => return Ok((current_record, bytes)),
+            Err(error) => {
+                let Some(status) = unavailable_snapshot_error_status(&error) else {
+                    return Err(error);
+                };
+                if !should_try_alternate_snapshot_after_status(status) {
+                    return Err(error);
+                }
+                let reason = format!("returned {status}");
+                if switch_to_alternate_snapshot(
+                    client,
+                    archive_root,
+                    Some(fallback_options),
+                    &mut current_record,
+                    &mut current_snapshot_url,
+                    &mut seen_records,
+                    &mut alternate_switches,
+                    None,
+                    &reason,
+                    cancellation,
+                )
+                .await?
+                {
+                    continue;
+                }
+                return Err(error);
+            }
         }
     }
 }
@@ -1853,7 +1931,6 @@ async fn download_record_to_file(
     record: &CdxRecord,
     destination: &Path,
     fallback_options: &FallbackOptions,
-    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let mut current_record = record.clone();
@@ -1866,6 +1943,7 @@ async fn download_record_to_file(
     remember_snapshot_record(&mut seen_records, &current_record);
 
     loop {
+        let route = client.active_route_label();
         match fetch_snapshot_response_once(client, &snapshot_url, &current_record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
                 match stream_response_to_file(response, destination).await {
@@ -1898,11 +1976,11 @@ async fn download_record_to_file(
                         }
                         retry_snapshot_after_error(
                             &current_record,
+                            &route,
                             &mut attempt,
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
-                            snapshot_retry_policy,
                             cancellation,
                         )
                         .await?;
@@ -1911,25 +1989,25 @@ async fn download_record_to_file(
                 }
             }
             Ok(SnapshotResponseAttempt::RetryStatus { status, headers }) => {
-                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_status(
                     &current_record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
-                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
             }
             Ok(SnapshotResponseAttempt::SshFallbackStatus { status }) => {
-                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
@@ -1964,14 +2042,41 @@ async fn download_record_to_file(
                 }
                 retry_snapshot_after_error(
                     &current_record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
-                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
+            }
+            Err(error)
+                if unavailable_snapshot_error_status(&error)
+                    .is_some_and(should_try_alternate_snapshot_after_status) =>
+            {
+                let status = unavailable_snapshot_error_status(&error).expect("status checked");
+                let reason = format!("returned {status}");
+                if switch_to_alternate_snapshot(
+                    client,
+                    archive_root,
+                    Some(fallback_options),
+                    &mut current_record,
+                    &mut snapshot_url,
+                    &mut seen_records,
+                    &mut alternate_switches,
+                    None,
+                    &reason,
+                    cancellation,
+                )
+                .await?
+                {
+                    attempt = 0;
+                    started_at = Instant::now();
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         }
@@ -1985,7 +2090,6 @@ async fn download_record_to_file_limited(
     destination: &Path,
     max_bytes: u64,
     fallback_options: Option<&FallbackOptions>,
-    snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<bool> {
     let mut current_record = record.clone();
@@ -1998,6 +2102,7 @@ async fn download_record_to_file_limited(
     remember_snapshot_record(&mut seen_records, &current_record);
 
     loop {
+        let route = client.active_route_label();
         match fetch_snapshot_response_once(client, &snapshot_url, &current_record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
                 match stream_response_to_file_limited(response, destination, max_bytes).await {
@@ -2030,11 +2135,11 @@ async fn download_record_to_file_limited(
                         }
                         retry_snapshot_after_error(
                             &current_record,
+                            &route,
                             &mut attempt,
                             started_at,
                             &mut suppressed_retry_messages,
                             &error,
-                            snapshot_retry_policy,
                             cancellation,
                         )
                         .await?;
@@ -2043,25 +2148,25 @@ async fn download_record_to_file_limited(
                 }
             }
             Ok(SnapshotResponseAttempt::RetryStatus { status, headers }) => {
-                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
                 }
                 retry_snapshot_after_status(
                     &current_record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &headers,
                     status,
-                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
             }
             Ok(SnapshotResponseAttempt::SshFallbackStatus { status }) => {
-                if try_activate_ssh_for_snapshot_status(client, &current_record, status) {
+                if try_activate_ssh_for_snapshot_status(client, &current_record, status, attempt) {
                     attempt = 0;
                     suppressed_retry_messages = 0;
                     continue;
@@ -2096,14 +2201,41 @@ async fn download_record_to_file_limited(
                 }
                 retry_snapshot_after_error(
                     &current_record,
+                    &route,
                     &mut attempt,
                     started_at,
                     &mut suppressed_retry_messages,
                     &error,
-                    snapshot_retry_policy,
                     cancellation,
                 )
                 .await?;
+            }
+            Err(error)
+                if unavailable_snapshot_error_status(&error)
+                    .is_some_and(should_try_alternate_snapshot_after_status) =>
+            {
+                let status = unavailable_snapshot_error_status(&error).expect("status checked");
+                let reason = format!("returned {status}");
+                if switch_to_alternate_snapshot(
+                    client,
+                    archive_root,
+                    fallback_options,
+                    &mut current_record,
+                    &mut snapshot_url,
+                    &mut seen_records,
+                    &mut alternate_switches,
+                    Some(max_bytes),
+                    &reason,
+                    cancellation,
+                )
+                .await?
+                {
+                    attempt = 0;
+                    started_at = Instant::now();
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         }
@@ -2130,14 +2262,48 @@ async fn maybe_switch_to_alternate_snapshot(
     if !should_try_alternate_snapshot_after_error(error, attempt) {
         return Ok(false);
     }
-    if *alternate_switches >= MAX_ALTERNATE_SNAPSHOT_CAPTURE_CHECKS {
-        eprintln!(
-            "already tried {} alternate captures for {}; continuing selected capture",
-            *alternate_switches, current_record.original
-        );
-        return Ok(false);
-    }
 
+    match switch_to_alternate_snapshot(
+        client,
+        archive_root,
+        Some(fallback_options),
+        current_record,
+        current_snapshot_url,
+        seen_records,
+        alternate_switches,
+        max_bytes,
+        "failed repeatedly while reading bytes",
+        cancellation,
+    )
+    .await
+    {
+        Ok(switched) => Ok(switched),
+        Err(error) => {
+            eprintln!(
+                "failed to look up alternate captures for {} after body read failures: {error:#}; continuing selected capture",
+                current_record.original
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Switches to the next indexed capture after the current replay cannot be read.
+async fn switch_to_alternate_snapshot(
+    client: &WaybackClient,
+    archive_root: &Url,
+    fallback_options: Option<&FallbackOptions>,
+    current_record: &mut CdxRecord,
+    current_snapshot_url: &mut Url,
+    seen_records: &mut HashSet<(String, String)>,
+    alternate_switches: &mut usize,
+    max_bytes: Option<u64>,
+    reason: &str,
+    cancellation: &CancellationFlag,
+) -> Result<bool> {
+    let Some(fallback_options) = fallback_options else {
+        return Ok(false);
+    };
     let alternate = match find_alternate_snapshot_record(
         client,
         archive_root,
@@ -2147,28 +2313,25 @@ async fn maybe_switch_to_alternate_snapshot(
         max_bytes,
         cancellation,
     )
-    .await
+    .await?
     {
-        Ok(Some(alternate)) => alternate,
-        Ok(None) => {
+        Some(alternate) => alternate,
+        None => {
             eprintln!(
-                "no alternate capture found for {} after repeated snapshot body read failures",
-                current_record.original
-            );
-            return Ok(false);
-        }
-        Err(error) => {
-            eprintln!(
-                "failed to look up alternate captures for {}: {error:#}; continuing selected capture",
-                current_record.original
+                "no alternate capture found for {} after it {}",
+                current_record.original, reason
             );
             return Ok(false);
         }
     };
 
     eprintln!(
-        "snapshot for {} at {} failed repeatedly while reading bytes; trying alternate capture {} at {}",
-        current_record.original, current_record.timestamp, alternate.original, alternate.timestamp
+        "snapshot for {} at {} {}; trying alternate capture {} at {}",
+        current_record.original,
+        current_record.timestamp,
+        reason,
+        alternate.original,
+        alternate.timestamp
     );
 
     *current_record = alternate;
@@ -2276,30 +2439,38 @@ async fn fetch_snapshot_response_once(
 
     let response = response
         .error_for_status()
+        .map_err(|error| {
+            let error = anyhow::Error::from(error);
+            if is_unavailable_snapshot_status(status) {
+                error.context(UnavailableSnapshot(status))
+            } else {
+                error
+            }
+        })
         .with_context(|| format!("Wayback returned an error for {}", record.original))?;
     Ok(SnapshotResponseAttempt::Ready(response))
 }
 
 async fn retry_snapshot_after_status(
     record: &CdxRecord,
+    route: &str,
     attempt: &mut usize,
     started_at: Instant,
     suppressed_retry_messages: &mut usize,
     headers: &HeaderMap,
     status: StatusCode,
-    _snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
     let delay = snapshot_retry_after_delay(headers, *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
-            "Wayback snapshot for {} returned {status} on attempt {} after {}{}; retrying in {} seconds",
+            "Wayback snapshot for {} returned {status} via {route} on attempt {} after {}{}; retrying in {}",
             record.original,
             attempt_number,
             format_snapshot_retry_elapsed(started_at.elapsed()),
             format_snapshot_suppressed_retries(*suppressed_retry_messages),
-            delay.as_secs()
+            format_retry_delay(delay)
         );
         *suppressed_retry_messages = 0;
     } else {
@@ -2312,24 +2483,24 @@ async fn retry_snapshot_after_status(
 
 async fn retry_snapshot_after_error(
     record: &CdxRecord,
+    route: &str,
     attempt: &mut usize,
     started_at: Instant,
     suppressed_retry_messages: &mut usize,
     error: &anyhow::Error,
-    _snapshot_retry_policy: SnapshotRetryPolicy,
     cancellation: &CancellationFlag,
 ) -> Result<()> {
     let attempt_number = (*attempt).saturating_add(1);
     let delay = snapshot_retry_after_delay(&HeaderMap::new(), *attempt);
     if should_log_snapshot_retry_attempt(attempt_number) {
         eprintln!(
-            "Wayback snapshot for {} failed on attempt {} after {}{}: {}; retrying in {} seconds",
+            "Wayback snapshot for {} failed via {route} on attempt {} after {}{}: {}; retrying in {}",
             record.original,
             attempt_number,
             format_snapshot_retry_elapsed(started_at.elapsed()),
             format_snapshot_suppressed_retries(*suppressed_retry_messages),
             format_anyhow_error_chain(error),
-            delay.as_secs()
+            format_retry_delay(delay)
         );
         *suppressed_retry_messages = 0;
     } else {
@@ -2368,26 +2539,38 @@ fn is_unavailable_snapshot_status(status: StatusCode) -> bool {
     )
 }
 
+fn should_try_alternate_snapshot_after_status(status: StatusCode) -> bool {
+    is_unavailable_snapshot_status(status)
+}
+
+/// Marks replay errors so CDX lookup failures cannot be mistaken for missing content.
+#[derive(Debug)]
+struct UnavailableSnapshot(StatusCode);
+
+impl std::fmt::Display for UnavailableSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "snapshot unavailable ({})", self.0)
+    }
+}
+
+/// Returns only statuses attached to replay failures, not statuses from CDX queries.
+fn unavailable_snapshot_error_status(error: &anyhow::Error) -> Option<StatusCode> {
+    error
+        .downcast_ref::<UnavailableSnapshot>()
+        .map(|marker| marker.0)
+}
+
 fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .and_then(reqwest::Error::status)
-            .is_some_and(is_unavailable_snapshot_status)
-    })
+    unavailable_snapshot_error_status(error).is_some()
 }
 
 fn try_activate_ssh_for_snapshot_status(
     client: &WaybackClient,
     record: &CdxRecord,
     status: StatusCode,
+    attempt: usize,
 ) -> bool {
-    if client.is_using_ssh()
-        && !matches!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
-        )
-    {
+    if !should_try_ssh_after_status(status, attempt, client.is_using_ssh()) {
         return false;
     }
 
@@ -2440,6 +2623,7 @@ fn is_retryable_snapshot_error(error: &anyhow::Error) -> bool {
             error.is_connect()
                 || error.is_timeout()
                 || error.is_body()
+                || error.is_decode()
                 || error.status().is_some_and(is_retryable_snapshot_status)
         })
     })
@@ -2449,7 +2633,7 @@ fn is_retryable_snapshot_body_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_body)
+            .is_some_and(|error| error.is_body() || error.is_decode())
     })
 }
 
@@ -2597,7 +2781,7 @@ async fn find_usable_capture(
                 continue;
             }
 
-            println!("{}", candidate.original);
+            println!("fallback capture {}: {}", candidate.timestamp, candidate.original);
             let bytes =
                 match fetch_record_bytes(client, archive_root, &candidate, cancellation).await {
                     Ok(bytes) => bytes,
@@ -2899,6 +3083,61 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
 
+	/// Static repair must inspect unique older page bodies beyond the former twenty-capture cap.
+	#[tokio::test]
+	async fn keeps_all_alternate_page_candidates() {
+		let server = wiremock::MockServer::start().await;
+		let original = "http://example.com/page.html";
+		let rows = (1..=23).map(|day| format!("202001{day:02}000000 {original} text/html 200 DIGEST{day} 100\n")).collect::<String>();
+		wiremock::Mock::given(wiremock::matchers::path("/cdx/search/cdx"))
+			.respond_with(wiremock::ResponseTemplate::new(200).set_body_string(rows))
+			.mount(&server).await;
+		let client = build_client("capture-test", Duration::from_secs(5), Vec::new()).unwrap();
+		let source = CdxRecord { timestamp: "20200201000000".into(), original: original.into(), mimetype: "text/html".into(), status_code: 200, digest: "SOURCE".into(), length: None };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest };
+		let candidates = alternate_text_records_for_source(&client, &Url::parse(&server.uri()).unwrap(), &fallback, &source, Path::new("page.html")).await.unwrap();
+		assert_eq!(candidates.len(), 23);
+	}
+
+	/// A truncated replay remains eligible for a new candidate after twenty previous switches.
+	#[tokio::test]
+	async fn body_failure_can_switch_beyond_twenty_captures() {
+		use std::io::{Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let responder = std::thread::spawn(move || {
+			let (mut connection, _) = listener.accept().unwrap();
+			connection.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+			let mut buffer = [0; 4096];
+			let mut request = Vec::new();
+			while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+				let count = connection.read(&mut buffer).unwrap();
+				assert!(count > 0, "client closed before sending request headers");
+				request.extend_from_slice(&buffer[..count]);
+			}
+			connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").unwrap();
+		});
+		let response = reqwest::Client::new().get(format!("http://{address}")).timeout(Duration::from_secs(5)).send().await.unwrap();
+		let error = anyhow::Error::from(response.bytes().await.unwrap_err());
+		responder.join().unwrap();
+		assert!(is_retryable_snapshot_body_error(&error));
+		let server = wiremock::MockServer::start().await;
+		wiremock::Mock::given(wiremock::matchers::path("/cdx/search/cdx"))
+			.respond_with(wiremock::ResponseTemplate::new(200).set_body_string("20200101000000 http://example.com/game.zip application/zip 200 FILE 100\n"))
+			.mount(&server).await;
+		let client = build_client("capture-test", Duration::from_secs(5), Vec::new()).unwrap();
+		let root = Url::parse(&server.uri()).unwrap();
+		let mut current = CdxRecord { timestamp: "20200201000000".into(), original: "http://example.com/game.zip".into(), mimetype: "application/zip".into(), status_code: 200, digest: "FILE".into(), length: None };
+		let mut replay = snapshot_url(&root, &current).unwrap();
+		let mut seen = HashSet::new();
+		remember_snapshot_record(&mut seen, &current);
+		let mut switches = 20;
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest };
+		assert!(maybe_switch_to_alternate_snapshot(&client, &root, Some(&fallback), &mut current, &mut replay, &mut seen, &mut switches, None, 4, &error, &CancellationFlag::new()).await.unwrap());
+		assert_eq!(switches, 21);
+		assert_eq!(current.timestamp, "20200101000000");
+	}
+
     #[test]
     fn builds_identity_snapshot_url() {
         let root = Url::parse("https://web.archive.org").unwrap();
@@ -2940,6 +3179,17 @@ mod tests {
     }
 
     #[test]
+    fn tries_alternate_capture_for_unavailable_selected_snapshot() {
+        assert!(should_try_alternate_snapshot_after_status(
+            StatusCode::NOT_FOUND
+        ));
+        assert!(should_try_alternate_snapshot_after_status(StatusCode::GONE));
+        assert!(!should_try_alternate_snapshot_after_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+    }
+
+    #[test]
     fn treats_forbidden_snapshot_status_as_ssh_fallback_only() {
         assert!(!is_retryable_snapshot_status(StatusCode::FORBIDDEN));
     }
@@ -2956,14 +3206,6 @@ mod tests {
         assert_eq!(
             snapshot_retry_after_delay(&HeaderMap::new(), 100),
             Duration::from_secs(MAX_WAYBACK_RETRY_DELAY_SECONDS)
-        );
-    }
-
-    #[test]
-    fn recovery_snapshot_policy_matches_primary_patience() {
-        assert_eq!(
-            SnapshotRetryPolicy::recovery(),
-            SnapshotRetryPolicy::primary()
         );
     }
 
@@ -3010,6 +3252,20 @@ mod tests {
 
         assert_eq!(selected.timestamp, "20200303000000");
         assert_eq!(selected.digest, "same-digest");
+    }
+
+    #[test]
+    fn accepts_extra_downloads_with_unknown_cdx_length() {
+        let record = CdxRecord {
+            timestamp: "20200101000000".to_owned(),
+            original: "http://downloads.example.com/game.exe".to_owned(),
+            mimetype: "application/octet-stream".to_owned(),
+            status_code: 200,
+            digest: "digest".to_owned(),
+            length: None,
+        };
+
+        assert!(extra_download_record_fits_limit(&record, u64::MAX));
     }
 
     #[test]

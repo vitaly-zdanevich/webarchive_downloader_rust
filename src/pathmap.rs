@@ -195,6 +195,28 @@ pub fn normalize_lookup_url(input: &str) -> String {
     url.to_string()
 }
 
+/// Removes identity/replay wrappers without losing the original URL's query.
+pub(crate) fn unwrap_wayback_url(value: &str) -> String {
+	let wrapped = if value.starts_with("/web/") {
+		format!("https://web.archive.org{value}")
+	} else if value.starts_with("//web.archive.org/") {
+		format!("https:{value}")
+	} else {
+		value.to_owned()
+	};
+	let Ok(url) = Url::parse(&wrapped) else { return value.to_owned() };
+	if url.host_str() != Some("web.archive.org") {
+		return value.to_owned();
+	}
+	let Some((_, original)) = url.path().strip_prefix("/web/").and_then(|path| path.split_once('/')) else {
+		return value.to_owned();
+	};
+	let Ok(mut original) = Url::parse(original) else { return value.to_owned() };
+	original.set_query(url.query());
+	original.set_fragment(url.fragment());
+	original.to_string()
+}
+
 pub fn canonical_query_without_volatile_params(url: &Url) -> Option<String> {
     let query = url.query()?;
     if query.is_empty() {
@@ -602,6 +624,18 @@ mod tests {
             "http://example.com/forums/viewtopic.php?t=1"
         );
     }
+
+	/// Replay query strings identify different forum pages and must survive unwrapping.
+	#[test]
+	fn unwraps_replays_without_losing_query_or_fragment() {
+		for prefix in ["https://web.archive.org", "//web.archive.org", ""] {
+			assert_eq!(
+				unwrap_wayback_url(&format!("{prefix}/web/20080101000000id_/http://example.com/viewtopic.php?t=7&p=9#p9")),
+				"http://example.com/viewtopic.php?t=7&p=9#p9"
+			);
+		}
+		assert_eq!(unwrap_wayback_url("//assets.example.com/a.gif"), "//assets.example.com/a.gif");
+	}
 
     #[test]
     fn computes_relative_links() {

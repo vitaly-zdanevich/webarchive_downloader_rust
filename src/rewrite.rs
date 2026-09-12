@@ -12,6 +12,7 @@ use crate::download_refs::{is_downloadable_file_url, is_extra_file_url};
 use crate::noise::is_archive_noise_reference;
 use crate::pathmap::{
     SiteMapper, canonical_query_without_volatile_params, normalize_lookup_url, relative_link,
+    unwrap_wayback_url,
 };
 
 macro_rules! attr_rewriter {
@@ -55,8 +56,6 @@ pub struct RewriteContext<'a> {
 pub enum UrlRewrite {
     /// Replace the original reference with the contained local relative path.
     Rewrite(String),
-    /// Remove the reference because it is known noise or an unsupported external file.
-    Suppress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +113,7 @@ impl<'a> RewriteContext<'a> {
     ///
     /// This is intended for resources by default. Document links should use the
     /// internal document-aware path handling so extensionless pages map to
-    /// `index.html`.
+    /// `index.html`. `None` means the original reference must remain unchanged.
     pub fn rewrite_url_reference(&self, value: &str) -> Option<UrlRewrite> {
         self.rewrite_url_reference_as(value, ReferenceKind::Resource)
     }
@@ -134,12 +133,9 @@ impl<'a> RewriteContext<'a> {
         let local_path = if let Some(local_path) = self.known_paths.get(&lookup_key).cloned() {
             local_path
         } else if is_archive_noise_reference(lookup_url.as_str()) {
-            return Some(UrlRewrite::Suppress);
+            return None;
         } else if kind == ReferenceKind::Document && is_downloadable_file_url(&lookup_url) {
-            match self.downloadable_fallback_path(&lookup_url) {
-                Some(local_path) => local_path,
-                None => return Some(UrlRewrite::Suppress),
-            }
+            self.downloadable_fallback_path(&lookup_url)?
         } else if is_extra_file_url(&lookup_url) {
             self.related_resource_fallback_path(&lookup_url, kind)?
         } else {
@@ -155,6 +151,15 @@ impl<'a> RewriteContext<'a> {
     }
 
     fn fallback_same_site_path(&self, url: &Url, kind: ReferenceKind) -> Option<PathBuf> {
+		if let Some(mapper) = self.mapper
+			&& mapper.is_related_host(url.host_str()?)
+		{
+			let mime = match kind {
+				ReferenceKind::Document => "text/html",
+				ReferenceKind::Resource => "application/octet-stream",
+			};
+			return mapper.local_path_for_url(url.as_str(), mime).ok();
+		}
         if !hosts_are_same_site(self.current_original.host_str()?, url.host_str()?) {
             return None;
         }
@@ -316,46 +321,21 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
     String::from_utf8(output).context("rewritten HTML is not valid UTF-8")
 }
 
-/// Rewrites `url(...)` references in one CSS stylesheet or style fragment.
+/// Rewrites URLs and imports in one CSS stylesheet or style fragment.
 ///
-/// The parser is intentionally small but handles `url(` case-insensitively and
-/// preserves the original quoting style when replacing values.
+/// CSS tokens preserve quoting and correctly distinguish escaped URLs from comments or strings.
 pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
-    let lower = input.to_ascii_lowercase();
-    let mut rewritten = String::with_capacity(input.len());
-    let mut offset = 0;
-
-    while let Some(relative_start) = lower[offset..].find("url(") {
-        let value_start = offset + relative_start + 4;
-        let Some(relative_end) = input[value_start..].find(')') else {
-            break;
-        };
-        let value_end = value_start + relative_end;
-
-        rewritten.push_str(&input[offset..value_start]);
-        let raw_url = &input[value_start..value_end];
-        let (quote, value) = trim_css_url(raw_url);
-        match context.rewrite_url_reference(value) {
-            Some(UrlRewrite::Rewrite(new_value)) => {
-                if let Some(quote) = quote {
-                    rewritten.push(quote);
-                    rewritten.push_str(&new_value);
-                    rewritten.push(quote);
-                } else {
-                    rewritten.push_str(&new_value);
-                }
-            }
-            Some(UrlRewrite::Suppress) => {
-                rewritten.push_str("\"\"");
-            }
-            None => rewritten.push_str(raw_url),
-        }
-        rewritten.push(')');
-        offset = value_end + 1;
-    }
-
-    rewritten.push_str(&input[offset..]);
-    rewritten
+	let mut rewritten = String::with_capacity(input.len());
+	let mut offset = 0;
+	for reference in crate::css_refs::references(input) {
+		if let Some(UrlRewrite::Rewrite(value)) = context.rewrite_url_reference(&reference.value) {
+			rewritten.push_str(&input[offset..reference.range.start]);
+			rewritten.push_str(&reference.replacement(&value));
+			offset = reference.range.end;
+		}
+	}
+	rewritten.push_str(&input[offset..]);
+	rewritten
 }
 
 fn rewrite_attr_url(
@@ -371,7 +351,6 @@ fn rewrite_attr_url(
         Some(UrlRewrite::Rewrite(rewritten)) => {
             element.set_attribute(attr, &rewritten).ok();
         }
-        Some(UrlRewrite::Suppress) => suppress_attr_url(element, attr),
         None => {}
     }
 }
@@ -396,30 +375,7 @@ fn rewrite_attr_url_if_reference_like(
         Some(UrlRewrite::Rewrite(rewritten)) => {
             element.set_attribute(attr, &rewritten).ok();
         }
-        Some(UrlRewrite::Suppress) => suppress_attr_url(element, attr),
         None => {}
-    }
-}
-
-fn suppress_attr_url(element: &mut Element<'_, '_>, attr: &str) {
-    let tag_name = element.tag_name().to_ascii_lowercase();
-    if matches!(
-        tag_name.as_str(),
-        "audio"
-            | "embed"
-            | "frame"
-            | "iframe"
-            | "img"
-            | "link"
-            | "object"
-            | "script"
-            | "source"
-            | "track"
-            | "video"
-    ) {
-        element.remove();
-    } else {
-        element.remove_attribute(attr);
     }
 }
 
@@ -453,9 +409,6 @@ fn rewrite_srcset(input: &str, context: &RewriteContext<'_>) -> Option<String> {
                 changed = true;
                 candidates.push(format!("{rewritten}{descriptor}"));
             }
-            Some(UrlRewrite::Suppress) => {
-                changed = true;
-            }
             None => candidates.push(trimmed.to_owned()),
         }
     }
@@ -484,9 +437,6 @@ fn rewrite_attr_comma_separated_urls(
             Some(UrlRewrite::Rewrite(rewritten)) => {
                 changed = true;
                 rewritten_values.push(rewritten);
-            }
-            Some(UrlRewrite::Suppress) => {
-                changed = true;
             }
             None => rewritten_values.push(trimmed.to_owned()),
         }
@@ -549,10 +499,8 @@ fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Op
             (None, &rest[..end], &rest[end..])
         };
 
-    let rewritten = match context.rewrite_url_reference_as(url, ReferenceKind::Document)? {
-        UrlRewrite::Rewrite(rewritten) => rewritten,
-        UrlRewrite::Suppress => String::new(),
-    };
+    let UrlRewrite::Rewrite(rewritten) =
+        context.rewrite_url_reference_as(url, ReferenceKind::Document)?;
     let mut output = String::with_capacity(input.len());
     output.push_str(&input[..value_start]);
     if let Some(quote) = quote {
@@ -570,7 +518,7 @@ fn rewrite_attr_css(element: &mut Element<'_, '_>, attr: &str, context: &Rewrite
     let Some(value) = element.get_attribute(attr) else {
         return;
     };
-    let rewritten = rewrite_css(&value, context);
+    let rewritten = rewrite_css(&html_escape::decode_html_entities(&value), context);
     if rewritten != value {
         element.set_attribute(attr, &rewritten).ok();
     }
@@ -763,10 +711,8 @@ fn javascript_string_literals(input: &str) -> Vec<&str> {
 }
 
 fn url_rewrite_to_javascript_string(rewrite: UrlRewrite) -> String {
-    match rewrite {
-        UrlRewrite::Rewrite(value) => value,
-        UrlRewrite::Suppress => String::new(),
-    }
+    let UrlRewrite::Rewrite(value) = rewrite;
+    value
 }
 
 fn rewrite_html_fragment_in_javascript_string(
@@ -1030,39 +976,6 @@ fn split_fragment(value: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn unwrap_wayback_url(value: &str) -> String {
-    let Ok(url) = Url::parse(value) else {
-        return value.to_owned();
-    };
-    let Some(host) = url.host_str() else {
-        return value.to_owned();
-    };
-    if !host.eq_ignore_ascii_case("web.archive.org") {
-        return value.to_owned();
-    }
-
-    let path = url.path();
-    let Some(rest) = path.strip_prefix("/web/") else {
-        return value.to_owned();
-    };
-    let Some((_, original)) = rest.split_once('/') else {
-        return value.to_owned();
-    };
-    original.to_owned()
-}
-
-fn trim_css_url(raw_url: &str) -> (Option<char>, &str) {
-    let trimmed = raw_url.trim();
-    if trimmed.len() >= 2 {
-        let first = trimmed.as_bytes()[0] as char;
-        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
-        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-            return (Some(first), &trimmed[1..trimmed.len() - 1]);
-        }
-    }
-    (None, trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1029,15 @@ mod tests {
             assert_eq!(rewritten, r#".logo { background: URL('img/logo.png'); }"#);
         });
     }
+
+	/// Imports use the same local mapping as URLs; comments and literal strings are untouched.
+	#[test]
+	fn rewrites_css_imports_and_escaped_urls() {
+		with_context(|context| {
+			let input = r#"@import '/css/site.css' screen; /* url(/missing.png) */ .logo { content: 'url(/missing.png)'; background: url('/img/lo\67 o.png'); }"#;
+			assert_eq!(rewrite_css(input, &context), r#"@import 'css/site.css' screen; /* url(/missing.png) */ .logo { content: 'url(/missing.png)'; background: url('img/logo.png'); }"#);
+		});
+	}
 
     #[test]
     fn rewrites_static_urls_in_rollover_event_attributes() {
@@ -1242,6 +1164,22 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unresolved_forum_anchor_targets() {
+        with_context(|context| {
+            let rewritten = rewrite_html(
+                r#"<a class="topictitle" href="./viewtopic.php?f=43&amp;t=14887&amp;sid=abcdef">[RAS2] Diary Entry #20</a><a class="username-coloured" href="./memberlist.php?mode=viewprofile&amp;u=2&amp;sid=abcdef">jonathan</a><a href="./viewtopic.php?f=43&amp;p=22377#p22377"><img src="styles/prosilver/imageset/icon_topic_latest.gif"></a>"#,
+                &context,
+            )
+            .unwrap();
+
+            assert!(rewritten.contains(r#"<a class="topictitle" href="#));
+            assert!(rewritten.contains(r#"<a class="username-coloured" href="#));
+            assert_eq!(rewritten.matches("<a ").count(), 3);
+            assert_eq!(rewritten.matches("href=").count(), 3);
+        });
+    }
+
+    #[test]
     fn unwraps_wayback_links_before_rewriting() {
         with_context(|context| {
             let rewritten = rewrite_html(
@@ -1255,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_noise_references_without_fallback_paths() {
+    fn preserves_unresolved_references_without_removing_attributes() {
         with_context(|context| {
             let rewritten = rewrite_html(
                 r#"<a href="/forums/login.php">Login</a><img src="/forums/cron.php" width="1" height="1" alt="cron"><img src="/img/logo.png?sid=abcdef">"#,
@@ -1263,14 +1201,14 @@ mod tests {
             )
             .unwrap();
 
-            assert!(rewritten.contains("<a>Login</a>"));
-            assert!(!rewritten.contains("cron.php"));
+            assert!(rewritten.contains(r#"<a href="forums/login.php.html">Login</a>"#));
+            assert!(rewritten.contains(r#"src="forums/cron.php""#));
             assert!(rewritten.contains(r#"src="img/logo.png""#));
         });
     }
 
     #[test]
-    fn suppresses_unresolved_download_links() {
+    fn preserves_unresolved_download_links() {
         with_context(|context| {
             let rewritten = rewrite_html(
                 r#"<a href="http://downloads.example.com/file.exe" target="download">Download</a>"#,
@@ -1278,7 +1216,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(rewritten, r#"<a target="download">Download</a>"#);
+            assert_eq!(
+                rewritten,
+                r#"<a href="http://downloads.example.com/file.exe" target="download">Download</a>"#
+            );
         });
     }
 

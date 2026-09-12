@@ -123,6 +123,22 @@ pub struct LinkValidationReport {
     pub missing_image_sources: Vec<MissingImageSource>,
 }
 
+impl LinkValidationReport {
+	/// Counts distinct missing paths independently of how many pages reference them.
+	pub fn unique_missing_targets(&self) -> usize {
+		self.missing.iter().map(|link| &link.target).collect::<HashSet<_>>().len()
+	}
+}
+
+/// Reuses the validation parser to discover archived HTML and CSS dependencies.
+pub(crate) fn extract_document_references(input: &str, is_css: bool) -> Result<Vec<String>> {
+	if is_css {
+		Ok(extract_css_url_references(input))
+	} else {
+		Ok(extract_html_references(input)?.references)
+	}
+}
+
 /// Validates local references in generated HTML and CSS files.
 ///
 /// The scan checks ordinary attributes, `srcset`, inline CSS, CSS files, common
@@ -546,7 +562,7 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                     if let Some(value) = element.get_attribute("style") {
                         style_attr_references
                             .borrow_mut()
-                            .extend(extract_css_url_references(&value));
+                            .extend(extract_css_url_references(&html_escape::decode_html_entities(&value)));
                     }
                     Ok(())
                 }),
@@ -625,21 +641,7 @@ fn extract_meta_refresh_reference(input: &str) -> Option<String> {
 }
 
 fn extract_css_url_references(input: &str) -> Vec<String> {
-    let lower = input.to_ascii_lowercase();
-    let mut references = Vec::new();
-    let mut offset = 0;
-
-    while let Some(relative_start) = lower[offset..].find("url(") {
-        let value_start = offset + relative_start + 4;
-        let Some(relative_end) = input[value_start..].find(')') else {
-            break;
-        };
-        let value_end = value_start + relative_end;
-        references.push(trim_css_url(&input[value_start..value_end]).to_owned());
-        offset = value_end + 1;
-    }
-
-    references
+	crate::css_refs::references(input).into_iter().map(|reference| reference.value).collect()
 }
 
 fn parse_srcset_references(input: &str) -> Vec<String> {

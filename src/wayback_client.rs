@@ -1,12 +1,19 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Proxy, RequestBuilder};
 use url::Url;
 
+use crate::retry::format_retry_delay;
+
+const SSH_TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const INITIAL_SSH_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_SSH_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+
+/// A Wayback HTTP client that can rotate through SSH SOCKS fallback routes.
 #[derive(Clone)]
 pub struct WaybackClient {
     inner: Arc<WaybackClientInner>,
@@ -24,6 +31,7 @@ enum ActiveWaybackClient {
 }
 
 impl WaybackClient {
+    /// Builds a direct client and lazily configured SSH fallback routes.
     pub fn new(user_agent: &str, timeout: Duration, ssh_destinations: Vec<String>) -> Result<Self> {
         let direct = build_reqwest_client(user_agent, timeout, None)?;
         let ssh_fallbacks = ssh_destinations
@@ -40,10 +48,12 @@ impl WaybackClient {
         })
     }
 
+    /// Creates a GET request through the currently active route.
     pub fn get(&self, url: Url) -> RequestBuilder {
         self.active_client().get(url)
     }
 
+    /// Activates the next SSH fallback that is not in a temporary cooldown.
     pub fn activate_ssh(&self, reason: &str) -> Result<bool> {
         if self.inner.ssh_fallbacks.is_empty() {
             return Ok(false);
@@ -58,12 +68,12 @@ impl WaybackClient {
         self.activate_ssh_from(&mut active, start_index, reason)
     }
 
-    /// Marks the currently active SSH route as unusable and switches route.
+    /// Temporarily cools the currently active SSH route and switches route.
     ///
     /// This is used when the SOCKS proxy is alive but the remote SSH side cannot
     /// connect to Wayback, which appears as SOCKS handshake or channel-open
     /// failures. If no later SSH fallback is available, the client returns to
-    /// direct Wayback access so retries do not stay pinned to a broken tunnel.
+    /// direct Wayback access. Cooled routes become eligible again automatically.
     pub fn recover_from_active_ssh_failure(&self, reason: &str) -> Result<bool> {
         let mut active = lock_unpoisoned(&self.inner.active);
         let ActiveWaybackClient::Ssh { index, .. } = &*active else {
@@ -71,10 +81,11 @@ impl WaybackClient {
         };
         let failed_index = *index;
         let failed = &self.inner.ssh_fallbacks[failed_index];
-        failed.mark_failed();
+        let retry_delay = failed.mark_failed();
         eprintln!(
-            "SSH fallback {} became unusable ({reason}); trying next configured SSH destination",
-            failed.destination()
+            "SSH fallback {} became temporarily unavailable ({reason}); it will be eligible again in {}; trying next configured SSH destination",
+            failed.destination(),
+            format_retry_delay(retry_delay)
         );
         *active = ActiveWaybackClient::Direct;
         if self.activate_ssh_from(&mut active, failed_index.saturating_add(1), reason)? {
@@ -93,6 +104,19 @@ impl WaybackClient {
         )
     }
 
+    /// Describes the route currently used for new Wayback requests.
+    pub fn active_route_label(&self) -> String {
+        match &*lock_unpoisoned(&self.inner.active) {
+            ActiveWaybackClient::Direct => "direct route".to_owned(),
+            ActiveWaybackClient::Ssh { index, .. } => {
+                format!(
+                    "SSH tunnel {}",
+                    self.inner.ssh_fallbacks[*index].destination()
+                )
+            }
+        }
+    }
+
     fn activate_ssh_from(
         &self,
         active: &mut ActiveWaybackClient,
@@ -103,6 +127,7 @@ impl WaybackClient {
             let ssh_fallback = &self.inner.ssh_fallbacks[index];
             let client = match ssh_fallback.client() {
                 Ok(Some(client)) => client,
+                // The failure already announced this cooldown; do not repeat it per request.
                 Ok(None) => continue,
                 Err(error) => {
                     eprintln!(
@@ -113,7 +138,7 @@ impl WaybackClient {
                 }
             };
             eprintln!(
-                "Wayback unavailable via current route ({reason}); retrying through SSH tunnel {}",
+                "Wayback unavailable via current route ({reason}); switching to SSH tunnel {}",
                 ssh_fallback.destination()
             );
             *active = ActiveWaybackClient::Ssh { index, client };
@@ -131,6 +156,11 @@ impl WaybackClient {
     #[cfg(test)]
     fn ssh_fallback_count(&self) -> usize {
         self.inner.ssh_fallbacks.len()
+    }
+
+    #[cfg(test)]
+    fn ssh_retry_remaining_for_test(&self, index: usize) -> Option<Duration> {
+        self.inner.ssh_fallbacks[index].retry_remaining_at(Instant::now())
     }
 
     fn active_client(&self) -> Client {
@@ -151,7 +181,8 @@ struct SshFallback {
 struct SshFallbackState {
     client: Option<Client>,
     tunnel: Option<SshTunnel>,
-    failed: bool,
+    retry_at: Option<Instant>,
+    consecutive_failures: usize,
 }
 
 impl SshFallback {
@@ -171,7 +202,8 @@ impl SshFallback {
             state: Mutex::new(SshFallbackState {
                 client: None,
                 tunnel: None,
-                failed: false,
+                retry_at: None,
+                consecutive_failures: 0,
             }),
         })
     }
@@ -182,9 +214,10 @@ impl SshFallback {
 
     fn client(&self) -> Result<Option<Client>> {
         let mut state = lock_unpoisoned(&self.state);
-        if state.failed {
+        if state.retry_remaining_at(Instant::now()).is_some() {
             return Ok(None);
         }
+        state.retry_at = None;
         if let Some(client) = &state.client {
             return Ok(Some(client.clone()));
         }
@@ -193,20 +226,32 @@ impl SshFallback {
             Ok((tunnel, client)) => {
                 state.tunnel = Some(tunnel);
                 state.client = Some(client.clone());
+                state.consecutive_failures = 0;
                 Ok(Some(client))
             }
             Err(error) => {
-                state.failed = true;
-                Err(error)
+                let retry_delay = state.remember_failure(Instant::now());
+                Err(error.context(format!(
+                    "SSH fallback will be eligible again in {}",
+                    format_retry_delay(retry_delay)
+                )))
             }
         }
     }
 
-    fn mark_failed(&self) {
+    fn mark_failed(&self) -> Duration {
         let mut state = lock_unpoisoned(&self.state);
-        state.failed = true;
-        state.client = None;
-        state.tunnel = None;
+        state.remember_failure(Instant::now())
+    }
+
+    #[cfg(test)]
+    fn retry_remaining_at(&self, now: Instant) -> Option<Duration> {
+        lock_unpoisoned(&self.state).retry_remaining_at(now)
+    }
+
+    #[cfg(test)]
+    fn expire_retry_for_test(&self) {
+        lock_unpoisoned(&self.state).retry_at = Some(Instant::now());
     }
 
     fn start_client(&self) -> Result<(SshTunnel, Client)> {
@@ -216,6 +261,32 @@ impl SshFallback {
         let client = build_reqwest_client(&self.user_agent, self.timeout, Some(proxy))?;
         Ok((tunnel, client))
     }
+}
+
+impl SshFallbackState {
+    fn remember_failure(&mut self, now: Instant) -> Duration {
+        self.client = None;
+        self.tunnel = None;
+        let delay = ssh_retry_delay(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_at = Some(now + delay);
+        delay
+    }
+
+    fn retry_remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.retry_at
+            .and_then(|retry_at| retry_at.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+fn ssh_retry_delay(failure_count: usize) -> Duration {
+    let multiplier = 1u64 << failure_count.min(6);
+    let seconds = INITIAL_SSH_RETRY_DELAY
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(MAX_SSH_RETRY_DELAY.as_secs());
+    Duration::from_secs(seconds)
 }
 
 struct SshTunnel {
@@ -232,7 +303,7 @@ impl SshTunnel {
             .context("failed to read local SSH SOCKS port")?;
         drop(listener);
 
-        let mut child = Command::new("ssh")
+        let child = Command::new("ssh")
             .arg("-N")
             .arg("-D")
             .arg(local_addr.to_string())
@@ -244,6 +315,11 @@ impl SshTunnel {
             .arg("ServerAliveCountMax=3")
             .arg("-o")
             .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!(
+                "ConnectTimeout={}",
+                SSH_TUNNEL_READY_TIMEOUT.as_secs()
+            ))
             .arg(destination)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -251,14 +327,20 @@ impl SshTunnel {
             .spawn()
             .with_context(|| format!("failed to start SSH tunnel to {destination}"))?;
 
-        wait_for_ssh_tunnel(&mut child, local_addr)
+        let mut tunnel = Self { child, local_addr };
+        tunnel
+            .wait_until_ready(SSH_TUNNEL_READY_TIMEOUT)
             .with_context(|| format!("SSH tunnel to {destination} did not become ready"))?;
 
-        Ok(Self { child, local_addr })
+        Ok(tunnel)
     }
 
     fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        wait_for_ssh_tunnel(&mut self.child, self.local_addr, timeout)
     }
 }
 
@@ -269,18 +351,24 @@ impl Drop for SshTunnel {
     }
 }
 
-fn wait_for_ssh_tunnel(child: &mut Child, local_addr: SocketAddr) -> Result<()> {
-    for _ in 0..40 {
+fn wait_for_ssh_tunnel(child: &mut Child, local_addr: SocketAddr, timeout: Duration) -> Result<()> {
+    let started_at = Instant::now();
+    loop {
         if let Some(status) = child.try_wait().context("failed to poll SSH tunnel")? {
             bail!("ssh exited early with status {status}");
         }
         if TcpStream::connect_timeout(&local_addr, Duration::from_millis(100)).is_ok() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let elapsed = started_at.elapsed();
+        if elapsed >= timeout {
+            bail!(
+                "timed out after {} waiting for local SOCKS listener at {local_addr}",
+                format_retry_delay(timeout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(elapsed)));
     }
-
-    bail!("timed out waiting for local SOCKS listener at {local_addr}");
 }
 
 fn build_reqwest_client(
@@ -309,19 +397,20 @@ mod tests {
     #[test]
     fn builds_without_ssh_fallback() {
         let client = WaybackClient::new(
-            "webarchive-downloader-rust/0.1",
+            crate::DEFAULT_USER_AGENT,
             Duration::from_secs(1),
             Vec::new(),
         )
         .unwrap();
 
         assert!(!client.is_ssh_configured());
+        assert_eq!(client.active_route_label(), "direct route");
     }
 
     #[test]
     fn builds_with_multiple_ssh_fallbacks() {
         let client = WaybackClient::new(
-            "webarchive-downloader-rust/0.1",
+            crate::DEFAULT_USER_AGENT,
             Duration::from_secs(1),
             vec![
                 "ubuntu@151.145.94.114".to_owned(),
@@ -338,7 +427,7 @@ mod tests {
     fn rejects_empty_ssh_destination() {
         assert!(
             WaybackClient::new(
-                "webarchive-downloader-rust/0.1",
+                crate::DEFAULT_USER_AGENT,
                 Duration::from_secs(1),
                 vec![" ".to_owned()]
             )
@@ -347,16 +436,16 @@ mod tests {
     }
 
     #[test]
-    fn recovers_from_active_ssh_failure_without_reusing_failed_fallback() {
+    fn active_ssh_failure_temporarily_cools_fallback() {
         let direct = build_reqwest_client(
-            "webarchive-downloader-rust/0.1",
+            crate::DEFAULT_USER_AGENT,
             Duration::from_secs(1),
             None,
         )
         .unwrap();
         let fallback = SshFallback::new(
             "ubuntu@151.145.94.114".to_owned(),
-            "webarchive-downloader-rust/0.1".to_owned(),
+            crate::DEFAULT_USER_AGENT.to_owned(),
             Duration::from_secs(1),
         )
         .unwrap();
@@ -372,6 +461,10 @@ mod tests {
         };
 
         assert!(client.is_using_ssh());
+        assert_eq!(
+            client.active_route_label(),
+            "SSH tunnel ubuntu@151.145.94.114"
+        );
         assert!(
             client
                 .recover_from_active_ssh_failure("SOCKS handshake failed")
@@ -379,12 +472,36 @@ mod tests {
         );
         assert!(!client.is_using_ssh());
         assert!(!client.activate_ssh("retry").unwrap());
+        assert!(client.ssh_retry_remaining_for_test(0).is_some());
+    }
+
+    #[test]
+    fn failed_ssh_fallback_becomes_eligible_after_cooldown() {
+        let fallback = SshFallback::new(
+            "ubuntu@151.145.94.114".to_owned(),
+            crate::DEFAULT_USER_AGENT.to_owned(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        fallback.mark_failed();
+        assert!(fallback.retry_remaining_at(Instant::now()).is_some());
+
+        fallback.expire_retry_for_test();
+        assert_eq!(fallback.retry_remaining_at(Instant::now()), None);
+    }
+
+    #[test]
+    fn ssh_retry_delay_is_exponential_and_capped() {
+        assert_eq!(ssh_retry_delay(0), Duration::from_secs(60));
+        assert_eq!(ssh_retry_delay(1), Duration::from_secs(120));
+        assert_eq!(ssh_retry_delay(100), Duration::from_secs(3600));
     }
 
     #[test]
     fn active_ssh_recovery_is_noop_for_direct_route() {
         let client = WaybackClient::new(
-            "webarchive-downloader-rust/0.1",
+            crate::DEFAULT_USER_AGENT,
             Duration::from_secs(1),
             vec!["ubuntu@151.145.94.114".to_owned()],
         )
@@ -392,5 +509,22 @@ mod tests {
 
         assert!(!client.is_using_ssh());
         assert!(!client.recover_from_active_ssh_failure("direct").unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_ssh_tunnel_kills_and_reaps_child_process() {
+        use std::path::Path;
+
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let child_pid = child.id();
+        let tunnel = SshTunnel {
+            child,
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+
+        drop(tunnel);
+
+        assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
     }
 }
