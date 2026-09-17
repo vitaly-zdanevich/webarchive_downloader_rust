@@ -130,7 +130,10 @@ impl<'a> RewriteContext<'a> {
         let mut lookup_url = resolved.clone();
         lookup_url.set_fragment(None);
         let lookup_key = normalize_lookup_url(lookup_url.as_str());
-        let local_path = if let Some(local_path) = self.known_paths.get(&lookup_key).cloned() {
+        let known_path = self.known_paths.get(&lookup_key).or_else(|| {
+			self.mapper?.known_path_for_url(&lookup_url, self.known_paths)
+		});
+        let local_path = if let Some(local_path) = known_path.cloned() {
             local_path
         } else if is_archive_noise_reference(lookup_url.as_str()) {
             return None;
@@ -979,6 +982,62 @@ fn split_fragment(value: &str) -> (&str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Session-only navigation must find an HTML capture across primary host variants.
+	#[test]
+	fn rewrites_session_navigation_across_primary_host_and_scheme_variants() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let known = HashMap::from([(
+			"http://www.example.com/forums/faq.php".to_owned(),
+			PathBuf::from("forums/faq.php.html"),
+		)]);
+		for original in [
+			"http://www.example.com/forums/topic.php?t=1",
+			"http://example.com/forums/topic.php?t=1",
+			"https://www.example.com/forums/topic.php?t=1",
+			"https://example.com/forums/topic.php?t=1",
+		] {
+			let context = RewriteContext::new_with_mapper(original, "forums/topic.html".into(), &known, &mapper).unwrap();
+			let actual = rewrite_html(r##"<a href="./faq.php?sid=abc#help">FAQ</a>"##, &context).unwrap();
+			assert_eq!(actual, r##"<a href="faq.php.html#help">FAQ</a>"##, "{original}");
+		}
+	}
+
+	/// Alternate lookup must retain page selectors and the destination's recorded MIME path.
+	#[test]
+	fn equivalent_lookup_preserves_query_specific_mime_paths() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let known = HashMap::from([
+			("http://www.example.com/forums/style.php?id=1".to_owned(), PathBuf::from("forums/selected.css")),
+			("http://www.example.com/forums/faq.php?id=1".to_owned(), PathBuf::from("forums/selected.html")),
+		]);
+		let context = RewriteContext::new_with_mapper("https://example.com/forums/topic.php", "forums/topic.html".into(), &known, &mapper).unwrap();
+		let actual = rewrite_html(r#"<link href="style.php?sid=abc&amp;id=1"><a href="faq.php?sid=abc&amp;id=1">FAQ</a>"#, &context).unwrap();
+		assert_eq!(actual, r#"<link href="selected.css"><a href="selected.html">FAQ</a>"#);
+		let different_page = rewrite_html(r#"<a href="faq.php?id=2">Other</a>"#, &context).unwrap();
+		assert!(!different_page.contains("selected.html"));
+	}
+
+	/// Host fallback must not guess between conflicting paths or cross ports/subdomains.
+	#[test]
+	fn equivalent_lookup_keeps_ambiguous_and_unrelated_session_links() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let known = HashMap::from([
+			("http://example.com/faq.php".to_owned(), PathBuf::from("first.html")),
+			("https://www.example.com/faq.php".to_owned(), PathBuf::from("second.html")),
+		]);
+		let context = RewriteContext::new_with_mapper("http://www.example.com/index.html", "index.html".into(), &known, &mapper).unwrap();
+		for href in [
+			"faq.php?sid=abc", "http://example.com:8080/faq.php?sid=abc",
+			"http://other.example.com/faq.php?sid=abc", "http://unrelated.invalid/faq.php?sid=abc",
+			"http://user:password@example.com/faq.php?sid=abc",
+		] {
+			let input = format!("<a href=\"{href}\">FAQ</a>");
+			assert_eq!(rewrite_html(&input, &context).unwrap(), input);
+		}
+		let exact = RewriteContext::new_with_mapper("https://www.example.com/index.html", "index.html".into(), &known, &mapper).unwrap();
+		assert_eq!(rewrite_html(r#"<a href="faq.php?sid=abc">FAQ</a>"#, &exact).unwrap(), r#"<a href="second.html">FAQ</a>"#);
+	}
 
     fn with_context<T>(test: T)
     where

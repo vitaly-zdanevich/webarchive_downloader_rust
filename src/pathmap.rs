@@ -123,6 +123,47 @@ impl SiteMapper {
         Ok(paths)
     }
 
+	/// Finds an exact capture path before considering equivalent output hosts/schemes.
+	///
+	/// Only default-port HTTP(S) URLs on related hosts participate in fallback.
+	/// Primary www/bare hosts share an output root; other subdomains stay distinct.
+	/// Conflicting fallback paths are not guessed, and query selectors are retained.
+	pub(crate) fn known_path_for_url<'a>(
+		&self,
+		url: &Url,
+		known_paths: &'a HashMap<String, PathBuf>,
+	) -> Option<&'a PathBuf> {
+		if let Some(path) = known_paths.get(&normalize_lookup_url(url.as_str())) {
+			return Some(path);
+		}
+		let host = url.host_str()?;
+		if !self.is_related_host(host) || !matches!(url.scheme(), "http" | "https")
+			|| url.port().is_some() || !url.username().is_empty() || url.password().is_some()
+		{
+			return None;
+		}
+		let hosts = if self.is_primary_host(host) {
+			self.primary_hosts.iter().map(String::as_str).collect::<Vec<_>>()
+		} else {
+			vec![host]
+		};
+		let mut found = None;
+		for host in hosts {
+			for scheme in ["http", "https"] {
+				let mut candidate = url.clone();
+				candidate.set_host(Some(host)).ok()?;
+				candidate.set_scheme(scheme).ok()?;
+				if let Some(path) = known_paths.get(&normalize_lookup_url(candidate.as_str())) {
+					if found.is_some_and(|previous| previous != path) {
+						return None;
+					}
+					found = Some(path);
+				}
+			}
+		}
+		found
+	}
+
     pub fn original_url_candidates_for_local_path(&self, local_path: &Path) -> Vec<String> {
         let mut components = local_path
             .components()
