@@ -8,13 +8,13 @@ on:
         required: false
         type: string
       match_type:
-        description: "Wayback CDX match type"
+        description: "Wayback CDX discovery scope (domain includes subdomains)"
         required: true
-        default: host
+        default: domain
         type: choice
         options:
-          - host
           - domain
+          - host
           - prefix
           - exact
       from:

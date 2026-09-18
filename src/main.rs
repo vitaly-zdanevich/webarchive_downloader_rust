@@ -29,8 +29,9 @@ struct Cli {
     #[arg(short, long, default_value = "public")]
     output: PathBuf,
 
-    /// CDX match type used by the Internet Archive. Use "domain" only when you also want subdomains.
-    #[arg(long, value_enum, default_value_t = MatchType::Host)]
+	/// CDX discovery scope: "domain" includes subdomains; "host" searches only the specified host and may download less.
+	/// Linked content on related subdomains can still be downloaded.
+	#[arg(long, value_enum, default_value_t = MatchType::Domain)]
     match_type: MatchType,
 
     /// Which capture to keep when a URL has multiple archived snapshots.
@@ -488,6 +489,47 @@ fn format_elapsed_time(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Both help forms distinguish initial host discovery from linked subdomain downloads.
+	#[test]
+	fn help_explains_host_scope_and_linked_subdomains() {
+		for flag in ["-h", "--help"] {
+			let error = Cli::try_parse_from(["webarchive-downloader-rust", flag]).unwrap_err();
+			assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+			let help = error.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+			assert!(help.contains("\"domain\" includes subdomains"), "{help}");
+			assert!(help.contains("\"host\" searches only the specified host and may download less"), "{help}");
+			assert!(help.contains("Linked content on related subdomains can still be downloaded"), "{help}");
+			assert!(help.contains("[default: domain]"), "{help}");
+		}
+	}
+
+	/// All CLI discovery modes include indexed subdomains unless explicitly narrowed.
+	#[test]
+	fn default_match_type_includes_subdomains() {
+		for mode in [None, Some("--list"), Some("--repair-output")] {
+			let mut args = vec!["webarchive-downloader-rust", "example.com"];
+			args.extend(mode);
+			let cli = Cli::try_parse_from(args).unwrap();
+			assert_eq!(cli.match_type, MatchType::Domain);
+		}
+	}
+
+	/// Explicit matching scopes remain available when the default is broader.
+	#[test]
+	fn explicit_match_type_overrides_default() {
+		for (argument, expected) in [
+			("host", MatchType::Host),
+			("prefix", MatchType::Prefix),
+			("exact", MatchType::Exact),
+			("domain", MatchType::Domain),
+		] {
+			let cli = Cli::try_parse_from([
+				"webarchive-downloader-rust", "example.com", "--match-type", argument,
+			]).unwrap();
+			assert_eq!(cli.match_type, expected);
+		}
+	}
 
 	/// Release metadata and the default HTTP identity must use the same package version.
 	#[test]

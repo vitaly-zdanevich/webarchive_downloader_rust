@@ -64,17 +64,17 @@ cargo run --release -- another.by
 
 ## Usage
 
-Download one host into `public/`:
+Download a domain, including its archived subdomains, into `public/`:
 
 ```sh
 webarchive-downloader-rust another.by
 ```
 
-Download a whole domain, including subdomains, only when you explicitly want a
-multi-host archive:
+Narrow the initial CDX search to one host when a domain-wide inventory is not
+needed (linked discovery can still follow references to related subdomains):
 
 ```sh
-webarchive-downloader-rust another.by --match-type domain
+webarchive-downloader-rust another.by --match-type host
 ```
 
 Choose an output directory. If a previous run was interrupted, run the same command again and already completed files will be skipped:
@@ -153,11 +153,12 @@ To include indexed subdomains and recursively follow archived links without a
 file-size cap or date limit, use:
 
 ```sh
-webarchive-downloader-rust smallrockets.com --match-type domain --recover-existing \
+webarchive-downloader-rust smallrockets.com --recover-existing \
 	--output /tmp/smallrockets-preservation
 ```
 
-No extra flag is needed to enable linked discovery or unlimited file sizes.
+No extra flag is needed to include indexed subdomains, enable linked discovery,
+or allow unlimited file sizes.
 Do not pass `--limit`, `--no-rewrite`, or `--max-extra-download-size-mib 0` for
 this mode. Add `--ssh USER@HOST` only for a working, trusted SSH route. A normal
 run against an existing output directory reuses local pages and saved original
@@ -190,7 +191,8 @@ existing files or inventing page content. Recovery remains limited to content
 that Wayback can actually return; the tool cannot recreate unarchived posts.
 Recovery stays within related hosts and the requested date range, fetches from
 Wayback rather than live sites, and stops following cycles already visited in
-the current run. This can take longer than the initial host-only download.
+the current run. Domain-wide discovery can take longer than an explicit
+host-scoped run.
 
 This is not a complete historical backup of every capture: one selected version
 per mapped URL is saved. Content never captured by Wayback, inaccessible
@@ -202,7 +204,7 @@ This repository includes a manual `Archive website` GitHub Actions workflow for
 small sites. Open the Actions tab, choose `Archive website`, click `Run workflow`,
 and provide a domain or URL. The workflow builds the downloader, writes the site
 to `public/`, packs `website-archive.tar.gz`, and stores it as a downloadable
-artifact for 7 days.
+artifact for 7 days. Its `match_type` input defaults to `domain`, matching the CLI.
 
 For repeated runs, set the `ARCHIVE_TARGET` repository variable and leave the
 manual `target` input empty. Optional variables and secrets:
@@ -242,7 +244,7 @@ Useful options:
 --max-extra-download-size-mib N
 --timeout-seconds N
 --ssh USER@HOST  (repeatable)
---user-agent "webarchive-downloader-rust/0.3.0 your-email@example.com"
+--user-agent "webarchive-downloader-rust/0.4.0 your-email@example.com"
 ```
 
 ## GitLab Pages
@@ -271,17 +273,19 @@ Review the result locally, commit `public/`, and push to GitLab.
 
 ## Notes
 
-The default `--match-type host` asks the CDX API for one host only. This produces
-a root-level static site that is easier to host on GitLab Pages. If you use
-`--match-type domain`, subdomains are written under `_hosts/<hostname>/` so their
-paths cannot collide with the primary site.
+The default `--match-type domain` asks the CDX API for the target and its
+subdomains to maximize content discovery, including pages not linked from the
+primary site. Subdomains are written under `_hosts/<hostname>/` so their paths
+cannot collide with the primary site. Use `--match-type host` to narrow the
+initial CDX search to one host.
 
 Even with `--match-type host`, the downloader follows linked pages and resources
 on related hosts. Each recovered HTML/CSS document contributes another wave of
 references, including extensionless pages, `srcset` images, CSS `@import` rules,
 and nested stylesheet resources. Protocol-relative URLs and Wayback-wrapped
-URLs retain their original queries. Only referenced subdomain URLs are queried;
-there is no blanket subdomain CDX scan unless `--match-type domain` is selected.
+URLs retain their original queries. With `--match-type host`, only referenced
+subdomain URLs are queried; that mode skips the domain-wide CDX inventory but
+does not prohibit related-host downloads.
 Extra subdomain files are stored under
 `_hosts/<hostname>/`. By default there is no size cap for preservation
 completeness. Use `--max-extra-download-size-mib N` to cap each extra download

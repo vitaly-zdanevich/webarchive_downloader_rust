@@ -10,6 +10,51 @@ use std::sync::{
 use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+/// Default discovery downloads unlinked subdomain content; explicit host scope stays narrower.
+#[tokio::test]
+async fn default_domain_discovery_downloads_unlinked_subdomain_content() {
+	let server = MockServer::start().await;
+	let primary = "20260918000000 http://example.com/index.html text/html 200 PRIMARY 100\n";
+	let subdomain = "20260918000000 http://archive.example.com/history.html text/html 200 HISTORY 100\n";
+	for (scope, records) in [
+		("host", primary.to_owned()),
+		("domain", format!("{primary}{subdomain}")),
+	] {
+		Mock::given(path("/cdx/search/cdx"))
+			.and(query_param("url", "example.com"))
+			.and(query_param("matchType", scope))
+			.respond_with(ResponseTemplate::new(200).set_body_string(records))
+			.expect(1)
+			.mount(&server).await;
+	}
+	for (original, body, requests) in [
+		("http://example.com/index.html", "<p>Main site</p>", 2),
+		("http://archive.example.com/history.html", "<p>Unlinked history</p>", 1),
+	] {
+		Mock::given(path(format!("/web/20260918000000id_/{original}")))
+			.respond_with(ResponseTemplate::new(200).set_body_string(body))
+			.expect(requests)
+			.mount(&server).await;
+	}
+	for (arguments, includes_subdomains) in [
+		(Vec::new(), true),
+		(vec!["--match-type", "host"], false),
+	] {
+		let output = tempfile::tempdir().unwrap();
+		let result = run_cli(&server, output.path(), &arguments, None).await;
+		assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+		assert_eq!(
+			std::fs::read_to_string(output.path().join("index.html")).unwrap(),
+			"<p>Main site</p>",
+		);
+		let history = output.path().join("_hosts/archive.example.com/history.html");
+		assert_eq!(history.is_file(), includes_subdomains);
+		if includes_subdomains {
+			assert_eq!(std::fs::read_to_string(history).unwrap(), "<p>Unlinked history</p>");
+		}
+	}
+}
+
 /// A saved forum error remains a preservation defect even when all files exist.
 #[test]
 fn strict_validation_reports_unusable_html_without_network() {
