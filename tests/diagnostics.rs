@@ -10,6 +10,20 @@ use std::sync::{
 use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+/// A saved forum error remains a preservation defect even when all files exist.
+#[test]
+fn strict_validation_reports_unusable_html_without_network() {
+	let output = tempfile::tempdir().unwrap();
+	std::fs::write(output.path().join("topic.html"), "<table><tr><td align='center'><span class='gen'>The topic or post you requested does not exist</span></td></tr></table>").unwrap();
+	let result = Command::new(env!("CARGO_BIN_EXE_webarchive-downloader-rust"))
+		.args(["--validate-only", "--strict-validate-links", "--output"]).arg(output.path())
+		.args(["--archive-root", "http://127.0.0.1:1"]).output().unwrap();
+	assert_eq!(result.status.code(), Some(2));
+	let stdout = String::from_utf8_lossy(&result.stdout);
+	assert!(stdout.contains("unusable HTML files: 1"), "{stdout}");
+	assert!(stdout.contains("topic.html"), "{stdout}");
+}
+
 /// Runs the real CLI with isolated output and optional fake SSH on PATH.
 async fn run_cli(server: &MockServer, output: &Path, extra: &[&str], ssh: Option<&Path>) -> Output {
 	let mut command = Command::new(env!("CARGO_BIN_EXE_webarchive-downloader-rust"));

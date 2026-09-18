@@ -121,6 +121,8 @@ pub struct LinkValidationReport {
     pub missing: Vec<MissingLocalLink>,
     /// Image elements that cannot render because no source attribute exists.
     pub missing_image_sources: Vec<MissingImageSource>,
+	/// Existing HTML files recognized as redirects or missing-content/error placeholders.
+	pub unusable_html: Vec<PathBuf>,
 }
 
 impl LinkValidationReport {
@@ -155,6 +157,9 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
         let input = read_lossy(&file)?;
         let references =
             if is_html_file(&file) {
+				if crate::soft_redirect::is_unusable_html_capture(&input) {
+					report.unusable_html.push(file.clone());
+				}
                 let html_report = extract_html_references(&input)
                     .with_context(|| format!("failed to parse {}", file.display()))?;
                 report.missing_image_sources.extend(
@@ -796,7 +801,8 @@ fn collect_candidate_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn collect_html_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// Collects regular HTML files without following directory or file symlinks.
+pub(crate) fn collect_html_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
         let file_type = entry
@@ -813,7 +819,73 @@ fn collect_html_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn resolve_local_reference(root: &Path, from_file: &Path, href: &str) -> Option<PathBuf> {
+/// Repairs only proven, local HTML-suffix navigation links, preserving other bytes.
+///
+/// This intentionally does not rerun archive URL rewriting on already mapped URLs.
+/// Pages with a base URL, forms, meaningful queries and missing destinations stay intact.
+pub(crate) fn repair_local_navigation_html(
+	root: &Path,
+	file: &Path,
+	input: &[u8],
+) -> Result<(Vec<u8>, usize)> {
+	let mut output = Vec::with_capacity(input.len());
+	let repaired = Cell::new(0);
+	let has_base = Cell::new(false);
+	{
+		let settings = Settings {
+			element_content_handlers: vec![
+				element!("base[href]", |_| { has_base.set(true); Ok(()) }),
+				element!("a[href], area[href]", |element| {
+					if let Some(href) = element.get_attribute("href")
+						&& let Some(replacement) = existing_html_navigation_target(root, file, &href)
+					{
+						element.set_attribute("href", &replacement)?;
+						repaired.set(repaired.get() + 1);
+					}
+					Ok(())
+				}),
+			],
+			..Settings::default()
+		};
+		let mut rewriter = HtmlRewriter::new(settings, |chunk: &[u8]| output.extend_from_slice(chunk));
+		rewriter.write(input)?;
+		rewriter.end()?;
+	}
+	if has_base.get() { return Ok((Vec::new(), 0)); }
+	Ok((output, repaired.get()))
+}
+
+/// Resolves a missing relative dynamic-page link only to its existing HTML counterpart.
+fn existing_html_navigation_target(root: &Path, file: &Path, href: &str) -> Option<String> {
+	let decoded = html_escape::decode_html_entities(href);
+	let href = decoded.trim();
+	let target = resolve_local_reference(root, file, href)?;
+	if target_exists_for_static_host(&target) { return None; }
+	let extension = target.extension()?.to_str()?.to_ascii_lowercase();
+	if !matches!(extension.as_str(), "php" | "cgi" | "asp" | "aspx" | "jsp" | "cfm") {
+		return None;
+	}
+	let url = Url::parse("https://local-repair.invalid/").ok()?.join(href).ok()?;
+	if url.query_pairs().any(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(),
+		"sid" | "sessionid" | "session_id" | "phpsessid" | "jsessionid" | "aspsessionid" | "cfid" | "cftoken"
+	)) {
+		return None;
+	}
+	let candidate = target.with_file_name(format!("{}.html", target.file_name()?.to_str()?));
+	let canonical = candidate.canonicalize().ok()?;
+	if !canonical.starts_with(root) { return None; }
+	let metadata = fs::metadata(&canonical).ok()?;
+	if !metadata.is_file() || metadata.len() == 0 { return None; }
+	let mut replacement = format!("{}.html", strip_query_and_fragment(href));
+	if let Some((_, fragment)) = href.split_once('#') {
+		replacement.push('#');
+		replacement.push_str(fragment);
+	}
+	Some(replacement)
+}
+
+/// Resolves a relative reference inside the output tree without following symlinks.
+pub(crate) fn resolve_local_reference(root: &Path, from_file: &Path, href: &str) -> Option<PathBuf> {
     let trimmed = href.trim();
     if trimmed.is_empty() || should_skip_reference(trimmed) || Url::parse(trimmed).is_ok() {
         return None;

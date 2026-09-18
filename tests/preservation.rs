@@ -46,11 +46,179 @@ fn options(output_dir: &Path, max_bytes: Option<u64>) -> DownloadOptions {
 	DownloadOptions {
 		output_dir: output_dir.to_owned(),
 		no_clobber: true,
+		recover_existing: false,
 		rewrite_links: true,
 		extra_download_max_bytes: max_bytes,
 		validate_links: true,
 		cancellation: CancellationFlag::new(),
 	}
+}
+
+/// Resume must use local pages to discover missing resources without replaying good HTML.
+#[tokio::test]
+async fn resume_preserves_good_page_when_replay_has_disappeared() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let original = "http://example.com/index.html";
+	let html = b"<p>Previously recovered content</p><img src='image.gif'>";
+	std::fs::write(output.path().join("index.html"), html).unwrap();
+	mock_cdx(&server, "example.com", "host", &format!("20260917000000 {original} text/html 200 PAGE 100\n20260917000000 http://example.com/image.gif image/gif 200 IMAGE 100\n")).await;
+	mock_capture(&server, "20260917000000", "http://example.com/image.gif", 200, "mock image").await;
+	let report = download_site(
+		build_client("resume-test", Duration::from_secs(5), Vec::new()).unwrap(),
+		SiteMapper::new("example.com").unwrap(),
+		CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+		options(output.path(), Some(u64::MAX)),
+	).await.unwrap();
+	assert_eq!(std::fs::read(output.path().join("index.html")).unwrap(), html);
+	assert_eq!(report.failed, 0);
+	assert_eq!(report.unavailable_snapshots, 0);
+	assert_eq!(report.downloaded, 1);
+	assert!(!server.received_requests().await.unwrap().iter().any(|request| request.url.path().contains("id_/http://example.com/index.html")));
+}
+
+/// Explicit overwrite must not replace useful content with a recognized error page.
+#[tokio::test]
+async fn overwrite_keeps_good_content_when_only_error_capture_remains() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let original = "http://example.com/topic.html";
+	let html = b"<p>Recovered discussion</p>";
+	std::fs::write(output.path().join("topic.html"), html).unwrap();
+	let record = format!("20260917000000 {original} text/html 200 ERROR 100\n");
+	mock_cdx(&server, "example.com", "host", &record).await;
+	mock_cdx(&server, original, "exact", &record).await;
+	mock_capture(&server, "20260917000000", original, 200, "<table><tr><td align='center'><span class='gen'>The topic or post you requested does not exist</span></td></tr></table>").await;
+	let mut config = options(output.path(), None);
+	config.no_clobber = false;
+	let report = download_site(
+		build_client("overwrite-test", Duration::from_secs(5), Vec::new()).unwrap(),
+		SiteMapper::new("example.com").unwrap(),
+		CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+		config,
+	).await.unwrap();
+	assert_eq!(report.failed, 0);
+	assert_eq!(std::fs::read(output.path().join("topic.html")).unwrap(), html);
+}
+
+/// Recovery upgrades a local error page but keeps ordinary resume strictly no-clobber.
+#[tokio::test]
+async fn recovery_upgrades_error_page_and_retries_same_digest_after_unavailable_replay() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let original = "http://example.com/topic.html";
+	let error = "<table><tr><td align='center'><span class='gen'>The topic or post you requested does not exist</span></td></tr></table>";
+	std::fs::write(output.path().join("topic.html"), error).unwrap();
+	mock_cdx(&server, "example.com", "host", &format!("20260917000000 {original} text/html 200 ERROR 100\n")).await;
+	mock_cdx(&server, original, "exact", &format!("20260917000000 {original} text/html 200 ERROR 100\n20260916000000 {original} text/html 200 CONTENT 100\n20260915000000 {original} text/html 200 CONTENT 100\n")).await;
+	mock_capture(&server, "20260917000000", original, 200, error).await;
+	mock_capture(&server, "20260916000000", original, 404, "gone").await;
+	mock_capture(&server, "20260915000000", original, 200, "<p>example.com recovered discussion</p>").await;
+	for recover in [false, true] {
+		let mut config = options(output.path(), None);
+		config.recover_existing = recover;
+		let report = download_site(
+			build_client("recover-test", Duration::from_secs(5), Vec::new()).unwrap(),
+			SiteMapper::new("example.com").unwrap(),
+			CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+			config,
+		).await.unwrap();
+		assert_eq!(report.failed, 0);
+		let saved = std::fs::read_to_string(output.path().join("topic.html")).unwrap();
+		assert_eq!(saved.contains("recovered discussion"), recover);
+		if !recover { assert_eq!(saved, error); }
+	}
+	let events = std::fs::read_to_string(output.path().join(".wayback-state/captures.jsonl")).unwrap();
+	let saved: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+	assert_eq!(saved["record"]["timestamp"], "20260915000000");
+}
+
+/// A failed recovery cannot remove the existing placeholder or its retry evidence.
+#[tokio::test]
+async fn recovery_keeps_existing_bytes_when_all_replays_are_unavailable() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let original = "http://example.com/topic.html";
+	let error = "<table><tr><td align='center'><span class='gen'>The forum you selected does not exist.</span></td></tr></table>";
+	std::fs::write(output.path().join("topic.html"), error).unwrap();
+	let records = format!("20260917000000 {original} text/html 200 ERROR 100\n");
+	mock_cdx(&server, "example.com", "host", &records).await;
+	mock_cdx(&server, original, "exact", &records).await;
+	mock_capture(&server, "20260917000000", original, 404, "gone").await;
+	let mut config = options(output.path(), None);
+	config.recover_existing = true;
+	let report = download_site(
+		build_client("recover-test", Duration::from_secs(5), Vec::new()).unwrap(),
+		SiteMapper::new("example.com").unwrap(),
+		CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+		config,
+	).await.unwrap();
+	assert_eq!(report.unavailable_snapshots, 1);
+	assert_eq!(std::fs::read_to_string(output.path().join("topic.html")).unwrap(), error);
+	let events = std::fs::read_to_string(output.path().join(".wayback-state/captures.jsonl")).unwrap();
+	let saved: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+	assert_eq!(saved["outcome"], "unavailable");
+	assert_eq!(saved["record"]["original"], original);
+}
+
+/// Raw references in the journal allow a later run to recover hashed missing links.
+#[tokio::test]
+async fn resume_recovers_original_query_reference_from_journal_without_replaying_page() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let original = "http://example.com/index.html";
+	let linked = "http://example.com/topic.php?t=99";
+	let records = format!("20260917000000 {original} text/html 200 PAGE 100\n");
+	mock_cdx(&server, "example.com", "host", &records).await;
+	mock_cdx(&server, linked, "exact", "").await;
+	mock_capture(&server, "20260917000000", original, 200, "<a href='topic.php?t=99'>Discussion</a>").await;
+	let mapper = SiteMapper::new("example.com").unwrap();
+	let linked_path = mapper.local_path_for_url(linked, "text/html").unwrap();
+	for second_run in [false, true] {
+		if second_run {
+			server.reset().await;
+			mock_cdx(&server, "example.com", "host", &records).await;
+			mock_cdx(&server, linked, "exact", &format!("20260916000000 {linked} text/html 200 CONTENT 100\n")).await;
+			mock_capture(&server, "20260916000000", linked, 200, "<p>Recovered discussion</p>").await;
+		}
+		let mut config = options(output.path(), Some(u64::MAX));
+		config.recover_existing = second_run;
+		let report = download_site(
+			build_client("journal-test", Duration::from_secs(5), Vec::new()).unwrap(), mapper.clone(),
+			CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+			config,
+		).await.unwrap();
+		assert_eq!(report.failed, 0);
+		assert_eq!(output.path().join(&linked_path).is_file(), second_run);
+		if second_run {
+			assert!(!server.received_requests().await.unwrap().iter().any(|request| request.url.path().contains("id_/http://example.com/index.html")));
+		}
+	}
+}
+
+/// An HTTPS bare-host page must link to a www HTTP destination already in CDX.
+#[tokio::test]
+async fn download_rewrites_session_links_to_equivalent_selected_captures() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let timestamp = "20260915000000";
+	mock_cdx(&server, "example.com", "host", &format!(
+		"{timestamp} http://www.example.com/forums/faq.php text/html 200 FAQ 100\n{timestamp} https://example.com/forums/viewtopic.php?t=1 text/html 200 TOPIC 100\n"
+	)).await;
+	mock_capture(&server, timestamp, "http://www.example.com/forums/faq.php", 200, "<p id='help'>FAQ</p>").await;
+	mock_capture(&server, timestamp, "https://example.com/forums/viewtopic.php?t=1", 200,
+		r##"<a href='./faq.php?sid=abc#help'>FAQ</a>"##).await;
+	let mapper = SiteMapper::new("example.com").unwrap();
+	let topic = mapper.local_path_for_url("https://example.com/forums/viewtopic.php?t=1", "text/html").unwrap();
+	let report = download_site(
+		build_client("navigation-test", Duration::from_secs(5), Vec::new()).unwrap(), mapper,
+		CdxQuery::new("example.com".to_owned(), MatchType::Host, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+		options(output.path(), None),
+	).await.unwrap();
+	assert_eq!(report.downloaded, 2);
+	assert_eq!(report.failed, 0);
+	assert_eq!(report.missing_local_links, 0);
+	assert!(std::fs::read_to_string(output.path().join(topic)).unwrap().contains("faq.php.html#help"));
 }
 
 #[tokio::test]
@@ -88,6 +256,11 @@ async fn download_and_repair_keep_unresolved_references() {
 	assert_eq!(report.failed, 0);
 	assert_eq!(report.missing_image_sources, 0);
 	assert!(report.missing_local_links >= 3);
+	let journal = std::fs::read_to_string(output.path().join(".wayback-state/captures.jsonl")).unwrap();
+	let event: serde_json::Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+	assert!(event["references"].as_array().unwrap().iter().any(|reference|
+		reference == "http://example.com/forums/viewtopic.php?t=14887"
+	), "disabling linked downloads must not discard original query references");
 	let before_repair = std::fs::read_to_string(output.path().join("index.html")).unwrap();
 	assert_eq!(before_repair.matches("href=").count(), 3);
 	assert!(
@@ -342,6 +515,9 @@ async fn missing_replay_search_checks_more_than_twenty_captures() {
 		std::fs::read_to_string(output.path().join("index.html")).unwrap(),
 		body
 	);
+	let requests = server.received_requests().await.unwrap();
+	assert_eq!(requests.iter().filter(|request| request.url.path() == "/cdx/search/cdx"
+		&& request.url.query_pairs().any(|(key, value)| key == "matchType" && value == "exact")).count(), 1);
 }
 
 /// New and resumed runs must follow archived page and stylesheet dependencies recursively.
@@ -413,9 +589,11 @@ async fn discovers_linked_pages_and_nested_assets_on_new_and_resumed_runs() {
 		))
 		.mount(&server)
 		.await;
+	let output = tempfile::tempdir().unwrap();
 	for resume in [false, true] {
-		let output = tempfile::tempdir().unwrap();
 		if resume {
+			std::fs::remove_file(output.path().join("_hosts/assets.example.com/nested.gif")).unwrap();
+			std::fs::remove_file(output.path().join("_hosts/assets.example.com/font.woff2")).unwrap();
 			std::fs::write(
 				output.path().join("index.html"),
 				"existing local page must not be overwritten",
@@ -429,15 +607,12 @@ async fn discovers_linked_pages_and_nested_assets_on_new_and_resumed_runs() {
 			SnapshotStrategy::Latest,
 			root.clone(),
 		);
-		let report = download_site(
-			client,
-			SiteMapper::new("example.com").unwrap(),
-			query,
-			options(output.path(), Some(u64::MAX)),
-		)
+		let mut config = options(output.path(), Some(u64::MAX));
+		config.recover_existing = resume;
+		let report = download_site(client, SiteMapper::new("example.com").unwrap(), query, config)
 		.await
 		.unwrap();
-		assert_eq!(report.extra_downloads, 8);
+		assert_eq!(report.extra_downloads, if resume { 2 } else { 8 });
 		assert_eq!(report.failed, 0);
 		assert_eq!(report.missing_local_links, 0);
 		assert_eq!(

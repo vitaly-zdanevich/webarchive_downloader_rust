@@ -7,6 +7,7 @@ pub mod link_validation;
 pub mod noise;
 pub mod output_summary;
 pub mod pathmap;
+mod recovery;
 mod retry;
 pub mod rewrite;
 pub mod soft_redirect;

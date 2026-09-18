@@ -111,6 +111,19 @@ Validate an existing output directory without downloading or modifying files:
 webarchive-downloader-rust --validate-only --output public --strict-validate-links
 ```
 
+Fix navigation links to HTML files already downloaded, without contacting Wayback:
+
+```sh
+webarchive-downloader-rust --repair-local-links --output public --strict-validate-links
+```
+
+This explicitly modifies existing HTML files, so keep a backup first. It repairs
+local anchor/area links such as `faq.php?sid=...` only when `faq.php.html` exists
+and is nonempty. It preserves fragments and unrelated bytes, skips meaningful
+queries, forms, external links and pages with a `<base>` URL, and never creates
+placeholder content. Repeating the repair makes no further changes. Remaining
+missing links still produce exit code 2 with `--strict-validate-links`.
+
 Repair an existing output directory. This fetches only recoverable missing static
 assets from Wayback, then reports assets that are not archived or exceed the size
 cap:
@@ -131,20 +144,50 @@ Force a full refresh of already downloaded files:
 webarchive-downloader-rust another.by --overwrite
 ```
 
+Even with `--overwrite`, a recognized HTML error/redirect cannot replace an
+existing nonempty file. Failed transfers also leave the existing file intact.
+
 ### Maximum Content Recovery
 
 To include indexed subdomains and recursively follow archived links without a
 file-size cap or date limit, use:
 
 ```sh
-webarchive-downloader-rust smallrockets.com --match-type domain --output /tmp/smallrockets-expanded
+webarchive-downloader-rust smallrockets.com --match-type domain --recover-existing \
+	--output /tmp/smallrockets-preservation
 ```
 
 No extra flag is needed to enable linked discovery or unlimited file sizes.
 Do not pass `--limit`, `--no-rewrite`, or `--max-extra-download-size-mib 0` for
 this mode. Add `--ssh USER@HOST` only for a working, trusted SSH route. A normal
-run against an existing output directory also discovers missing content without
-overwriting existing files; `--repair-output` alone only recovers static assets.
+run against an existing output directory reuses local pages and saved original
+references without replacing files. `--recover-existing` additionally retries
+recognizable local HTML error pages and replaces them only after a usable
+capture is found. Back up the output first and keep using the same directory;
+do not delete it between recovery attempts. `--repair-output` alone only
+recovers static assets.
+
+Captures and replay failures are recorded in `.wayback-state/captures.jsonl`
+inside the output directory. The append-only journal preserves original URLs,
+capture timestamps, raw outgoing references, and failure reasons. Keep it with
+the archive: local query hashes cannot reconstruct their original URLs. It is
+recovery metadata, not a backup of file contents or a complete capture inventory.
+Original references are retained even when linked downloads are disabled.
+Binary transfers are still validated by the
+download stream; the journal records their terminal failures, not successful
+binary fallback provenance.
+
+Resume uses local references and the journal without replaying healthy files.
+An interrupted final journal entry is ignored with a warning; earlier
+successful entries remain usable.
+
+Exact CDX responses are reused across recovery passes within one run. Empty
+results are not persisted between runs, and CDX failures are never cached as
+missing content. Forum error detection uses structured message containers and
+does not treat quotations inside discussions as missing-content pages. Missing
+directory-index links can reuse a usable sibling `index.htm`, without replacing
+existing files or inventing page content. Recovery remains limited to content
+that Wayback can actually return; the tool cannot recreate unarchived posts.
 Recovery stays within related hosts and the requested date range, fetches from
 Wayback rather than live sites, and stops following cycles already visited in
 the current run. This can take longer than the initial host-only download.
@@ -189,15 +232,17 @@ Useful options:
 --to YYYYMMDDhhmmss
 --limit N
 --validate-only
+--repair-local-links
 --repair-output
 --overwrite
+--recover-existing
 --no-rewrite
 --no-validate-links
 --strict-validate-links
 --max-extra-download-size-mib N
 --timeout-seconds N
 --ssh USER@HOST  (repeatable)
---user-agent "webarchive-downloader-rust/0.2.0 your-email@example.com"
+--user-agent "webarchive-downloader-rust/0.3.0 your-email@example.com"
 ```
 
 ## GitLab Pages
@@ -281,11 +326,15 @@ file is missing. It also reports image elements that still have neither `src`
 nor `srcset`, because those cannot render but do not have a target path to
 validate. By default this is a warning so partial museum builds can still
 finish. Use `--strict-validate-links` to return exit code 2 when missing local
-links or source-less images remain, or `--no-validate-links` to skip the pass.
+links, source-less images, or recognized unusable HTML pages remain, or
+`--no-validate-links` to skip the pass.
 The summary separates missing link occurrences from distinct missing target
 paths. `failed: 0` means no terminal download errors, not a complete mirror.
 `retained unusable captures` counts newly saved HTML placeholders for which no
 usable fallback was found; their archived bytes are kept instead of deleted.
+`unusable HTML files` checks the final output, including files retained from
+earlier runs. This is a conservative detector, not a guarantee that every other
+saved page contains useful content.
 
 The repair pass only downloads real files that Wayback has captured. It first
 tries the site CDX result, then queries likely original URLs for each still
@@ -329,11 +378,6 @@ Direct HTTP 5xx responses receive two retries before starting SSH, avoiding a
 sixty-second tunnel startup for brief server failures. HTTP 403/429 can switch
 immediately. Failed SSH startup announces its cooldown once; requests made
 during that cooldown do not repeat the same message.
-
-Older versions removed unresolved `href` and `src` attributes from downloaded
-pages. Updating the downloader cannot reconstruct those erased references, and
-`--repair-output` does not refetch page HTML. To restore them, download into a
-new output directory, or back up the old directory before using `--overwrite`.
 
 For large domains, use `--from`, `--to`, and `--limit` to keep runs focused. The Internet Archive is a shared service, so the downloader intentionally fetches archived files one at a time.
 

@@ -10,7 +10,7 @@ use webarchive_downloader_rust::DEFAULT_USER_AGENT;
 use webarchive_downloader_rust::cdx::{CdxQuery, MatchType, SnapshotStrategy};
 use webarchive_downloader_rust::downloader::{
     CancellationFlag, DownloadOptions, RepairOptions, build_client, download_site, list_records,
-    repair_output_dir,
+    repair_local_links, repair_output_dir,
 };
 use webarchive_downloader_rust::link_validation::validate_local_links;
 use webarchive_downloader_rust::output_summary::{format_bytes, summarize_output_dir};
@@ -61,9 +61,17 @@ struct Cli {
     #[arg(long)]
     repair_output: bool,
 
+	/// Repair navigation to existing local HTML files without any network requests.
+	#[arg(long, conflicts_with_all = ["validate_only", "repair_output", "list", "overwrite", "no_rewrite"])]
+	repair_local_links: bool,
+
     /// Redownload and replace files that already exist.
     #[arg(long)]
     overwrite: bool,
+
+	/// Retry recognized local HTML error pages while preserving all other existing files.
+	#[arg(long, conflicts_with_all = ["overwrite", "no_clobber", "validate_only", "repair_output", "repair_local_links", "list"])]
+	recover_existing: bool,
 
     /// Deprecated compatibility alias. Existing files are skipped by default.
     #[arg(long, hide = true, conflicts_with = "overwrite")]
@@ -77,7 +85,7 @@ struct Cli {
     #[arg(long)]
     no_validate_links: bool,
 
-    /// Return exit code 2 when post-download validation finds missing local links.
+    /// Return exit code 2 for missing links, source-less images, or recognized HTML error pages.
     #[arg(long, conflicts_with = "no_validate_links")]
     strict_validate_links: bool,
 
@@ -127,10 +135,22 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
         return Ok(exit_code);
     }
 
+	if cli.repair_local_links {
+		let report = repair_local_links(&cli.output).await?;
+		println!("repaired {} local navigation links in {} files", report.repaired_links, report.modified_files);
+		let exit_code = if cli.no_validate_links {
+			ExitCode::SUCCESS
+		} else {
+			validate_output_dir(&cli.output, cli.strict_validate_links)?
+		};
+		print_elapsed_time(started_at);
+		return Ok(exit_code);
+	}
+
     let target = cli
         .target
         .as_deref()
-        .context("target is required unless --validate-only is used")?;
+        .context("target is required unless --validate-only or --repair-local-links is used")?;
     let mapper = SiteMapper::new(target)?;
     let mut query = CdxQuery::new(
         mapper.cdx_target().to_owned(),
@@ -191,7 +211,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
         let exit_code = if cancellation.is_cancelled() {
             ExitCode::from(130)
         } else if cli.strict_validate_links
-            && (report.missing_local_links > 0 || report.missing_image_sources > 0)
+            && (report.missing_local_links > 0 || report.missing_image_sources > 0 || report.unusable_html_files > 0)
         {
             ExitCode::from(2)
         } else {
@@ -208,6 +228,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
         DownloadOptions {
             output_dir: cli.output,
             no_clobber: !cli.overwrite || cli.no_clobber,
+			recover_existing: cli.recover_existing,
             rewrite_links: !cli.no_rewrite,
             extra_download_max_bytes,
             validate_links: !cli.no_validate_links,
@@ -228,7 +249,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
     let exit_code = if cancellation.is_cancelled() || report.cancelled > 0 {
         ExitCode::from(130)
     } else if cli.strict_validate_links
-        && (report.missing_local_links > 0 || report.missing_image_sources > 0)
+        && (report.missing_local_links > 0 || report.missing_image_sources > 0 || report.unusable_html_files > 0)
     {
         ExitCode::from(2)
     } else {
@@ -294,7 +315,11 @@ fn validate_output_dir(output_dir: &Path, strict: bool) -> Result<ExitCode> {
         );
     }
 
-    if strict && (!report.missing.is_empty() || !report.missing_image_sources.is_empty()) {
+	println!("unusable HTML files: {}", report.unusable_html.len());
+	for file in report.unusable_html.iter().take(20) {
+		println!("unusable HTML: {}", file.strip_prefix(output_dir).unwrap_or(file).display());
+	}
+    if strict && (!report.missing.is_empty() || !report.missing_image_sources.is_empty() || !report.unusable_html.is_empty()) {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -344,6 +369,7 @@ fn print_repair_report(report: &webarchive_downloader_rust::downloader::RepairRe
     println!("  missing links: {}", report.missing_local_links);
     println!("  unique missing targets: {}", report.unique_missing_targets);
     println!("  images without source: {}", report.missing_image_sources);
+	println!("  unusable HTML files: {}", report.unusable_html_files);
     println!("  output: {}", report.output_dir.display());
 }
 
@@ -389,6 +415,7 @@ fn print_download_report(report: &webarchive_downloader_rust::downloader::Downlo
     println!("  missing links: {}", report.missing_local_links);
     println!("  unique missing targets: {}", report.unique_missing_targets);
     println!("  images without source: {}", report.missing_image_sources);
+	println!("  unusable HTML files: {}", report.unusable_html_files);
     println!("  output: {}", report.output_dir.display());
 }
 

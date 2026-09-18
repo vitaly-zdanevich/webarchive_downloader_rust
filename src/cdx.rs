@@ -77,7 +77,7 @@ impl CdxRetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CdxRecord {
     pub timestamp: String,
     pub original: String,

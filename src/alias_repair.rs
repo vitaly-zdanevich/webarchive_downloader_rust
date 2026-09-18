@@ -11,6 +11,33 @@ pub struct AliasRepairReport {
     pub ambiguous: usize,
 }
 
+/// Restores missing index.html links from a usable index.htm in the same directory.
+/// Existing destinations and sources resolving outside the archive are never touched.
+pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
+	let root = fs::canonicalize(root)?;
+	let report = crate::link_validation::validate_local_links(&root)?;
+	let mut created = 0;
+	let mut seen = HashSet::new();
+	for missing in report.missing {
+		let target = missing.target;
+		if target.file_name().is_none_or(|name| name != "index.html")
+			|| !seen.insert(target.clone()) || fs::symlink_metadata(&target).is_ok() {
+			continue;
+		}
+		let source = target.with_file_name("index.htm");
+		let Ok(canonical) = fs::canonicalize(&source) else { continue; };
+		if !canonical.starts_with(&root) || !canonical.is_file() { continue; }
+		let bytes = fs::read(&canonical)?;
+		if bytes.is_empty() || crate::soft_redirect::is_unusable_html_capture(&String::from_utf8_lossy(&bytes)) {
+			continue;
+		}
+		let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+		std::io::Write::write_all(&mut file, &bytes)?;
+		created += 1;
+	}
+	Ok(created)
+}
+
 pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
     let html_files = collect_html_files(root)?;
     let title_index = build_topic_title_index(root, &html_files)?;
@@ -606,6 +633,34 @@ fn is_html_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Alias repair keeps existing files byte-identical and rejects error-page sources.
+	#[test]
+	fn directory_aliases_only_use_existing_usable_sibling() {
+		let root = tempfile::tempdir().unwrap();
+		fs::write(root.path().join("source.html"), "<a href='press/index.html'>Press</a><a href='bad/index.html'>Bad</a>").unwrap();
+		fs::create_dir(root.path().join("press")).unwrap();
+		fs::create_dir(root.path().join("bad")).unwrap();
+		fs::write(root.path().join("press/index.htm"), b"<p>Press archive \xe9</p>").unwrap();
+		fs::write(root.path().join("bad/index.htm"), "<table><tr><td align='center'><span class='gen'>The forum you selected does not exist.</span></td></tr></table>").unwrap();
+		assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 1);
+		assert_eq!(fs::read(root.path().join("press/index.html")).unwrap(), b"<p>Press archive \xe9</p>");
+		assert!(!root.path().join("bad/index.html").exists());
+		assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 0);
+	}
+
+	/// Symlinked source directories outside the archive must not be copied or written.
+	#[cfg(unix)]
+	#[test]
+	fn directory_aliases_do_not_follow_outside_symlinks() {
+		let root = tempfile::tempdir().unwrap();
+		let outside = tempfile::tempdir().unwrap();
+		fs::write(outside.path().join("index.htm"), "<p>Outside</p>").unwrap();
+		std::os::unix::fs::symlink(outside.path(), root.path().join("press")).unwrap();
+		fs::write(root.path().join("source.html"), "<a href='press/index.html'>Press</a>").unwrap();
+		assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 0);
+		assert!(!outside.path().join("index.html").exists());
+	}
 
     #[test]
     fn creates_missing_topic_alias_from_matching_title() {

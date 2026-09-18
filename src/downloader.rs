@@ -17,14 +17,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::alias_repair::create_missing_topic_aliases;
+use crate::alias_repair::{create_missing_directory_aliases, create_missing_topic_aliases};
 use crate::cdx::{
     CdxQuery, CdxRecord, CdxRetryPolicy, MAX_WAYBACK_RETRY_DELAY_SECONDS, MatchType,
-    SnapshotStrategy, fetch_all_records, fetch_all_records_with_policy, fetch_latest_records,
+    SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
     is_cdx_connectivity_error,
 };
 use crate::download_refs::extract_related_references;
-use crate::link_validation::validate_local_links;
+use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
+use crate::recovery::{CaptureEvent, RecoveryState};
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
@@ -38,6 +39,8 @@ use crate::wayback_client::WaybackClient;
 pub struct DownloadOptions {
     pub output_dir: PathBuf,
     pub no_clobber: bool,
+	/// Replaces recognized local HTML error pages only after a usable capture is found.
+	pub recover_existing: bool,
     pub rewrite_links: bool,
     pub extra_download_max_bytes: Option<u64>,
     pub validate_links: bool,
@@ -65,6 +68,8 @@ pub struct DownloadReport {
     /// Distinct missing filesystem targets, not reference occurrences.
     pub unique_missing_targets: usize,
     pub missing_image_sources: usize,
+	/// Recognized error/redirect pages remaining in the final output after validation.
+	pub unusable_html_files: usize,
     pub output_dir: PathBuf,
 }
 
@@ -93,6 +98,8 @@ pub struct RepairReport {
     /// Distinct missing filesystem targets, not reference occurrences.
     pub unique_missing_targets: usize,
     pub missing_image_sources: usize,
+	/// Recognized error/redirect pages remaining in the final output after validation.
+	pub unusable_html_files: usize,
     pub output_dir: PathBuf,
 }
 
@@ -136,6 +143,21 @@ struct FallbackOptions {
     from: Option<String>,
     to: Option<String>,
     strategy: SnapshotStrategy,
+	recovery: Arc<RecoveryState>,
+	originals_by_path: HashMap<PathBuf, CdxRecord>,
+}
+
+/// Reuses exact CDX responses across fallback, linked, and static-asset passes.
+async fn recovery_records(client: &WaybackClient, query: &CdxQuery, fallback: &FallbackOptions) -> Result<Vec<CdxRecord>> {
+	let mut canonical_query = query.clone();
+	canonical_query.target = crate::cdx::canonical_original_key(&query.target);
+	let key = format!("{}#{:?}", canonical_query.search_url()?, query.strategy);
+	if let Some(records) = fallback.recovery.lookup(&key) {
+		return Ok(records);
+	}
+	let records = fetch_all_records_with_policy(client, query, CdxRetryPolicy::recovery()).await?;
+	fallback.recovery.remember_lookup(key, records.clone());
+	Ok(records)
 }
 
 const MAX_ALTERNATE_CDX_CONNECTIVITY_FAILURES: usize = 3;
@@ -205,6 +227,8 @@ pub async fn download_site(
         from: query.from.clone(),
         to: query.to.clone(),
         strategy: query.strategy,
+		recovery: Arc::new(RecoveryState::open(&options.output_dir)?),
+		originals_by_path: selected_records_by_path.clone(),
     };
     let archive_root = query.archive_root;
 
@@ -346,7 +370,9 @@ pub async fn download_site(
                 alias_report.created
             );
         }
-        report.aliases_created = alias_report.created;
+		let directory_aliases = create_missing_directory_aliases(&options.output_dir)?;
+		if directory_aliases > 0 { println!("created {directory_aliases} local directory index aliases"); }
+        report.aliases_created = alias_report.created + directory_aliases;
 
         if let Some(max_bytes) = options.extra_download_max_bytes {
             let recovery_report = recover_missing_static_assets(
@@ -424,6 +450,8 @@ pub async fn download_site(
         report.missing_local_links = validation_report.missing.len();
         report.unique_missing_targets = validation_report.unique_missing_targets();
         report.missing_image_sources = validation_report.missing_image_sources.len();
+		report.unusable_html_files = validation_report.unusable_html.len();
+		println!("unusable HTML files: {}", report.unusable_html_files);
         println!(
             "validated {} local links; missing {}; unique missing targets {}; images without source {}",
             validation_report.checked,
@@ -479,6 +507,38 @@ pub async fn download_site(
     Ok(report)
 }
 
+/// Counts local navigation changes independently of downloaded or aliased files.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalLinkRepairReport {
+	/// Number of anchor/area destinations rewritten to existing HTML files.
+	pub repaired_links: usize,
+	/// Number of HTML files atomically replaced by the repair.
+	pub modified_files: usize,
+}
+
+/// Repairs existing HTML navigation offline without downloading or inventing content.
+///
+/// Only links with an existing HTML counterpart and no meaningful query are changed.
+/// This is explicit rather than part of resume, which promises not to overwrite files.
+pub async fn repair_local_links(root: &Path) -> Result<LocalLinkRepairReport> {
+	let root = fs::canonicalize(root).await.context("failed to open local repair directory")?;
+	let mut files = Vec::new();
+	collect_html_files(&root, &mut files)?;
+	files.sort();
+	let mut report = LocalLinkRepairReport::default();
+	for file in files {
+		let input = fs::read(&file).await.with_context(|| format!("failed to read {}", file.display()))?;
+		let (output, repaired) = repair_local_navigation_html(&root, &file, &input)
+			.with_context(|| format!("failed to repair {}", file.display()))?;
+		if repaired > 0 {
+			write_bytes_atomic(&file, &output).await?;
+			report.repaired_links += repaired;
+			report.modified_files += 1;
+		}
+	}
+	Ok(report)
+}
+
 pub async fn repair_output_dir(
     client: WaybackClient,
     mapper: SiteMapper,
@@ -505,7 +565,9 @@ pub async fn repair_output_dir(
             alias_report.created
         );
     }
-    report.aliases_created = alias_report.created;
+	let directory_aliases = create_missing_directory_aliases(&options.output_dir)?;
+	if directory_aliases > 0 { println!("created {directory_aliases} local directory index aliases"); }
+    report.aliases_created = alias_report.created + directory_aliases;
 
     if let Some(max_bytes) = options.extra_download_max_bytes {
         let records = fetch_recovery_records(&client, &mapper, &options).await?;
@@ -516,6 +578,8 @@ pub async fn repair_output_dir(
             from: options.from.clone(),
             to: options.to.clone(),
             strategy: options.strategy,
+			recovery: Arc::new(RecoveryState::default()),
+			originals_by_path: selected_records_by_path.clone(),
         };
         let recovery_report = recover_missing_static_assets(
             &client,
@@ -592,6 +656,8 @@ pub async fn repair_output_dir(
         report.missing_local_links = validation_report.missing.len();
         report.unique_missing_targets = validation_report.unique_missing_targets();
         report.missing_image_sources = validation_report.missing_image_sources.len();
+		report.unusable_html_files = validation_report.unusable_html.len();
+		println!("unusable HTML files: {}", report.unusable_html_files);
         println!(
             "validated {} local links; missing {}; unique missing targets {}; images without source {}",
             validation_report.checked,
@@ -773,16 +839,95 @@ async fn download_one(
     known_paths: &HashMap<String, PathBuf>,
     job: DownloadJob,
 ) -> Result<DownloadStatus> {
+	let requested = job.record.clone();
+	let local_path = job.local_path.clone();
+	let result = download_one_inner(client, mapper, archive_root, options, fallback_options, known_paths, job).await;
+	if let Err(error) = &result {
+		fallback_options.recovery.record(CaptureEvent {
+			record: requested, local_path,
+			outcome: if is_unavailable_snapshot_error(error) { "unavailable" } else { "failed" }.into(),
+			references: Vec::new(), error: Some(format!("{error:#}")),
+		})?;
+	}
+	result
+}
+
+/// Reads preserved local references without replaying healthy pages or guessing query hashes.
+fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: &FallbackOptions, job: &DownloadJob, bytes: &[u8]) -> Result<Vec<String>> {
+	if !options.rewrite_links || options.extra_download_max_bytes.is_none()
+		|| !should_rewrite_as_text(&job.record, &job.local_path) {
+		return Ok(Vec::new());
+	}
+	let root = std::fs::canonicalize(&options.output_dir)?;
+	let file = root.join(&job.local_path);
+	let mut references = fallback.recovery.references(&job.local_path);
+	for reference in extract_document_references(&String::from_utf8_lossy(bytes), is_css_mimetype(&job.record.mimetype))? {
+		let decoded = html_escape::decode_html_entities(&reference);
+		let value = decoded.trim();
+		if let Ok(url) = Url::parse(value) {
+			references.push(url.to_string());
+			continue;
+		}
+		if value.starts_with("//") {
+			if let Ok(url) = Url::parse(&job.record.original)?.join(value) {
+				references.push(url.to_string());
+			}
+			continue;
+		}
+		let Some(target) = resolve_local_reference(&root, &file, value) else { continue; };
+		let relative = target.strip_prefix(&root)?;
+		let original = fallback.originals_by_path.get(relative).map(|record| record.original.clone())
+			.or_else(|| fallback.recovery.original_for_path(relative));
+		if let Some(original) = original {
+			references.push(original);
+		} else if !relative.to_string_lossy().contains("__q_") && !target.is_file() {
+			let mut original_path = relative.to_owned();
+			if let Some(name) = relative.file_name().and_then(|name| name.to_str())
+				&& [".php.html", ".cgi.html", ".asp.html", ".aspx.html", ".jsp.html", ".cfm.html"].iter().any(|suffix| name.ends_with(suffix)) {
+				original_path.set_file_name(name.trim_end_matches(".html"));
+			}
+			let query = Url::parse("http://local.invalid/")?.join(value)?.query().map(str::to_owned);
+			for candidate in mapper.original_url_candidates_for_local_path(&original_path) {
+				let mut url = Url::parse(&candidate)?;
+				url.set_query(query.as_deref());
+				references.push(url.to_string());
+			}
+		}
+	}
+	references.retain(|reference| Url::parse(reference).is_ok_and(|url|
+		matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|host| mapper.is_related_host(host))
+		&& !crate::noise::is_archive_noise_reference(reference)));
+	references.sort();
+	references.dedup();
+	Ok(references)
+}
+
+/// Downloads a replacement atomically, retaining existing bytes when recovery is unsuccessful.
+async fn download_one_inner(
+	client: &WaybackClient,
+	mapper: &SiteMapper,
+	archive_root: &Url,
+	options: &DownloadOptions,
+	fallback_options: &FallbackOptions,
+	known_paths: &HashMap<String, PathBuf>,
+	job: DownloadJob,
+) -> Result<DownloadStatus> {
     if options.cancellation.is_cancelled() {
         return Ok(DownloadStatus::Cancelled);
     }
 
     let destination = options.output_dir.join(&job.local_path);
-    let skip_existing = options.no_clobber && has_non_empty_file(&destination).await?;
-    if skip_existing && !(options.rewrite_links && options.extra_download_max_bytes.is_some()
-        && should_rewrite_as_text(&job.record, &job.local_path)) {
-        return Ok(DownloadStatus::Skipped { extra_download_refs: Vec::new() });
-    }
+	let existing = has_non_empty_file(&destination).await?;
+	let local_bytes = if existing && should_rewrite_as_text(&job.record, &job.local_path) {
+		fs::read(&destination).await?
+	} else { Vec::new() };
+	let local_unusable = existing && should_detect_soft_redirect(&job.record, &job.local_path)
+		&& is_unusable_html_capture(&String::from_utf8_lossy(&local_bytes));
+	if existing && options.no_clobber && !(options.recover_existing && local_unusable) {
+		return Ok(DownloadStatus::Skipped {
+			extra_download_refs: resumed_references(mapper, options, fallback_options, &job, &local_bytes)?,
+		});
+	}
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
@@ -821,15 +966,22 @@ async fn download_one(
         retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
             && is_unusable_html_capture(&String::from_utf8_lossy(&bytes));
 
-        let extra_download_refs = if options.rewrite_links && options.extra_download_max_bytes.is_some()
+        let extra_download_refs = if options.rewrite_links
             && should_rewrite_as_text(&record, &job.local_path) {
             extract_related_references(&String::from_utf8_lossy(&bytes), &Url::parse(&record.original)?, mapper, is_css_mimetype(&record.mimetype))?
         } else {
             Vec::new()
         };
-        if skip_existing {
-            return Ok(DownloadStatus::Skipped { extra_download_refs });
-        }
+		if existing && retained_unusable {
+			eprintln!("keeping existing {}: no usable replacement capture found", job.local_path.display());
+			fallback_options.recovery.record(CaptureEvent {
+				record, local_path: job.local_path.clone(), outcome: "replacement_unusable".into(),
+				references: extra_download_refs, error: Some("Existing file retained; replacement is an HTML error/redirect".into()),
+			})?;
+			return Ok(DownloadStatus::Skipped {
+				extra_download_refs: resumed_references(mapper, options, fallback_options, &job, &local_bytes)?,
+			});
+		}
 
         if job
             .max_bytes
@@ -856,12 +1008,22 @@ async fn download_one(
                 rewrite_html(&text, &context)?
             };
             write_bytes_atomic(&destination, rewritten.as_bytes()).await?;
+			fallback_options.recovery.record(CaptureEvent {
+				record, local_path: job.local_path.clone(),
+				outcome: if retained_unusable { "unusable" } else { "downloaded" }.into(),
+				references: extra_download_refs.clone(), error: None,
+			})?;
             return Ok(DownloadStatus::Downloaded {
                 extra_download_refs,
                 retained_unusable,
             });
         } else {
             write_bytes_atomic(&destination, &bytes).await?;
+			fallback_options.recovery.record(CaptureEvent {
+				record, local_path: job.local_path.clone(),
+				outcome: if retained_unusable { "unusable" } else { "downloaded" }.into(),
+				references: extra_download_refs, error: None,
+			})?;
         }
     } else if let Some(max_bytes) = job.max_bytes {
         if !download_record_to_file_limited(
@@ -926,7 +1088,7 @@ async fn resolve_extra_download_jobs(
             break;
         }
         let lookup_key = normalize_lookup_url(&reference);
-        if known_paths.contains_key(&lookup_key) {
+        if Url::parse(&reference).ok().and_then(|url| mapper.known_path_for_url(&url, known_paths)).is_some() {
             continue;
         }
 
@@ -1326,8 +1488,7 @@ async fn alternate_text_records_for_source(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records =
-            fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery()).await?;
+        let records = recovery_records(client, &query, fallback_options).await?;
         for record in records {
             if record.timestamp == source_record.timestamp
                 && record.original == source_record.original
@@ -1710,7 +1871,7 @@ async fn find_missing_static_asset_record(
             query.to = fallback_options.to.clone();
 
             let records =
-                match fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery())
+                match recovery_records(client, &query, fallback_options)
                     .await
                 {
                     Ok(records) => records,
@@ -1753,7 +1914,7 @@ async fn find_extra_download_record(
         query.to = fallback_options.to.clone();
 
         let records =
-            match fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery()).await {
+            match recovery_records(client, &query, fallback_options).await {
                 Ok(records) => records,
                 Err(error) if is_cdx_connectivity_error(&error) => return Err(error),
                 Err(error) => {
@@ -2360,8 +2521,7 @@ async fn find_alternate_snapshot_record(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records =
-            fetch_all_records_with_policy(client, &query, CdxRetryPolicy::recovery()).await?;
+        let records = recovery_records(client, &query, fallback_options).await?;
         if let Some(candidate) = alternate_snapshot_candidate_from_records(
             records,
             seen_records,
@@ -2764,7 +2924,7 @@ async fn find_usable_capture(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records = fetch_all_records(client, &query).await?;
+        let records = recovery_records(client, &query, fallback_options).await?;
         for candidate in records {
             if cancellation.is_cancelled() {
                 return Ok(None);
@@ -2774,7 +2934,7 @@ async fn find_usable_capture(
             {
                 continue;
             }
-            if !remember_digest(&mut seen_digests, &candidate) {
+            if !candidate.digest.is_empty() && candidate.digest != "-" && seen_digests.contains(&candidate.digest) {
                 continue;
             }
             if !should_detect_soft_redirect(&candidate, local_path) {
@@ -2794,6 +2954,7 @@ async fn find_usable_capture(
                     }
                 };
             let text = String::from_utf8_lossy(&bytes);
+            remember_digest(&mut seen_digests, &candidate);
             if is_unusable_html_capture(&text) {
                 println!(
                     "unusable capture for {} at {}; trying another capture",
@@ -3005,6 +3166,9 @@ async fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::File::create(&temp_path)
             .await
             .with_context(|| format!("failed to create {}", temp_path.display()))?;
+		if let Ok(metadata) = fs::metadata(destination).await {
+			file.set_permissions(metadata.permissions()).await?;
+		}
         file.write_all(bytes)
             .await
             .with_context(|| format!("failed to write {}", temp_path.display()))?;
@@ -3094,7 +3258,7 @@ mod tests {
 			.mount(&server).await;
 		let client = build_client("capture-test", Duration::from_secs(5), Vec::new()).unwrap();
 		let source = CdxRecord { timestamp: "20200201000000".into(), original: original.into(), mimetype: "text/html".into(), status_code: 200, digest: "SOURCE".into(), length: None };
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
 		let candidates = alternate_text_records_for_source(&client, &Url::parse(&server.uri()).unwrap(), &fallback, &source, Path::new("page.html")).await.unwrap();
 		assert_eq!(candidates.len(), 23);
 	}
@@ -3132,7 +3296,7 @@ mod tests {
 		let mut seen = HashSet::new();
 		remember_snapshot_record(&mut seen, &current);
 		let mut switches = 20;
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
 		assert!(maybe_switch_to_alternate_snapshot(&client, &root, Some(&fallback), &mut current, &mut replay, &mut seen, &mut switches, None, 4, &error, &CancellationFlag::new()).await.unwrap());
 		assert_eq!(switches, 21);
 		assert_eq!(current.timestamp, "20200101000000");
