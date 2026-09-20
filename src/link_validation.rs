@@ -62,36 +62,6 @@ macro_rules! collect_guarded_attr {
     }};
 }
 
-macro_rules! resource_attr_remover {
-    ($selector:literal, $attr:literal, $root:ident, $file:ident, $removed_in_file:ident) => {{
-        let removed_in_file = Rc::clone(&$removed_in_file);
-        element!($selector, move |element| {
-            if should_remove_missing_local_reference($root, $file, element.get_attribute($attr)) {
-                element.remove_attribute($attr);
-                removed_in_file.set(removed_in_file.get() + 1);
-            }
-            Ok(())
-        })
-    }};
-}
-
-macro_rules! event_attr_resource_remover {
-    ($selector:literal, $attr:literal, $root:ident, $file:ident, $removed_in_file:ident) => {{
-        let removed_in_file = Rc::clone(&$removed_in_file);
-        element!($selector, move |element| {
-            if let Some(value) = element.get_attribute($attr) {
-                let (rewritten, removed) =
-                    remove_missing_javascript_string_references(&value, $root, $file);
-                if removed > 0 {
-                    element.set_attribute($attr, &rewritten).ok();
-                    removed_in_file.set(removed_in_file.get() + removed);
-                }
-            }
-            Ok(())
-        })
-    }};
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// A local reference whose rewritten target does not exist in the output tree.
 pub struct MissingLocalLink {
@@ -146,6 +116,7 @@ pub(crate) fn extract_document_references(input: &str, is_css: bool) -> Result<V
 /// The scan checks ordinary attributes, `srcset`, inline CSS, CSS files, common
 /// JavaScript string references, legacy applet/object attributes, meta refresh
 /// targets, and image elements that are missing both `src` and `srcset`.
+/// Validation is read-only; unresolved references remain intact for future recovery.
 pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
     let root = normalize_path(root);
     let mut files = Vec::new();
@@ -196,288 +167,6 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
     }
 
     Ok(report)
-}
-
-/// Removes missing local document links from anchor and image-map elements.
-///
-/// This post-processing step keeps the visible text/content but drops `href`
-/// attributes that point at files not present in the generated archive.
-pub fn remove_missing_local_href_links(root: &Path) -> Result<usize> {
-    let root = normalize_path(root);
-    let mut files = Vec::new();
-    collect_html_files(&root, &mut files)?;
-    files.sort();
-
-    let mut removed = 0;
-    for file in files {
-        let input = read_lossy(&file)?;
-        let mut output = Vec::with_capacity(input.len());
-        let removed_in_file = Rc::new(Cell::new(0));
-        let removed_in_anchor = Rc::clone(&removed_in_file);
-        let removed_in_area = Rc::clone(&removed_in_file);
-        let settings = Settings {
-            element_content_handlers: vec![
-                element!("a[href]", |element| {
-                    if should_remove_local_href(&root, &file, element.get_attribute("href")) {
-                        element.remove_attribute("href");
-                        removed_in_anchor.set(removed_in_anchor.get() + 1);
-                    }
-                    Ok(())
-                }),
-                element!("area[href]", |element| {
-                    if should_remove_local_href(&root, &file, element.get_attribute("href")) {
-                        element.remove_attribute("href");
-                        removed_in_area.set(removed_in_area.get() + 1);
-                    }
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        };
-
-        let mut rewriter =
-            HtmlRewriter::new(settings, |chunk: &[u8]| output.extend_from_slice(chunk));
-        rewriter
-            .write(input.as_bytes())
-            .with_context(|| format!("failed to rewrite {}", file.display()))?;
-        rewriter
-            .end()
-            .with_context(|| format!("failed to finish rewriting {}", file.display()))?;
-
-        let removed_in_file = removed_in_file.get();
-        if removed_in_file > 0 {
-            fs::write(&file, output)
-                .with_context(|| format!("failed to write {}", file.display()))?;
-            removed += removed_in_file;
-        }
-    }
-
-    Ok(removed)
-}
-
-/// Removes missing local resource references from HTML and CSS files.
-///
-/// This is used after recovery has exhausted Wayback lookups, so pages do not
-/// keep references to local images, scripts, stylesheets, or media files that
-/// cannot exist in the output.
-pub fn remove_missing_local_resource_references(root: &Path) -> Result<usize> {
-    let root = normalize_path(root);
-    let mut files = Vec::new();
-    collect_candidate_files(&root, &mut files)?;
-    files.sort();
-
-    let mut removed = 0;
-    for file in files {
-        let input = read_lossy(&file)?;
-        let removed_in_file = if is_html_file(&file) {
-            rewrite_html_missing_resource_references(&root, &file, &input)?
-        } else {
-            let (output, removed_in_file) = remove_missing_css_url_references(&input, &root, &file);
-            if removed_in_file > 0 {
-                fs::write(&file, output)
-                    .with_context(|| format!("failed to write {}", file.display()))?;
-            }
-            removed_in_file
-        };
-
-        removed += removed_in_file;
-    }
-
-    Ok(removed)
-}
-
-fn should_remove_local_href(root: &Path, file: &Path, href: Option<String>) -> bool {
-    let Some(href) = href else {
-        return false;
-    };
-    let Some(target) = resolve_local_reference(root, file, &href) else {
-        return false;
-    };
-    !target_exists_for_static_host(&target)
-}
-
-fn rewrite_html_missing_resource_references(
-    root: &Path,
-    file: &Path,
-    input: &str,
-) -> Result<usize> {
-    let mut output = Vec::with_capacity(input.len());
-    let removed_in_file = Rc::new(Cell::new(0));
-    let settings = Settings {
-        element_content_handlers: vec![
-            resource_attr_remover!("audio[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("embed[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("form[action]", "action", root, file, removed_in_file),
-            resource_attr_remover!("frame[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("iframe[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("img[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("input[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("link[href]", "href", root, file, removed_in_file),
-            resource_attr_remover!("object[data]", "data", root, file, removed_in_file),
-            resource_attr_remover!("script[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("source[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("track[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("video[poster]", "poster", root, file, removed_in_file),
-            resource_attr_remover!("video[src]", "src", root, file, removed_in_file),
-            resource_attr_remover!("*[background]", "background", root, file, removed_in_file),
-            event_attr_resource_remover!("*[onclick]", "onclick", root, file, removed_in_file),
-            event_attr_resource_remover!("*[onload]", "onload", root, file, removed_in_file),
-            event_attr_resource_remover!(
-                "*[onmousedown]",
-                "onmousedown",
-                root,
-                file,
-                removed_in_file
-            ),
-            event_attr_resource_remover!(
-                "*[onmouseout]",
-                "onmouseout",
-                root,
-                file,
-                removed_in_file
-            ),
-            event_attr_resource_remover!(
-                "*[onmouseover]",
-                "onmouseover",
-                root,
-                file,
-                removed_in_file
-            ),
-            event_attr_resource_remover!("*[onmouseup]", "onmouseup", root, file, removed_in_file),
-            element!("*[style]", {
-                let removed_in_file = Rc::clone(&removed_in_file);
-                move |element| {
-                    if let Some(value) = element.get_attribute("style") {
-                        let (rewritten, removed) =
-                            remove_missing_css_url_references(&value, root, file);
-                        if removed > 0 {
-                            element.set_attribute("style", &rewritten).ok();
-                            removed_in_file.set(removed_in_file.get() + removed);
-                        }
-                    }
-                    Ok(())
-                }
-            }),
-            text!("style", {
-                let removed_in_file = Rc::clone(&removed_in_file);
-                move |chunk| {
-                    let (rewritten, removed) =
-                        remove_missing_css_url_references(chunk.as_str(), root, file);
-                    if removed > 0 {
-                        chunk.replace(&rewritten, lol_html::html_content::ContentType::Text);
-                        removed_in_file.set(removed_in_file.get() + removed);
-                    }
-                    Ok(())
-                }
-            }),
-            text!("script", {
-                let removed_in_file = Rc::clone(&removed_in_file);
-                move |chunk| {
-                    let (rewritten, removed) =
-                        remove_missing_javascript_string_references(chunk.as_str(), root, file);
-                    if removed > 0 {
-                        chunk.replace(&rewritten, lol_html::html_content::ContentType::Text);
-                        removed_in_file.set(removed_in_file.get() + removed);
-                    }
-                    Ok(())
-                }
-            }),
-        ],
-        ..Settings::default()
-    };
-
-    let mut rewriter = HtmlRewriter::new(settings, |chunk: &[u8]| output.extend_from_slice(chunk));
-    rewriter
-        .write(input.as_bytes())
-        .with_context(|| format!("failed to rewrite {}", file.display()))?;
-    rewriter
-        .end()
-        .with_context(|| format!("failed to finish rewriting {}", file.display()))?;
-
-    let removed = removed_in_file.get();
-    if removed > 0 {
-        fs::write(file, output).with_context(|| format!("failed to write {}", file.display()))?;
-    }
-
-    Ok(removed)
-}
-
-fn should_remove_missing_local_reference(root: &Path, file: &Path, href: Option<String>) -> bool {
-    let Some(href) = href else {
-        return false;
-    };
-    let Some(target) = resolve_local_reference(root, file, &href) else {
-        return false;
-    };
-    !target_exists_for_static_host(&target)
-}
-
-fn remove_missing_css_url_references(input: &str, root: &Path, file: &Path) -> (String, usize) {
-    let lower = input.to_ascii_lowercase();
-    let mut output = String::with_capacity(input.len());
-    let mut offset = 0;
-    let mut removed = 0;
-
-    while let Some(relative_start) = lower[offset..].find("url(") {
-        let value_start = offset + relative_start + 4;
-        let Some(relative_end) = input[value_start..].find(')') else {
-            break;
-        };
-        let value_end = value_start + relative_end;
-        let raw_url = &input[value_start..value_end];
-        output.push_str(&input[offset..value_start]);
-        if should_remove_missing_local_reference(root, file, Some(trim_css_url(raw_url).to_owned()))
-        {
-            output.push_str("\"\"");
-            removed += 1;
-        } else {
-            output.push_str(raw_url);
-        }
-        output.push(')');
-        offset = value_end + 1;
-    }
-
-    output.push_str(&input[offset..]);
-    (output, removed)
-}
-
-fn remove_missing_javascript_string_references(
-    input: &str,
-    root: &Path,
-    file: &Path,
-) -> (String, usize) {
-    let bytes = input.as_bytes();
-    let mut output = String::with_capacity(input.len());
-    let mut cursor = 0;
-    let mut index = 0;
-    let mut removed = 0;
-
-    while index < bytes.len() {
-        let quote = bytes[index];
-        if quote != b'\'' && quote != b'"' {
-            index += 1;
-            continue;
-        }
-
-        let Some(end) = find_javascript_string_end(bytes, quote, index + 1) else {
-            break;
-        };
-        let value = &input[index + 1..end];
-        if !value.contains('\\')
-            && looks_like_url_reference_or_file(value)
-            && should_remove_missing_local_reference(root, file, Some(value.to_owned()))
-        {
-            output.push_str(&input[cursor..index + 1]);
-            output.push(quote as char);
-            cursor = end + 1;
-            removed += 1;
-        }
-
-        index = end + 1;
-    }
-
-    output.push_str(&input[cursor..]);
-    (output, removed)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -979,27 +668,6 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn trim_css_url(raw_url: &str) -> &str {
-    let trimmed = raw_url.trim();
-    if trimmed.len() >= 2 {
-        let first = trimmed.as_bytes()[0] as char;
-        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
-        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-            return &trimmed[1..trimmed.len() - 1];
-        }
-    }
-    if trimmed.len() >= 12 && trimmed.starts_with("&quot;") && trimmed.ends_with("&quot;") {
-        return &trimmed[6..trimmed.len() - 6];
-    }
-    if trimmed.len() >= 10 && trimmed.starts_with("&#39;") && trimmed.ends_with("&#39;") {
-        return &trimmed[5..trimmed.len() - 5];
-    }
-    if trimmed.len() >= 12 && trimmed.starts_with("&#x27;") && trimmed.ends_with("&#x27;") {
-        return &trimmed[6..trimmed.len() - 6];
-    }
-    trimmed
-}
-
 fn read_lossy(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -1028,6 +696,26 @@ fn is_css_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Validation reports missing targets without changing references or source encoding.
+	#[test]
+	fn preserves_unresolved_references_and_original_bytes() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path();
+		let mut html = br#"<a href="missing.html">Page</a><a href="game.zip">Download</a><img src="missing.gif"><script src="missing.js"></script><link href="missing.css" rel="stylesheet"><a style="background: url(inline.gif)" onmouseover="swap('hover.gif')">Hover</a><style>body { background: url(style.gif); }</style><script>var image = 'script.gif';</script>"#.to_vec();
+		html.push(0xe9);
+		let css = br#"body { background: url("background.gif"); }"#;
+		fs::write(root.join("index.html"), &html).unwrap();
+		fs::write(root.join("style.css"), css).unwrap();
+
+		let report = validate_local_links(root).unwrap();
+
+		assert_eq!(report.checked, 10);
+		assert_eq!(report.missing.len(), 10);
+		assert!(report.missing_image_sources.is_empty());
+		assert_eq!(fs::read(root.join("index.html")).unwrap(), html);
+		assert_eq!(fs::read(root.join("style.css")).unwrap(), css);
+	}
 
     #[test]
     fn validates_existing_local_links() {
@@ -1211,98 +899,5 @@ mod tests {
 
         assert_eq!(report.checked, 0);
         assert!(report.missing.is_empty());
-    }
-
-    #[test]
-    fn removes_missing_local_anchor_hrefs_after_alias_repair() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        fs::write(
-            root.join("index.html"),
-            r##"<a href="user/index.htm">Account</a><a href="https://example.com/">External</a><a href="#top">Top</a>"##,
-        )
-        .unwrap();
-
-        let removed = remove_missing_local_href_links(root).unwrap();
-
-        assert_eq!(removed, 1);
-        assert_eq!(
-            fs::read_to_string(root.join("index.html")).unwrap(),
-            r##"<a>Account</a><a href="https://example.com/">External</a><a href="#top">Top</a>"##
-        );
-    }
-
-    #[test]
-    fn keeps_existing_local_anchor_hrefs() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        fs::create_dir_all(root.join("user")).unwrap();
-        fs::write(root.join("user/index.htm"), "account").unwrap();
-        fs::write(
-            root.join("index.html"),
-            r#"<a href="user/index.htm">Account</a>"#,
-        )
-        .unwrap();
-
-        let removed = remove_missing_local_href_links(root).unwrap();
-
-        assert_eq!(removed, 0);
-        assert_eq!(
-            fs::read_to_string(root.join("index.html")).unwrap(),
-            r#"<a href="user/index.htm">Account</a>"#
-        );
-    }
-
-    #[test]
-    fn removes_missing_local_resource_references_after_recovery() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        fs::create_dir_all(root.join("images")).unwrap();
-        fs::write(root.join("images/ok.gif"), "gif").unwrap();
-        fs::write(
-            root.join("index.html"),
-            r#"<img src="images/missing.gif" alt="missing"><img src="images/ok.gif"><script src="missing.js"></script><link rel="stylesheet" href="missing.css">"#,
-        )
-        .unwrap();
-
-        let removed = remove_missing_local_resource_references(root).unwrap();
-
-        assert_eq!(removed, 3);
-        let output = fs::read_to_string(root.join("index.html")).unwrap();
-        assert!(!output.contains("images/missing.gif"));
-        assert!(!output.contains("missing.js"));
-        assert!(!output.contains("missing.css"));
-        assert!(output.contains("images/ok.gif"));
-        let report = validate_local_links(root).unwrap();
-        assert!(report.missing.is_empty(), "{:?}", report.missing);
-    }
-
-    #[test]
-    fn removes_missing_css_and_event_resource_references() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        fs::create_dir_all(root.join("images")).unwrap();
-        fs::write(root.join("images/ok.gif"), "gif").unwrap();
-        fs::write(
-            root.join("index.html"),
-            r#"<a onmouseover="swap('button','images/missing_on.gif')" style="background: url(images/missing_bg.gif)">Button</a>"#,
-        )
-        .unwrap();
-        fs::write(
-            root.join("style.css"),
-            r#".missing { background: URL("images/missing_css.gif"); } .ok { background: url("images/ok.gif"); }"#,
-        )
-        .unwrap();
-
-        let removed = remove_missing_local_resource_references(root).unwrap();
-
-        assert_eq!(removed, 3);
-        let report = validate_local_links(root).unwrap();
-        assert!(report.missing.is_empty(), "{:?}", report.missing);
-        assert!(
-            fs::read_to_string(root.join("style.css"))
-                .unwrap()
-                .contains(r#"url("images/ok.gif")"#)
-        );
     }
 }
