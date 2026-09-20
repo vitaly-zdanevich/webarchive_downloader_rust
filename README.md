@@ -245,7 +245,7 @@ Useful options:
 --max-extra-download-size-mib N
 --timeout-seconds N
 --ssh USER@HOST  (repeatable)
---user-agent "webarchive-downloader-rust/0.4.0 your-email@example.com"
+--user-agent "webarchive-downloader-rust/0.4.1 your-email@example.com"
 ```
 
 ## GitLab Pages
