@@ -71,12 +71,8 @@ struct Cli {
     overwrite: bool,
 
 	/// Retry recognized local HTML error pages while preserving all other existing files.
-	#[arg(long, conflicts_with_all = ["overwrite", "no_clobber", "validate_only", "repair_output", "repair_local_links", "list"])]
+	#[arg(long, conflicts_with_all = ["overwrite", "validate_only", "repair_output", "repair_local_links", "list"])]
 	recover_existing: bool,
-
-    /// Deprecated compatibility alias. Existing files are skipped by default.
-    #[arg(long, hide = true, conflicts_with = "overwrite")]
-    no_clobber: bool,
 
     /// Keep archived links as-is instead of rewriting internal HTML/CSS links to local paths.
     #[arg(long)]
@@ -228,7 +224,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
         query,
         DownloadOptions {
             output_dir: cli.output,
-            no_clobber: !cli.overwrite || cli.no_clobber,
+			no_clobber: !cli.overwrite,
 			recover_existing: cli.recover_existing,
             rewrite_links: !cli.no_rewrite,
             extra_download_max_bytes,
@@ -489,6 +485,35 @@ fn format_elapsed_time(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+	/// Obsolete CLI aliases are not retained solely for older invocations.
+	#[test]
+	fn rejects_deprecated_no_clobber_alias() {
+		let error = Cli::try_parse_from([
+			"webarchive-downloader-rust", "example.com", "--no-clobber",
+		]).unwrap_err();
+		assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+	}
+
+	/// Skipping existing files is the default; only explicit overwrite opts out.
+	#[test]
+	fn overwrite_remains_explicit_and_conflicts_with_recovery() {
+		let default = Cli::try_parse_from(["webarchive-downloader-rust", "example.com"]).unwrap();
+		assert!(!default.overwrite);
+		let overwrite = Cli::try_parse_from([
+			"webarchive-downloader-rust", "example.com", "--overwrite",
+		]).unwrap();
+		assert!(overwrite.overwrite);
+		let recovery = Cli::try_parse_from([
+			"webarchive-downloader-rust", "example.com", "--recover-existing",
+		]).unwrap();
+		assert!(recovery.recover_existing);
+		assert!(!recovery.overwrite);
+		let error = Cli::try_parse_from([
+			"webarchive-downloader-rust", "example.com", "--overwrite", "--recover-existing",
+		]).unwrap_err();
+		assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
 
 	/// Both help forms distinguish initial host discovery from linked subdomain downloads.
 	#[test]
