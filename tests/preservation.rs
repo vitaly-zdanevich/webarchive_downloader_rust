@@ -54,6 +54,53 @@ fn options(output_dir: &Path, max_bytes: Option<u64>) -> DownloadOptions {
 	}
 }
 
+/// A fresh domain download must keep same-ID posts and all alias resources in their own forums.
+#[tokio::test]
+async fn fresh_domain_download_keeps_topic_aliases_in_the_destination_forum() {
+	let server = MockServer::start().await;
+	let output = tempfile::tempdir().unwrap();
+	let timestamp = "20060101000000";
+	let mapper = SiteMapper::new("example.com").unwrap();
+	let mut records = String::new();
+	for (host, label) in [("example.com", "PRIMARY POST"), ("other.example.com", "OTHER POST")] {
+		for (path, mime, body) in [
+			("forums/index.htm", "text/html", "<a href='viewtopic.php?p=42#p42'>Shared title</a>".to_owned()),
+			("forums/viewtopic.php?t=1", "text/html", format!("<title>Forum :: View topic - Shared title</title><p id='p42'>{label}</p><link href='style.css'><script src='script.js'></script><img src='logo.gif'>")),
+			("forums/style.css", "text/css", "body { color: black; }".to_owned()),
+			("forums/script.js", "application/javascript", "void 0;".to_owned()),
+			("forums/logo.gif", "image/gif", "mock image".to_owned()),
+		] {
+			let original = format!("http://{host}/{path}");
+			records.push_str(&format!("{timestamp} {original} {mime} 200 MOCK 100\n"));
+			mock_capture(&server, timestamp, &original, 200, &body).await;
+		}
+	}
+	let unknown = "http://empty.example.com/forums/index.htm";
+	records.push_str(&format!("{timestamp} {unknown} text/html 200 MOCK 100\n"));
+	mock_capture(&server, timestamp, unknown, 200, "<a href='viewtopic.php?p=42#p42'>Shared title</a>").await;
+	mock_cdx(&server, "example.com", "domain", &records).await;
+	let report = download_site(
+		build_client("topic-alias-test", Duration::from_secs(5), Vec::new()).unwrap(), mapper.clone(),
+		CdxQuery::new("example.com".to_owned(), MatchType::Domain, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap()),
+		options(output.path(), None),
+	).await.unwrap();
+	assert_eq!(report.failed, 0);
+	assert_eq!(report.downloaded, 11);
+	assert_eq!(report.aliases_created, 2);
+	for (host, label) in [("example.com", "PRIMARY POST"), ("other.example.com", "OTHER POST")] {
+		let alias = mapper.local_path_for_url(&format!("http://{host}/forums/viewtopic.php?p=42"), "text/html").unwrap();
+		let source = mapper.local_path_for_url(&format!("http://{host}/forums/viewtopic.php?t=1"), "text/html").unwrap();
+		let bytes = std::fs::read(output.path().join(&alias)).unwrap();
+		assert!(String::from_utf8_lossy(&bytes).contains(label));
+		assert_eq!(bytes, std::fs::read(output.path().join(source)).unwrap());
+	}
+	let missing = mapper.local_path_for_url("http://empty.example.com/forums/viewtopic.php?p=42", "text/html").unwrap();
+	assert!(!output.path().join(&missing).exists());
+	let validation = webarchive_downloader_rust::link_validation::validate_local_links(output.path()).unwrap();
+	assert_eq!(validation.missing.len(), 1, "{:?}", validation.missing);
+	assert_eq!(validation.missing[0].target, output.path().join(missing));
+}
+
 /// Resume must use local pages to discover missing resources without replaying good HTML.
 #[tokio::test]
 async fn resume_preserves_good_page_when_replay_has_disappeared() {

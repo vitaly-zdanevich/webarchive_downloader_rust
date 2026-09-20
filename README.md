@@ -44,6 +44,7 @@ This is an early but working Rust CLI. It:
 - can repair an existing output directory by fetching missing static assets that are present in Wayback
 - queries Wayback directly for missing local static assets that were not present in the initial CDX result
 - creates conservative local aliases for obvious static asset filename variants, such as `screen4.jpg` to an archived `screenshot4.jpg`
+- creates topic aliases only within the destination forum directory, keeping relative resources intact; shared post IDs or titles never establish equivalence across subdomains or separate forums
 - retains unresolved links and resource references instead of hiding gaps in the local mirror
 - validates generated local links after download and reports missing files
 - writes to `public/` by default, which matches GitLab Pages conventions

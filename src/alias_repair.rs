@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Topic identities are local to one forum directory, including its host prefix.
+type ScopedTopicIndex = HashMap<PathBuf, HashMap<String, Vec<PathBuf>>>;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AliasRepairReport {
     pub created: usize,
@@ -38,11 +41,18 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 	Ok(created)
 }
 
+/// Creates missing topic copies only beside their source, preserving relative URLs.
+/// Post IDs and titles are scoped to the destination forum, not the referring page.
+/// Existing files are never replaced, and no cross-forum equivalence is inferred.
 pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
+	let root = fs::canonicalize(root).context("failed to open topic alias directory")?;
+	let root = root.as_path();
     let html_files = collect_html_files(root)?;
     let title_index = build_topic_title_index(root, &html_files)?;
     let post_index = build_post_anchor_index(root, &html_files)?;
     let mut report = AliasRepairReport::default();
+	let empty_index = HashMap::new();
+	let empty_anchors = HashSet::new();
 
     for file in &html_files {
         let input = read_lossy(file)?;
@@ -54,18 +64,21 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
             let Some(target) = missing_topic_target(root, file, &link.href)? else {
                 continue;
             };
-            if target.exists() {
+            if fs::symlink_metadata(&target).is_ok() {
                 continue;
             }
+			let relative_target = target.strip_prefix(root)?;
+			let scope = relative_target.parent().unwrap_or(Path::new(""));
+			let same_forum = file.parent() == target.parent();
             let source = match alias_source_for_link(
                 root,
                 file,
                 &input,
-                &current_anchors,
-                current_topic_title.as_deref(),
+				if same_forum { &current_anchors } else { &empty_anchors },
+				if same_forum { current_topic_title.as_deref() } else { None },
                 &link,
-                &title_index,
-                &post_index,
+				title_index.get(scope).unwrap_or(&empty_index),
+				post_index.get(scope).unwrap_or(&empty_index),
             ) {
                 AliasSource::Resolved(source) => source,
                 AliasSource::Unresolved => {
@@ -78,18 +91,15 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
                 }
             };
 
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
+			anyhow::ensure!(source.parent() == Some(scope), "topic alias source must share its destination directory");
             let source = root.join(source);
-            fs::copy(&source, &target).with_context(|| {
-                format!(
-                    "failed to copy topic alias {} to {}",
-                    source.display(),
-                    target.display()
-                )
-            })?;
+			let bytes = fs::read(&source)
+				.with_context(|| format!("failed to read topic source {}", source.display()))?;
+			let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&target)
+				.with_context(|| format!("failed to create topic alias {}", target.display()))?;
+			file.set_permissions(fs::metadata(&source)?.permissions())?;
+			std::io::Write::write_all(&mut file, &bytes)
+				.with_context(|| format!("failed to write topic alias {}", target.display()))?;
             report.created += 1;
         }
     }
@@ -123,8 +133,8 @@ fn collect_html_files_into(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> 
 fn build_topic_title_index(
     root: &Path,
     html_files: &[PathBuf],
-) -> Result<HashMap<String, Vec<PathBuf>>> {
-    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+) -> Result<ScopedTopicIndex> {
+	let mut index = ScopedTopicIndex::new();
     for file in html_files {
         if !file
             .file_name()
@@ -147,10 +157,11 @@ fn build_topic_title_index(
             .strip_prefix(root)
             .unwrap_or(file.as_path())
             .to_path_buf();
-        index.entry(title).or_default().push(relative);
+		let scope = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+		index.entry(scope).or_default().entry(title).or_default().push(relative);
     }
 
-    for candidates in index.values_mut() {
+	for candidates in index.values_mut().flat_map(|topics| topics.values_mut()) {
         candidates.sort();
         candidates.dedup();
     }
@@ -160,8 +171,8 @@ fn build_topic_title_index(
 fn build_post_anchor_index(
     root: &Path,
     html_files: &[PathBuf],
-) -> Result<HashMap<String, Vec<PathBuf>>> {
-    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+) -> Result<ScopedTopicIndex> {
+	let mut index = ScopedTopicIndex::new();
     for file in html_files {
         if !file
             .file_name()
@@ -177,11 +188,13 @@ fn build_post_anchor_index(
             .unwrap_or(file.as_path())
             .to_path_buf();
         for anchor in extract_anchor_ids(&input) {
-            index.entry(anchor).or_default().push(relative.clone());
+			if anchor_variants(&anchor).is_empty() { continue; }
+			let scope = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+			index.entry(scope).or_default().entry(anchor).or_default().push(relative.clone());
         }
     }
 
-    for candidates in index.values_mut() {
+	for candidates in index.values_mut().flat_map(|topics| topics.values_mut()) {
         candidates.sort();
         candidates.dedup();
     }
@@ -537,26 +550,15 @@ fn reference_fragment(href: &str) -> Option<&str> {
     (!fragment.is_empty()).then_some(fragment)
 }
 
+/// Recognizes phpBB's numeric post anchors, excluding shared template IDs such as `top`.
 fn anchor_variants(fragment: &str) -> Vec<String> {
     let normalized = normalize_anchor_id(fragment);
-    if normalized.is_empty() {
+	let number = normalized.strip_prefix('p').unwrap_or(&normalized);
+	if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         return Vec::new();
     }
 
-    let mut variants = vec![normalized.clone()];
-    if let Some(number) = normalized.strip_prefix('p') {
-        if number.chars().all(|character| character.is_ascii_digit()) {
-            variants.push(number.to_owned());
-        }
-    } else if normalized
-        .chars()
-        .all(|character| character.is_ascii_digit())
-    {
-        variants.push(format!("p{normalized}"));
-    }
-    variants.sort();
-    variants.dedup();
-    variants
+	vec![number.to_owned(), format!("p{number}")]
 }
 
 fn normalize_anchor_id(input: &str) -> String {
