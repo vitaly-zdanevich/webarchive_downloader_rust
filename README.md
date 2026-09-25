@@ -313,6 +313,11 @@ domain whose page does not mention the original site name.
 If a selected replay returns 404, 410, or 451 even though CDX listed it as a
 successful capture, the downloader tries alternate captures of the same URL.
 This applies to buffered pages and streamed files.
+If no usable replay remains during static-asset recovery, the asset is reported
+as unavailable and recovery continues, including when fetching an alias source.
+Both normal downloads and `--repair-output` still reach validation and the final
+folder-size summary; unresolved references are preserved. Lookup and filesystem
+errors are not treated as missing snapshots.
 Repeated body-read or decoding failures also trigger alternate-capture lookup.
 Alternate body recovery and static-asset evidence searches have no twenty-capture
 limit; all eligible indexed candidates can be considered.

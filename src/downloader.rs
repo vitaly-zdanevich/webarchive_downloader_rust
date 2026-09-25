@@ -1130,6 +1130,8 @@ struct StaticAssetRecoveryReport {
     unavailable: usize,
 }
 
+/// Recovers available assets while counting exhausted replay failures as unavailable.
+/// Lookup and filesystem errors remain fatal so incomplete recovery is not hidden.
 async fn recover_missing_static_assets(
     client: &WaybackClient,
     archive_root: &Url,
@@ -1205,6 +1207,10 @@ async fn recover_missing_static_assets(
         .await
         {
             Ok(downloaded) => downloaded,
+			Err(error) if is_unavailable_snapshot_error(&error) => {
+				eprintln!("static asset snapshot unavailable: {error:#}");
+				false
+			}
             Err(error) => return Err(error),
         };
         if downloaded {
@@ -1566,6 +1572,7 @@ async fn create_static_asset_alias_from_candidate(
     Ok(true)
 }
 
+/// Finds an alias source without aborting recovery when all its replays are unavailable.
 async fn ensure_static_asset_alias_source(
     client: &WaybackClient,
     archive_root: &Url,
@@ -1607,6 +1614,10 @@ async fn ensure_static_asset_alias_source(
     .await
     {
         Ok(downloaded) => downloaded,
+		Err(error) if is_unavailable_snapshot_error(&error) => {
+			eprintln!("static asset alias source unavailable: {error:#}");
+			false
+		}
         Err(error) => return Err(error),
     };
     if downloaded {
