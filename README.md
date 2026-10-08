@@ -305,6 +305,26 @@ it again.
 
 The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes.
 
+Before rewriting HTML/CSS, the downloader decodes text with
+[`encoding_rs`](https://docs.rs/encoding_rs/). Encoding selection checks byte-order
+marks, the original HTTP `Content-Type` (or replay header when unavailable), and
+HTML charset metadata in the first 1,024 bytes or a leading CSS `@charset` rule.
+Without a recognized declaration, valid UTF-8 is retained; other bytes use the
+Windows-1252 fallback common to older Western websites. Other legacy encodings
+need a correct declaration; the downloader does not guess the language.
+Rewritten charset declarations identify UTF-8, and non-ASCII output gets a UTF-8
+byte-order mark so local browsers can decode even pages without charset metadata.
+Malformed declared text is reported as a failed download instead of silently
+saving replacement characters. `--no-rewrite` keeps the selected response bytes
+unchanged, including their original encoding. Inline scripts and styles retain
+raw operators, markup strings, and comment delimiters while URLs are rewritten.
+
+These fixes apply to newly rewritten downloads. Existing files are skipped by
+default, and `--recover-existing` does not repair encoding or script corruption
+in otherwise usable pages. Preserve the current output and use a new output
+directory when testing a fresh download with these fixes. The downloader still
+keeps one selected version per URL, not a historical timeline.
+
 If the latest HTML capture is only a meta-refresh or JavaScript redirect, the
 downloader tries older exact captures for that URL. During that fallback it also
 skips captures that no longer look like the requested site, for example a reused

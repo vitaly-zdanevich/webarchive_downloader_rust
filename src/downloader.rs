@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -33,6 +34,7 @@ use crate::pathmap::{
 use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::rewrite::{RewriteContext, rewrite_css, rewrite_html};
 use crate::soft_redirect::is_unusable_html_capture;
+use crate::text_encoding::{decode_text, utf8_bytes};
 use crate::wayback_client::WaybackClient;
 
 #[derive(Clone, Debug)]
@@ -940,7 +942,7 @@ async fn download_one_inner(
     let mut retained_unusable = false;
 
     if should_buffer_response(&job.record, &job.local_path, options.rewrite_links) {
-        let (available_record, bytes) = fetch_record_bytes_with_alternate_capture(
+        let (available_record, body) = fetch_record_bytes_with_alternate_capture(
             client,
             archive_root,
             fallback_options,
@@ -948,13 +950,13 @@ async fn download_one_inner(
             &options.cancellation,
         )
         .await?;
-        let (record, bytes) = maybe_replace_unusable_capture(
+        let (record, body) = maybe_replace_unusable_capture(
             client,
             archive_root,
             fallback_options,
             &options.cancellation,
             &available_record,
-            bytes,
+            body,
             &job.local_path,
         )
         .await?;
@@ -964,11 +966,22 @@ async fn download_one_inner(
         }
 
         retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
-            && is_unusable_html_capture(&String::from_utf8_lossy(&bytes));
+            && is_unusable_html_capture(&body.html_for_inspection());
+		let text = if options.rewrite_links && should_rewrite_as_text(&record, &job.local_path) {
+			Some(
+				decode_text(
+					&body.bytes,
+					body.content_type.as_deref(),
+					is_css_mimetype(&record.mimetype),
+				)
+				.with_context(|| format!("failed to decode {}", record.original))?,
+			)
+		} else {
+			None
+		};
 
-        let extra_download_refs = if options.rewrite_links
-            && should_rewrite_as_text(&record, &job.local_path) {
-            extract_related_references(&String::from_utf8_lossy(&bytes), &Url::parse(&record.original)?, mapper, is_css_mimetype(&record.mimetype))?
+		let extra_download_refs = if let Some(text) = text.as_deref() {
+            extract_related_references(text, &Url::parse(&record.original)?, mapper, is_css_mimetype(&record.mimetype))?
         } else {
             Vec::new()
         };
@@ -985,7 +998,7 @@ async fn download_one_inner(
 
         if job
             .max_bytes
-            .is_some_and(|limit| bytes.len() as u64 > limit)
+            .is_some_and(|limit| body.bytes.len() as u64 > limit)
         {
             eprintln!(
                 "linked file exceeds configured size limit: {}",
@@ -994,8 +1007,7 @@ async fn download_one_inner(
             return Ok(DownloadStatus::SizeLimitExceeded);
         }
 
-        if options.rewrite_links && should_rewrite_as_text(&record, &job.local_path) {
-            let text = String::from_utf8_lossy(&bytes);
+		if let Some(text) = text.as_deref() {
             let context = RewriteContext::new_with_mapper(
                 &record.original,
                 job.local_path.clone(),
@@ -1003,11 +1015,11 @@ async fn download_one_inner(
                 mapper,
             )?;
             let rewritten = if is_css_mimetype(&record.mimetype) {
-                rewrite_css(&text, &context)
+                rewrite_css(text, &context)
             } else {
-                rewrite_html(&text, &context)?
+                rewrite_html(text, &context)?
             };
-            write_bytes_atomic(&destination, rewritten.as_bytes()).await?;
+			write_bytes_atomic(&destination, &utf8_bytes(rewritten)).await?;
 			fallback_options.recovery.record(CaptureEvent {
 				record, local_path: job.local_path.clone(),
 				outcome: if retained_unusable { "unusable" } else { "downloaded" }.into(),
@@ -1018,7 +1030,7 @@ async fn download_one_inner(
                 retained_unusable,
             });
         } else {
-            write_bytes_atomic(&destination, &bytes).await?;
+            write_bytes_atomic(&destination, &body.bytes).await?;
 			fallback_options.recovery.record(CaptureEvent {
 				record, local_path: job.local_path.clone(),
 				outcome: if retained_unusable { "unusable" } else { "downloaded" }.into(),
@@ -1367,7 +1379,7 @@ async fn create_missing_static_asset_aliases_from_alternate_pages(
                         continue;
                     }
                 };
-            let text = String::from_utf8_lossy(&bytes);
+            let text = bytes.html_for_inspection();
 
             let mut index = 0;
             while index < requests.len() {
@@ -1950,12 +1962,26 @@ fn should_buffer_response(record: &CdxRecord, local_path: &Path, rewrite_links: 
         || (rewrite_links && should_rewrite_as_text(record, local_path))
 }
 
+/// Keeps transport encoding metadata attached to the exact replay body, including fallbacks.
+struct SnapshotBody {
+	bytes: Vec<u8>,
+	content_type: Option<String>,
+}
+
+impl SnapshotBody {
+	/// Error-page inspection must not prevent `--no-rewrite` from preserving original bytes.
+	fn html_for_inspection(&self) -> Cow<'_, str> {
+		decode_text(&self.bytes, self.content_type.as_deref(), false)
+			.unwrap_or_else(|_| String::from_utf8_lossy(&self.bytes))
+	}
+}
+
 async fn fetch_record_bytes(
     client: &WaybackClient,
     archive_root: &Url,
     record: &CdxRecord,
     cancellation: &CancellationFlag,
-) -> Result<Vec<u8>> {
+) -> Result<SnapshotBody> {
     let snapshot_url = snapshot_url(archive_root, record)?;
     let mut attempt = 0usize;
     let started_at = Instant::now();
@@ -1965,12 +1991,23 @@ async fn fetch_record_bytes(
         let route = client.active_route_label();
         match fetch_snapshot_response_once(client, &snapshot_url, record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
+				let content_type = response
+					.headers()
+					.get("x-archive-orig-content-type")
+					.or_else(|| response.headers().get(reqwest::header::CONTENT_TYPE))
+					.and_then(|value| value.to_str().ok())
+					.map(str::to_owned);
                 match response
                     .bytes()
                     .await
                     .with_context(|| format!("failed to read {}", record.original))
                 {
-                    Ok(bytes) => return Ok(bytes.to_vec()),
+					Ok(bytes) => {
+						return Ok(SnapshotBody {
+							bytes: bytes.to_vec(),
+							content_type,
+						});
+					}
                     Err(error) if is_retryable_snapshot_error(&error) => {
                         if try_activate_ssh_for_snapshot_error(client, record, &error) {
                             attempt = 0;
@@ -2046,7 +2083,7 @@ async fn fetch_record_bytes_with_alternate_capture(
     fallback_options: &FallbackOptions,
     record: &CdxRecord,
     cancellation: &CancellationFlag,
-) -> Result<(CdxRecord, Vec<u8>)> {
+) -> Result<(CdxRecord, SnapshotBody)> {
     let mut current_record = record.clone();
     let mut current_snapshot_url = snapshot_url(archive_root, &current_record)?;
     let mut seen_records = HashSet::new();
@@ -2869,14 +2906,14 @@ async fn maybe_replace_unusable_capture(
     fallback_options: &FallbackOptions,
     cancellation: &CancellationFlag,
     current_record: &CdxRecord,
-    current_bytes: Vec<u8>,
+    current_bytes: SnapshotBody,
     local_path: &Path,
-) -> Result<(CdxRecord, Vec<u8>)> {
+) -> Result<(CdxRecord, SnapshotBody)> {
     if !should_detect_soft_redirect(current_record, local_path) {
         return Ok((current_record.clone(), current_bytes));
     }
 
-    let text = String::from_utf8_lossy(&current_bytes);
+    let text = current_bytes.html_for_inspection();
     if !is_unusable_html_capture(&text) {
         return Ok((current_record.clone(), current_bytes));
     }
@@ -2921,7 +2958,7 @@ async fn find_usable_capture(
     cancellation: &CancellationFlag,
     current_record: &CdxRecord,
     local_path: &Path,
-) -> Result<Option<(CdxRecord, Vec<u8>)>> {
+) -> Result<Option<(CdxRecord, SnapshotBody)>> {
     let identity_terms = site_identity_terms(&current_record.original);
     let mut seen_digests = HashSet::new();
     remember_digest(&mut seen_digests, current_record);
@@ -2964,7 +3001,7 @@ async fn find_usable_capture(
                         continue;
                     }
                 };
-            let text = String::from_utf8_lossy(&bytes);
+            let text = bytes.html_for_inspection();
             remember_digest(&mut seen_digests, &candidate);
             if is_unusable_html_capture(&text) {
                 println!(

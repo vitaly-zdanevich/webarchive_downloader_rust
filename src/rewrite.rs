@@ -211,6 +211,8 @@ impl<'a> RewriteContext<'a> {
 /// `meta refresh`, and legacy `APPLET`/`PARAM` patterns common in older sites.
 pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String> {
     let mut output = Vec::with_capacity(input.len());
+	let mut style_text = String::new();
+	let mut script_text = String::new();
     let rollover_stack = Rc::new(RefCell::new(Vec::<Vec<RolloverImageSource>>::new()));
     let settings = Settings {
         element_content_handlers: vec![
@@ -286,8 +288,18 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
             ),
             element!("meta[http-equiv][content]", move |element| {
                 rewrite_meta_refresh(element, context);
+				if element
+					.get_attribute("http-equiv")
+					.is_some_and(|value| value.eq_ignore_ascii_case("content-type"))
+				{
+					element.set_attribute("content", "text/html; charset=utf-8")?;
+				}
                 Ok(())
             }),
+			element!("meta[charset]", |element| {
+				element.set_attribute("charset", "utf-8")?;
+				Ok(())
+			}),
             element!("*[style]", move |element| {
                 rewrite_attr_css(element, "style", context);
                 Ok(())
@@ -302,13 +314,27 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
             js_attr_rewriter!("*[onblur]", "onblur", context),
             js_attr_rewriter!("*[onchange]", "onchange", context),
             text!("style", move |chunk| {
-                let rewritten = rewrite_css(chunk.as_str(), context);
-                chunk.replace(&rewritten, ContentType::Text);
+				style_text.push_str(chunk.as_str());
+				if chunk.last_in_text_node() {
+					let rewritten = rewrite_css(&style_text, context);
+					// HTML raw-text elements do not decode character references.
+					chunk.replace(&rewritten, ContentType::Html);
+					style_text.clear();
+				} else {
+					chunk.remove();
+				}
                 Ok(())
             }),
             text!("script", move |chunk| {
-                let rewritten = rewrite_javascript_string_urls(chunk.as_str(), context);
-                chunk.replace(&rewritten, ContentType::Text);
+				// Buffer complete nodes so HTML tokenizer boundaries cannot split JS strings.
+				script_text.push_str(chunk.as_str());
+				if chunk.last_in_text_node() {
+					let rewritten = rewrite_javascript_string_urls(&script_text, context);
+					chunk.replace(&rewritten, ContentType::Html);
+					script_text.clear();
+				} else {
+					chunk.remove();
+				}
                 Ok(())
             }),
         ],
@@ -330,6 +356,10 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
 pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
 	let mut rewritten = String::with_capacity(input.len());
 	let mut offset = 0;
+	if let Some((_, end)) = crate::text_encoding::css_charset(input) {
+		rewritten.push_str("@charset \"UTF-8\";");
+		offset = end;
+	}
 	for reference in crate::css_refs::references(input) {
 		if let Some(UrlRewrite::Rewrite(value)) = context.rewrite_url_reference(&reference.value) {
 			rewritten.push_str(&input[offset..reference.range.start]);

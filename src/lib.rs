@@ -11,6 +11,7 @@ mod recovery;
 mod retry;
 pub mod rewrite;
 pub mod soft_redirect;
+mod text_encoding;
 pub mod wayback_client;
 
 /// Default HTTP identity, kept in sync with Cargo release metadata.
