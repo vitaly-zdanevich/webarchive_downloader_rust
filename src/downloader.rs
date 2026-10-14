@@ -151,9 +151,7 @@ struct FallbackOptions {
 
 /// Reuses exact CDX responses across fallback, linked, and static-asset passes.
 async fn recovery_records(client: &WaybackClient, query: &CdxQuery, fallback: &FallbackOptions) -> Result<Vec<CdxRecord>> {
-	let mut canonical_query = query.clone();
-	canonical_query.target = crate::cdx::canonical_original_key(&query.target);
-	let key = format!("{}#{:?}", canonical_query.search_url()?, query.strategy);
+	let key = format!("{}#{:?}", query.search_url()?, query.strategy);
 	if let Some(records) = fallback.recovery.lookup(&key) {
 		return Ok(records);
 	}
@@ -2613,14 +2611,14 @@ fn should_try_alternate_snapshot_after_error(error: &anyhow::Error, attempt: usi
         && attempt.saturating_add(1) >= SNAPSHOT_ALTERNATE_CAPTURE_AFTER_ATTEMPTS
 }
 
-/// Remembers a capture by timestamp and normalized original URL.
+/// Remembers exact replay identities, independently of normalized local path identities.
 fn remember_snapshot_record(
     seen_records: &mut HashSet<(String, String)>,
     record: &CdxRecord,
 ) -> bool {
     seen_records.insert((
         record.timestamp.clone(),
-        normalize_lookup_url(&record.original),
+        record.original.clone(),
     ))
 }
 
@@ -3294,6 +3292,71 @@ pub fn build_client(
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+	/// Distinct replay originals can share a local path without sharing availability.
+	#[test]
+	fn replay_attempts_keep_original_host_and_query_variants() {
+		let mut seen = HashSet::new();
+		let record = CdxRecord {
+			timestamp: "20200101000000".into(), original: "http://www.example.com/topic.php?t=7&sid=one".into(),
+			mimetype: "text/html".into(), status_code: 200, digest: "SAME".into(), length: None,
+		};
+		assert!(remember_snapshot_record(&mut seen, &record));
+		for original in [
+			"http://example.com/topic.php?t=7&sid=one",
+			"http://www.example.com/topic.php?t=7&sid=two",
+			"http://www.example.com:80/topic.php?t=7&sid=one",
+		] {
+			assert!(remember_snapshot_record(&mut seen, &CdxRecord { original: original.into(), ..record.clone() }), "{original}");
+		}
+		assert!(!remember_snapshot_record(&mut seen, &record));
+	}
+
+	/// Cached exact queries must not replace a different request with an earlier empty result.
+	#[tokio::test]
+	async fn recovery_lookup_cache_keeps_explicit_port_queries_distinct() {
+		use wiremock::matchers::{path, query_param};
+		use wiremock::{Mock, MockServer, ResponseTemplate};
+		let server = MockServer::start().await;
+		let first = "http://example.com:80/page.html";
+		let second = "http://example.com/page.html";
+		for (original, rows) in [(first, String::new()), (second, format!("20200101000000 {second} text/html 200 PAGE 100\n"))] {
+			Mock::given(path("/cdx/search/cdx")).and(query_param("url", original))
+				.respond_with(ResponseTemplate::new(200).set_body_string(rows)).expect(1).mount(&server).await;
+		}
+		let client = build_client("lookup-test", Duration::from_secs(5), Vec::new()).unwrap();
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let query = CdxQuery::new(first.into(), MatchType::Exact, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap());
+		assert!(recovery_records(&client, &query, &fallback).await.unwrap().is_empty());
+		let query = CdxQuery { target: second.into(), ..query };
+		assert_eq!(recovery_records(&client, &query, &fallback).await.unwrap().len(), 1);
+		assert_eq!(recovery_records(&client, &query, &fallback).await.unwrap().len(), 1);
+	}
+
+	/// A working replay with another session query must still be tried after a same-timestamp 404.
+	#[tokio::test]
+	async fn unavailable_replay_recovers_from_same_timestamp_query_variant() {
+		use wiremock::matchers::{path, query_param};
+		use wiremock::{Mock, MockServer, ResponseTemplate};
+		let server = MockServer::start().await;
+		let original = "http://example.com/topic.php?t=7&sid=one";
+		let alternate = "http://example.com/topic.php?t=7&sid=two";
+		let timestamp = "20200101000000";
+		Mock::given(path("/cdx/search/cdx")).and(query_param("url", original))
+			.respond_with(ResponseTemplate::new(200).set_body_string(format!("{timestamp} {alternate} text/html 200 PAGE 100\n")))
+			.expect(1).mount(&server).await;
+		for (query, status, body) in [("one", 404, "Missing"), ("two", 200, "<p>Preserved topic</p>")] {
+			Mock::given(path(format!("/web/{timestamp}id_/http://example.com/topic.php")))
+				.and(query_param("sid", query)).respond_with(ResponseTemplate::new(status).set_body_string(body))
+				.expect(1).mount(&server).await;
+		}
+		let client = build_client("replay-test", Duration::from_secs(5), Vec::new()).unwrap();
+		let record = CdxRecord { timestamp: timestamp.into(), original: original.into(), mimetype: "text/html".into(), status_code: 200, digest: "PAGE".into(), length: None };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let (saved, body) = fetch_record_bytes_with_alternate_capture(&client, &Url::parse(&server.uri()).unwrap(), &fallback, &record, &CancellationFlag::new()).await.unwrap();
+		assert_eq!(saved.original, alternate);
+		assert_eq!(body.bytes, b"<p>Preserved topic</p>");
+	}
 
 	/// Static repair must inspect unique older page bodies beyond the former twenty-capture cap.
 	#[tokio::test]

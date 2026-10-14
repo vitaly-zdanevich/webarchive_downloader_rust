@@ -328,6 +328,11 @@ data blocks, invalid scripts, and strings with lone UTF-16 surrogates are not
 rewritten. This is static analysis, not JavaScript execution.
 Building from source requires Rust 1.97 or newer for the parser dependency.
 
+Fallback downloads track the exact indexed original URL and timestamp separately
+from normalized local paths. A failed replay must not prevent trying another
+indexed host, port spelling, or session-query variant that maps to the same local
+file. Exact CDX lookup results are cached only for the request actually made.
+
 These fixes apply to newly rewritten downloads. Existing files are skipped by
 default, and `--recover-existing` does not repair encoding or script corruption
 in otherwise usable pages. Preserve the current output and use a new output
