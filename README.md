@@ -319,6 +319,15 @@ saving replacement characters. `--no-rewrite` keeps the selected response bytes
 unchanged, including their original encoding. Inline scripts and styles retain
 raw operators, markup strings, and comment delimiters while URLs are rewritten.
 
+JavaScript string handling uses the [Oxc parser](https://docs.rs/oxc_parser/).
+It decodes escapes before rewriting URLs or embedded HTML, then escapes edited
+values for their original quotes. Discovery and validation use the same decoded
+strings, including event handlers, so generated static dependencies can be
+downloaded too. Comments, regular expressions, template text, non-JavaScript
+data blocks, invalid scripts, and strings with lone UTF-16 surrogates are not
+rewritten. This is static analysis, not JavaScript execution.
+Building from source requires Rust 1.97 or newer for the parser dependency.
+
 These fixes apply to newly rewritten downloads. Existing files are skipped by
 default, and `--recover-existing` does not repair encoding or script corruption
 in otherwise usable pages. Preserve the current output and use a new output

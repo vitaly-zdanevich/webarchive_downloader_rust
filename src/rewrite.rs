@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -213,9 +213,17 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
     let mut output = Vec::with_capacity(input.len());
 	let mut style_text = String::new();
 	let mut script_text = String::new();
+	let javascript_script = Rc::new(Cell::new(true));
     let rollover_stack = Rc::new(RefCell::new(Vec::<Vec<RolloverImageSource>>::new()));
     let settings = Settings {
         element_content_handlers: vec![
+			element!("script", {
+				let javascript_script = Rc::clone(&javascript_script);
+				move |element| {
+					javascript_script.set(crate::javascript::is_javascript_element(element));
+					Ok(())
+				}
+			}),
             element!("*", {
                 let rollover_stack = Rc::clone(&rollover_stack);
                 move |element| {
@@ -329,7 +337,11 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
 				// Buffer complete nodes so HTML tokenizer boundaries cannot split JS strings.
 				script_text.push_str(chunk.as_str());
 				if chunk.last_in_text_node() {
-					let rewritten = rewrite_javascript_string_urls(&script_text, context);
+					let rewritten = if javascript_script.get() {
+						rewrite_javascript_string_urls(&script_text, context)
+					} else {
+						script_text.clone()
+					};
 					chunk.replace(&rewritten, ContentType::Html);
 					script_text.clear();
 				} else {
@@ -558,17 +570,19 @@ fn rewrite_attr_css(element: &mut Element<'_, '_>, attr: &str, context: &Rewrite
 }
 
 fn rewrite_attr_javascript_urls(
-    element: &mut Element<'_, '_>,
-    attr: &str,
-    context: &RewriteContext<'_>,
+	element: &mut Element<'_, '_>,
+	attr: &str,
+	context: &RewriteContext<'_>,
 ) {
-    let Some(value) = element.get_attribute(attr) else {
-        return;
-    };
-    let rewritten = rewrite_javascript_string_urls(&value, context);
-    if rewritten != value {
-        element.set_attribute(attr, &rewritten).ok();
-    }
+	let Some(value) = element.get_attribute(attr) else {
+		return;
+	};
+	let decoded = html_escape::decode_html_entities(&value);
+	let rewritten = rewrite_javascript_string_urls(&decoded, context);
+	if rewritten != decoded {
+		let encoded = html_escape::encode_double_quoted_attribute(&rewritten);
+		element.set_attribute(attr, &encoded).ok();
+	}
 }
 
 /// Fills missing image `src` values from surrounding old rollover markup.
@@ -638,7 +652,7 @@ fn extract_rollover_image_sources(
     ] {
         if let Some(value) = element.get_attribute(attr) {
             sources.extend(extract_rollover_image_sources_from_javascript(
-                &value, context,
+                &html_escape::decode_html_entities(&value), context,
             ));
         }
     }
@@ -649,7 +663,8 @@ fn extract_rollover_image_sources_from_javascript(
     input: &str,
     context: &RewriteContext<'_>,
 ) -> Vec<RolloverImageSource> {
-    let strings = javascript_string_literals(input);
+	let literals = crate::javascript::strings(input);
+	let strings = literals.iter().map(|literal| literal.value.as_str()).collect::<Vec<_>>();
     let mut sources = Vec::new();
     for index in 0..strings.len() {
         let name = strings[index];
@@ -679,68 +694,29 @@ fn extract_rollover_image_sources_from_javascript(
     sources
 }
 
+/// Rewrites decoded literal values and escapes each edited value for its original delimiter.
 fn rewrite_javascript_string_urls(input: &str, context: &RewriteContext<'_>) -> String {
-    let bytes = input.as_bytes();
-    let mut rewritten = String::with_capacity(input.len());
-    let mut cursor = 0;
-    let mut index = 0;
+	let mut rewritten = String::with_capacity(input.len());
+	let mut cursor = 0;
+	for literal in crate::javascript::strings(input) {
+		let value = literal.value.as_str();
+		let replacement = if looks_like_javascript_url_reference(value) {
+			context
+				.rewrite_url_reference(value)
+				.map(url_rewrite_to_javascript_string)
+		} else {
+			rewrite_html_fragment_in_javascript_string(value, context)
+		};
 
-    while index < bytes.len() {
-        let quote = bytes[index];
-        if quote != b'\'' && quote != b'"' {
-            index += 1;
-            continue;
-        }
+		if let Some(replacement) = replacement.filter(|replacement| replacement != value) {
+			rewritten.push_str(&input[cursor..literal.range.start]);
+			rewritten.push_str(&crate::javascript::quote(&replacement, literal.quote));
+			cursor = literal.range.end;
+		}
+	}
 
-        let Some(end) = find_javascript_string_end(bytes, quote, index + 1) else {
-            break;
-        };
-        let value = &input[index + 1..end];
-        let replacement = if !value.contains('\\') && looks_like_javascript_url_reference(value) {
-            context
-                .rewrite_url_reference(value)
-                .map(url_rewrite_to_javascript_string)
-        } else {
-            rewrite_html_fragment_in_javascript_string(value, context)
-        };
-
-        if let Some(replacement) = replacement {
-            rewritten.push_str(&input[cursor..index + 1]);
-            rewritten.push_str(&replacement);
-            rewritten.push(quote as char);
-            cursor = end + 1;
-        }
-
-        index = end + 1;
-    }
-
-    rewritten.push_str(&input[cursor..]);
-    rewritten
-}
-
-fn javascript_string_literals(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
-    let mut strings = Vec::new();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        let quote = bytes[index];
-        if quote != b'\'' && quote != b'"' {
-            index += 1;
-            continue;
-        }
-
-        let Some(end) = find_javascript_string_end(bytes, quote, index + 1) else {
-            break;
-        };
-        let value = &input[index + 1..end];
-        if !value.contains('\\') {
-            strings.push(value);
-        }
-        index = end + 1;
-    }
-
-    strings
+	rewritten.push_str(&input[cursor..]);
+	rewritten
 }
 
 fn url_rewrite_to_javascript_string(rewrite: UrlRewrite) -> String {
@@ -758,27 +734,6 @@ fn rewrite_html_fragment_in_javascript_string(
 
     let rewritten = rewrite_html(value, context).ok()?;
     (rewritten != value).then_some(rewritten)
-}
-
-fn find_javascript_string_end(bytes: &[u8], quote: u8, start: usize) -> Option<usize> {
-    let mut escaped = false;
-    for (offset, byte) in bytes[start..].iter().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        if *byte == b'\\' {
-            escaped = true;
-            continue;
-        }
-
-        if *byte == quote {
-            return Some(start + offset);
-        }
-    }
-
-    None
 }
 
 fn looks_like_javascript_url_reference(value: &str) -> bool {

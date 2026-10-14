@@ -41,7 +41,7 @@ macro_rules! collect_javascript_attr {
             if let Some(value) = element.get_attribute($attr) {
                 references
                     .borrow_mut()
-                    .extend(extract_javascript_string_references(&value));
+                    .extend(extract_javascript_string_references(&html_escape::decode_html_entities(&value)));
             }
             Ok(())
         })
@@ -183,8 +183,17 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
         let style_attr_references = Rc::clone(&references);
         let style_text_references = Rc::clone(&references);
         let missing_image_sources_handler = Rc::clone(&missing_image_sources);
+		let javascript_script = Rc::new(Cell::new(true));
+		let mut script_text = String::new();
         let settings = Settings {
             element_content_handlers: vec![
+				element!("script", {
+					let javascript_script = Rc::clone(&javascript_script);
+					move |element| {
+						javascript_script.set(crate::javascript::is_javascript_element(element));
+						Ok(())
+					}
+				}),
                 collect_attr!("*[href]", "href", references),
                 collect_attr!("*[src]", "src", references),
                 collect_attr!("blockquote[cite]", "cite", references),
@@ -267,9 +276,13 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                     Ok(())
                 }),
                 text!("script", move |chunk| {
-                    script_text_references
-                        .borrow_mut()
-                        .extend(extract_javascript_string_references(chunk.as_str()));
+					script_text.push_str(chunk.as_str());
+					if chunk.last_in_text_node() {
+						if javascript_script.get() {
+							script_text_references.borrow_mut().extend(extract_javascript_string_references(&script_text));
+						}
+						script_text.clear();
+					}
                     Ok(())
                 }),
             ],
@@ -346,50 +359,20 @@ fn parse_srcset_references(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Discovers decoded URL strings and generated HTML dependencies using the same JS parser as rewriting.
 fn extract_javascript_string_references(input: &str) -> Vec<String> {
-    let bytes = input.as_bytes();
-    let mut references = Vec::new();
-    let mut index = 0;
+	let mut references = Vec::new();
+	for literal in crate::javascript::strings(input) {
+		if looks_like_url_reference_or_file(&literal.value) {
+			references.push(literal.value);
+		} else if literal.value.contains('<') && literal.value.contains('>')
+			&& let Ok(fragment) = extract_html_references(&literal.value)
+		{
+			references.extend(fragment.references);
+		}
+	}
 
-    while index < bytes.len() {
-        let quote = bytes[index];
-        if quote != b'\'' && quote != b'"' {
-            index += 1;
-            continue;
-        }
-
-        let Some(end) = find_javascript_string_end(bytes, quote, index + 1) else {
-            break;
-        };
-        let value = &input[index + 1..end];
-        if looks_like_url_reference_or_file(value) {
-            references.push(value.to_owned());
-        }
-        index = end + 1;
-    }
-
-    references
-}
-
-fn find_javascript_string_end(bytes: &[u8], quote: u8, start: usize) -> Option<usize> {
-    let mut escaped = false;
-    for (offset, byte) in bytes[start..].iter().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        if *byte == b'\\' {
-            escaped = true;
-            continue;
-        }
-
-        if *byte == quote {
-            return Some(start + offset);
-        }
-    }
-
-    None
+	references
 }
 
 fn looks_like_url_reference_or_file(value: &str) -> bool {

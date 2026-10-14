@@ -3,6 +3,7 @@ pub mod cdx;
 mod css_refs;
 pub mod download_refs;
 pub mod downloader;
+mod javascript;
 pub mod link_validation;
 pub mod noise;
 pub mod output_summary;
