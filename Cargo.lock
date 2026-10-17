@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "webarchive-downloader-rust"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
