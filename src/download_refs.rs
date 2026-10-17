@@ -131,6 +131,24 @@ fn extension_of(segment: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+	/// HTML entities are syntax, whereas identical CSS/JS raw text is literal URL data.
+	#[test]
+	fn discovery_decodes_entities_at_html_attribute_boundaries_only() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://example.com/").unwrap();
+		let references = extract_related_references(r#"<a href="view.php?a=1&amp;b=2">Page</a>
+<img src="img/a&#38;b.gif"><source srcset="img/c&#x26;d.gif 2x">
+<style>i { background:url('img/literal&amp;name.gif'); }</style>
+<script>image.src = 'img/literal&amp;name.gif'; document.write('<img src="img/generated&amp;name.gif">');</script>"#, &base, &mapper, false).unwrap();
+		assert_eq!(references, vec![
+			"http://example.com/img/a&b.gif",
+			"http://example.com/img/c&d.gif",
+			"http://example.com/img/generated&name.gif",
+			"http://example.com/img/literal&amp;name.gif",
+			"http://example.com/view.php?a=1&b=2",
+		]);
+	}
+
 	/// Uses the same HTML/CSS parser as validation, including unquoted and wrapped URLs.
 	#[test]
 	fn discovers_pages_srcset_css_and_wrapped_queries() {
@@ -142,7 +160,7 @@ mod tests {
 		assert!(refs.contains(&"http://example.com/pages/next".to_owned()));
 		assert!(refs.contains(&"http://assets.example.com/a.gif".to_owned()));
 		assert!(refs.contains(&"http://example.com/b.gif".to_owned()));
-		assert!(refs.iter().any(|url| url.contains("viewtopic.php?t=7") && url.contains("p=9")));
+		assert!(refs.contains(&"http://example.com/viewtopic.php?t=7&p=9".to_owned()));
 		assert_eq!(refs.len(), 4);
 		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, true).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
 	}

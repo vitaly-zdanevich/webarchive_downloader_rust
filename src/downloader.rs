@@ -862,8 +862,7 @@ fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: 
 	let file = root.join(&job.local_path);
 	let mut references = fallback.recovery.references(&job.local_path);
 	for reference in extract_document_references(&String::from_utf8_lossy(bytes), is_css_mimetype(&job.record.mimetype))? {
-		let decoded = html_escape::decode_html_entities(&reference);
-		let value = decoded.trim();
+		let value = reference.trim();
 		if let Ok(url) = Url::parse(value) {
 			references.push(url.to_string());
 			continue;

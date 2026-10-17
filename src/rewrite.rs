@@ -9,6 +9,7 @@ use lol_html::{HtmlRewriter, Settings, element, end_tag, text};
 use url::Url;
 
 use crate::download_refs::{is_downloadable_file_url, is_extra_file_url};
+use crate::html_attrs::{decoded_attribute, set_decoded_attribute};
 use crate::noise::is_archive_noise_reference;
 use crate::pathmap::{
     SiteMapper, canonical_query_without_volatile_params, normalize_lookup_url, relative_link,
@@ -389,12 +390,12 @@ fn rewrite_attr_url(
     context: &RewriteContext<'_>,
     kind: ReferenceKind,
 ) {
-    let Some(value) = element.get_attribute(attr) else {
+    let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
     match context.rewrite_url_reference_as(&value, kind) {
         Some(UrlRewrite::Rewrite(rewritten)) => {
-            element.set_attribute(attr, &rewritten).ok();
+            set_decoded_attribute(element, attr, &rewritten).ok();
         }
         None => {}
     }
@@ -410,7 +411,7 @@ fn rewrite_attr_url_if_reference_like(
     context: &RewriteContext<'_>,
     kind: ReferenceKind,
 ) {
-    let Some(value) = element.get_attribute(attr) else {
+    let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
     if !looks_like_url_reference_or_file(&value) {
@@ -418,14 +419,14 @@ fn rewrite_attr_url_if_reference_like(
     }
     match context.rewrite_url_reference_as(&value, kind) {
         Some(UrlRewrite::Rewrite(rewritten)) => {
-            element.set_attribute(attr, &rewritten).ok();
+            set_decoded_attribute(element, attr, &rewritten).ok();
         }
         None => {}
     }
 }
 
 fn rewrite_attr_srcset(element: &mut Element<'_, '_>, attr: &str, context: &RewriteContext<'_>) {
-    let Some(value) = element.get_attribute(attr) else {
+    let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
     let Some(rewritten) = rewrite_srcset(&value, context) else {
@@ -434,7 +435,7 @@ fn rewrite_attr_srcset(element: &mut Element<'_, '_>, attr: &str, context: &Rewr
     if rewritten.is_empty() {
         element.remove_attribute(attr);
     } else {
-        element.set_attribute(attr, &rewritten).ok();
+        set_decoded_attribute(element, attr, &rewritten).ok();
     }
 }
 
@@ -468,7 +469,7 @@ fn rewrite_attr_comma_separated_urls(
     context: &RewriteContext<'_>,
     kind: ReferenceKind,
 ) {
-    let Some(value) = element.get_attribute(attr) else {
+    let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
     let mut changed = false;
@@ -490,9 +491,7 @@ fn rewrite_attr_comma_separated_urls(
         if rewritten_values.is_empty() {
             element.remove_attribute(attr);
         } else {
-            element
-                .set_attribute(attr, &rewritten_values.join(", "))
-                .ok();
+            set_decoded_attribute(element, attr, &rewritten_values.join(", ")).ok();
         }
     }
 }
@@ -505,13 +504,13 @@ fn rewrite_meta_refresh(element: &mut Element<'_, '_>, context: &RewriteContext<
     if !http_equiv.trim().eq_ignore_ascii_case("refresh") {
         return;
     }
-    let Some(content) = element.get_attribute("content") else {
+    let Some(content) = decoded_attribute(element, "content") else {
         return;
     };
     let Some(rewritten) = rewrite_meta_refresh_content(&content, context) else {
         return;
     };
-    element.set_attribute("content", &rewritten).ok();
+    set_decoded_attribute(element, "content", &rewritten).ok();
 }
 
 fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Option<String> {
@@ -560,12 +559,12 @@ fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Op
 }
 
 fn rewrite_attr_css(element: &mut Element<'_, '_>, attr: &str, context: &RewriteContext<'_>) {
-    let Some(value) = element.get_attribute(attr) else {
+    let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
-    let rewritten = rewrite_css(&html_escape::decode_html_entities(&value), context);
+    let rewritten = rewrite_css(&value, context);
     if rewritten != value {
-        element.set_attribute(attr, &rewritten).ok();
+        set_decoded_attribute(element, attr, &rewritten).ok();
     }
 }
 
@@ -609,7 +608,7 @@ fn infer_missing_img_src_from_rollover_stack(
                 .iter()
                 .find(|source| source.name.eq_ignore_ascii_case(identifier))
             {
-                element.set_attribute("src", &source.src).ok();
+                set_decoded_attribute(element, "src", &source.src).ok();
                 return;
             }
         }

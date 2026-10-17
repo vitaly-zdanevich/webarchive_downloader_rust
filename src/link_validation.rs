@@ -8,11 +8,13 @@ use anyhow::{Context, Result, anyhow};
 use lol_html::{HtmlRewriter, Settings, element, text};
 use url::Url;
 
+use crate::html_attrs::decoded_attribute;
+
 macro_rules! collect_attr {
     ($selector:literal, $attr:literal, $references:ident) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
-            if let Some(value) = element.get_attribute($attr) {
+            if let Some(value) = decoded_attribute(element, $attr) {
                 references.borrow_mut().push(value);
             }
             Ok(())
@@ -24,7 +26,7 @@ macro_rules! collect_srcset_attr {
     ($selector:literal, $attr:literal, $references:ident) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
-            if let Some(value) = element.get_attribute($attr) {
+            if let Some(value) = decoded_attribute(element, $attr) {
                 references
                     .borrow_mut()
                     .extend(parse_srcset_references(&value));
@@ -38,10 +40,10 @@ macro_rules! collect_javascript_attr {
     ($selector:literal, $attr:literal, $references:ident) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
-            if let Some(value) = element.get_attribute($attr) {
+            if let Some(value) = decoded_attribute(element, $attr) {
                 references
                     .borrow_mut()
-                    .extend(extract_javascript_string_references(&html_escape::decode_html_entities(&value)));
+                    .extend(extract_javascript_string_references(&value));
             }
             Ok(())
         })
@@ -52,7 +54,7 @@ macro_rules! collect_guarded_attr {
     ($selector:literal, $attr:literal, $references:ident) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
-            if let Some(value) = element.get_attribute($attr)
+            if let Some(value) = decoded_attribute(element, $attr)
                 && looks_like_url_reference_or_file(&value)
             {
                 references.borrow_mut().push(value);
@@ -212,7 +214,7 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                 element!("applet[archive]", {
                     let references = Rc::clone(&references);
                     move |element| {
-                        if let Some(value) = element.get_attribute("archive") {
+                        if let Some(value) = decoded_attribute(element, "archive") {
                             references.borrow_mut().extend(
                                 value
                                     .split(',')
@@ -230,7 +232,7 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                         if element
                             .get_attribute("http-equiv")
                             .is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
-                            && let Some(value) = element.get_attribute("content")
+                            && let Some(value) = decoded_attribute(element, "content")
                             && let Some(reference) = extract_meta_refresh_reference(&value)
                         {
                             references.borrow_mut().push(reference);
@@ -262,10 +264,10 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                     Ok(())
                 }),
                 element!("*[style]", move |element| {
-                    if let Some(value) = element.get_attribute("style") {
+                    if let Some(value) = decoded_attribute(element, "style") {
                         style_attr_references
                             .borrow_mut()
-                            .extend(extract_css_url_references(&html_escape::decode_html_entities(&value)));
+                            .extend(extract_css_url_references(&value));
                     }
                     Ok(())
                 }),

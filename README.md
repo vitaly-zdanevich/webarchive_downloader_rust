@@ -319,6 +319,11 @@ saving replacement characters. `--no-rewrite` keeps the selected response bytes
 unchanged, including their original encoding. Inline scripts and styles retain
 raw operators, markup strings, and comment delimiters while URLs are rewritten.
 
+HTML attribute character references (`&amp;`, `&#38;`, and `&#x26;`, for example)
+are decoded once before discovering or rewriting URLs. Rewritten attribute values
+are escaped for HTML again. CSS and JavaScript raw text keep literal entity-like
+text; generated HTML strings are decoded only when their HTML is parsed.
+
 JavaScript string handling uses the [Oxc parser](https://docs.rs/oxc_parser/).
 It decodes escapes before rewriting URLs or embedded HTML, then escapes edited
 values for their original quotes. Discovery and validation use the same decoded

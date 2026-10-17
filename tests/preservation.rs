@@ -629,7 +629,7 @@ async fn discovers_linked_pages_and_nested_assets_on_new_and_resumed_runs() {
 	Mock::given(path("/cdx/search/cdx"))
 		.and(query_param(
 			"url",
-			"http://example.com/forums/viewtopic.php?t=7&amp;p=9",
+			"http://example.com/forums/viewtopic.php?t=7&p=9",
 		))
 		.respond_with(ResponseTemplate::new(200).set_body_string(
 			"20260911000000 http://example.com/forums/viewtopic.php?p=9&t=7 text/html 200 CONTENT 100\n",
@@ -680,6 +680,8 @@ async fn discovers_linked_pages_and_nested_assets_on_new_and_resumed_runs() {
 		}
 	}
 	for request in server.received_requests().await.unwrap() {
+		assert!(request.url.query_pairs().filter(|(key, _)| key == "url")
+			.all(|(_, target)| !target.contains("&amp;")), "HTML entity leaked into a CDX lookup: {}", request.url);
 		assert!(
 			!request
 				.url
