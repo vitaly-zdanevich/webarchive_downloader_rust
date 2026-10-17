@@ -1,11 +1,12 @@
 //! Parses static JavaScript strings without confusing comments, regexes or template text with code.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use lol_html::html_content::Element;
 use oxc_allocator::Allocator;
-use oxc_ast::ast::StringLiteral;
-use oxc_ast_visit::Visit;
+use oxc_ast::ast::{BinaryExpression, Expression, StringLiteral};
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 
@@ -14,6 +15,8 @@ pub(crate) struct StaticString {
 	pub range: Range<usize>,
 	pub quote: char,
 	pub value: String,
+	/// A concatenation operand is a URL fragment, not a standalone resource reference.
+	pub is_concatenated: bool,
 }
 
 /// Collects literals in source order; unsupported or invalid code is left untouched.
@@ -34,6 +37,7 @@ pub(crate) fn strings(input: &str) -> Vec<StaticString> {
 	let mut collector = StringCollector {
 		input,
 		strings: Vec::new(),
+		concatenated: HashSet::new(),
 	};
 	collector.visit_program(&parsed.program);
 	collector.strings.sort_by_key(|string| string.range.start);
@@ -44,9 +48,33 @@ pub(crate) fn strings(input: &str) -> Vec<StaticString> {
 struct StringCollector<'s> {
 	input: &'s str,
 	strings: Vec<StaticString>,
+	concatenated: HashSet<u32>,
+}
+
+impl StringCollector<'_> {
+	/// Marks direct string operands without suppressing complete URLs in nested function calls.
+	fn mark_concatenated_operand(&mut self, expression: &Expression<'_>) {
+		match expression {
+			Expression::StringLiteral(literal) => {
+				self.concatenated.insert(literal.span.start);
+			}
+			Expression::ParenthesizedExpression(parenthesized) => {
+				self.mark_concatenated_operand(&parenthesized.expression);
+			}
+			_ => {}
+		}
+	}
 }
 
 impl<'a> Visit<'a> for StringCollector<'_> {
+	fn visit_binary_expression(&mut self, expression: &BinaryExpression<'a>) {
+		if expression.operator.as_str() == "+" {
+			self.mark_concatenated_operand(&expression.left);
+			self.mark_concatenated_operand(&expression.right);
+		}
+		walk::walk_binary_expression(self, expression);
+	}
+
 	fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
 		let range = literal.span.start as usize..literal.span.end as usize;
 		let Some(raw) = self.input.get(range.clone()) else {
@@ -60,6 +88,7 @@ impl<'a> Visit<'a> for StringCollector<'_> {
 				range,
 				quote,
 				value: literal.value.to_string(),
+				is_concatenated: self.concatenated.contains(&literal.span.start),
 			});
 		}
 	}

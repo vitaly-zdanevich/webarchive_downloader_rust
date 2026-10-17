@@ -700,7 +700,7 @@ fn rewrite_javascript_string_urls(input: &str, context: &RewriteContext<'_>) -> 
 	let mut cursor = 0;
 	for literal in crate::javascript::strings(input) {
 		let value = literal.value.as_str();
-		let replacement = if looks_like_javascript_url_reference(value) {
+		let replacement = if !literal.is_concatenated && looks_like_javascript_url_reference(value) {
 			context
 				.rewrite_url_reference(value)
 				.map(url_rewrite_to_javascript_string)

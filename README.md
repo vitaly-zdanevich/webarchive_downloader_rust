@@ -326,6 +326,11 @@ strings, including event handlers, so generated static dependencies can be
 downloaded too. Comments, regular expressions, template text, non-JavaScript
 data blocks, invalid scripts, and strings with lone UTF-16 surrogates are not
 rewritten. This is static analysis, not JavaScript execution.
+String operands of `+` concatenations are not treated as complete URLs: rewriting
+a directory prefix or markup suffix in isolation would change the generated URL.
+Complete HTML fragments and independent URL arguments inside those expressions
+are still processed. Runtime-generated URLs are otherwise left unchanged, so
+static analysis cannot guarantee that every dynamically selected resource is found.
 Building from source requires Rust 1.97 or newer for the parser dependency.
 
 Fallback downloads track the exact indexed original URL and timestamp separately

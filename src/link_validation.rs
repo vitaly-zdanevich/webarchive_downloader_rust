@@ -363,7 +363,7 @@ fn parse_srcset_references(input: &str) -> Vec<String> {
 fn extract_javascript_string_references(input: &str) -> Vec<String> {
 	let mut references = Vec::new();
 	for literal in crate::javascript::strings(input) {
-		if looks_like_url_reference_or_file(&literal.value) {
+		if !literal.is_concatenated && looks_like_url_reference_or_file(&literal.value) {
 			references.push(literal.value);
 		} else if literal.value.contains('<') && literal.value.contains('>')
 			&& let Ok(fragment) = extract_html_references(&literal.value)

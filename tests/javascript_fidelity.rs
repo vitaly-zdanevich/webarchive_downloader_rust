@@ -124,6 +124,40 @@ image.src = '\x69mg/logo.gif';</script>"#,
 	assert_eq!(references, vec!["img/logo.gif", "img/spacer.gif"]);
 }
 
+/// A suffix of dynamically generated markup is not a complete URL to localize.
+#[test]
+fn generated_html_suffix_is_not_rewritten_as_a_url() {
+	let input = r#"<script>document.write('<a href="' + productPath + '/index.html">' + title + '</a>');</script>"#;
+	assert_eq!(rewrite(input), input);
+	let root = tempfile::tempdir().unwrap();
+	std::fs::write(root.path().join("page.html"), input).unwrap();
+	let report = validate_local_links(root.path()).unwrap();
+	assert!(report.missing.is_empty(), "{:?}", report.missing);
+}
+
+/// Literal path fragments must not acquire directory indexes or relative prefixes individually.
+#[test]
+fn dynamic_url_concatenations_are_not_treated_as_complete_urls() {
+	let input = r#"<script>image.src = ('/img/') + name + ('/thumbnail.gif');</script>"#;
+	assert_eq!(rewrite(input), input);
+	let root = tempfile::tempdir().unwrap();
+	std::fs::write(root.path().join("page.html"), input).unwrap();
+	assert!(validate_local_links(root.path()).unwrap().missing.is_empty());
+}
+
+/// Complete URLs in nested calls and complete markup fragments still need localization.
+#[test]
+fn concatenation_does_not_hide_independent_resources() {
+	let input = r#"<script>document.write('<img src="/img/logo.gif">' + title); result = title + load('/img/cover.gif');</script>"#;
+	assert_eq!(rewrite(input), input.replace("/img/", "../img/"));
+	let root = tempfile::tempdir().unwrap();
+	std::fs::write(root.path().join("page.html"), input).unwrap();
+	let report = validate_local_links(root.path()).unwrap();
+	let mut refs = report.missing.into_iter().map(|link| link.href).collect::<Vec<_>>();
+	refs.sort();
+	assert_eq!(refs, vec!["/img/cover.gif", "/img/logo.gif"]);
+}
+
 /// A fresh CLI download must fetch dependencies embedded in escaped HTML and URL strings.
 #[tokio::test]
 async fn fresh_download_fetches_decoded_script_dependencies() {
