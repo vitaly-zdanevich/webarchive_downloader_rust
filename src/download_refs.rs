@@ -26,6 +26,7 @@ pub(crate) fn extract_related_references(
 		if matches!(url.scheme(), "http" | "https")
 			&& url.host_str().is_some_and(|host| mapper.is_related_host(host))
 			&& !is_archive_noise_reference(url.as_str())
+			&& !is_interactive_forum_extra_reference(&url)
 		{
 			references.push(url.to_string());
 		}
@@ -33,6 +34,67 @@ pub(crate) fn extract_related_references(
 	references.sort();
 	references.dedup();
 	Ok(references)
+}
+
+/// Identifies interactive forum compose, quote, private-message, login, and moderation
+/// endpoints that require an authenticated session and should not trigger per-URL
+/// extra CDX lookups when absent from initial discovery.
+pub(crate) fn is_interactive_forum_extra_reference(url: &Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    if [
+        "/posting.php",
+        "/privmsg.php",
+        "/mcp.php",
+        "/modcp.php",
+        "/report.php",
+    ]
+    .into_iter()
+    .any(|suffix| path.ends_with(suffix))
+    {
+        return true;
+    }
+
+    if path.ends_with("/login.php") && url.query().is_some() {
+        return true;
+    }
+
+    if path.ends_with("/ucp.php") {
+        return url.query_pairs().any(|(key, value)| {
+            let key = key.trim_start_matches("amp;");
+            (key.eq_ignore_ascii_case("mode")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "login"
+                        | "logout"
+                        | "register"
+                        | "sendpassword"
+                        | "activate"
+                        | "resend_act"
+                        | "delete_cookies"
+                        | "terms"
+                        | "privacy"
+                ))
+                || (key.eq_ignore_ascii_case("i") && value.eq_ignore_ascii_case("pm"))
+        });
+    }
+
+    if path.ends_with("/profile.php") || path.ends_with("/memberlist.php") {
+        return url.query_pairs().any(|(key, value)| {
+            let key = key.trim_start_matches("amp;");
+            key.eq_ignore_ascii_case("mode")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "email"
+                        | "register"
+                        | "sendpassword"
+                        | "activate"
+                        | "editprofile"
+                        | "contactadmin"
+                )
+        });
+    }
+
+    false
 }
 
 pub fn is_downloadable_file_url(url: &Url) -> bool {
@@ -198,6 +260,37 @@ mod tests {
 		assert_eq!(
 			references,
 			vec!["http://downloads.example.com/files/preview/shot.jpg".to_owned()]
+		);
+	}
+
+	/// Per-post quote, reply, private-message compose, email, and login redirect actions
+	/// must not be queued for per-URL extra CDX lookups, while public profiles and topics are kept.
+	#[test]
+	fn skips_interactive_forum_compose_and_login_extra_references() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://www.example.com/forums/viewtopic.php?t=1").unwrap();
+		let references = extract_related_references(
+			r#"<a href="posting.php?mode=quote&amp;p=100">Quote</a>
+			   <a href="posting.php?mode=reply&amp;t=1">Reply</a>
+			   <a href="privmsg.php?mode=post&amp;u=2">PM</a>
+			   <a href="ucp.php?i=pm&amp;mode=compose&amp;action=quotepost&amp;p=100">PM Quote</a>
+			   <a href="ucp.php?mode=login&amp;redirect=viewtopic.php">Login</a>
+			   <a href="login.php?redirect=posting.php&amp;mode=quote&amp;p=100">Login2</a>
+			   <a href="profile.php?mode=email&amp;u=2">Email</a>
+			   <a href="memberlist.php?mode=viewprofile&amp;u=2">Profile</a>
+			   <a href="viewtopic.php?t=2">Next Topic</a>"#,
+			&base,
+			&mapper,
+			false,
+		)
+		.unwrap();
+
+		assert_eq!(
+			references,
+			vec![
+				"http://www.example.com/forums/memberlist.php?mode=viewprofile&u=2".to_owned(),
+				"http://www.example.com/forums/viewtopic.php?t=2".to_owned(),
+			]
 		);
 	}
 }

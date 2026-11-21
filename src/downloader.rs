@@ -24,12 +24,13 @@ use crate::cdx::{
     SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
     is_cdx_connectivity_error, sort_records_for_strategy,
 };
-use crate::download_refs::extract_related_references;
+use crate::download_refs::{extract_related_references, is_interactive_forum_extra_reference};
 use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
 use crate::recovery::{CaptureEvent, RecoveryState};
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
+    strip_volatile_query_params,
 };
 use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::rewrite::{RewriteContext, rewrite_css, rewrite_html};
@@ -977,7 +978,8 @@ fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: 
 	}
 	references.retain(|reference| Url::parse(reference).is_ok_and(|url|
 		matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|host| mapper.is_related_host(host))
-		&& !crate::noise::is_archive_noise_reference(reference)));
+		&& !crate::noise::is_archive_noise_reference(reference)
+		&& !is_interactive_forum_extra_reference(&url)));
 	references.sort();
 	references.dedup();
 	Ok(references)
@@ -2190,7 +2192,7 @@ async fn find_extra_download_record(
 ) -> Result<ExtraDownloadLookup> {
     let mut lookup = ExtraDownloadLookup::default();
 
-    for target in fallback_capture_targets(reference) {
+    for target in extra_download_capture_targets(reference) {
         let mut query = CdxQuery::new(
             target.clone(),
             MatchType::Exact,
@@ -2219,6 +2221,16 @@ async fn find_extra_download_record(
     }
 
     Ok(lookup)
+}
+
+fn extra_download_capture_targets(reference: &str) -> Vec<String> {
+    let stripped = strip_volatile_query_params(reference);
+    let normalized = normalize_lookup_url(reference);
+    if stripped == normalized {
+        vec![stripped]
+    } else {
+        vec![stripped, normalized]
+    }
 }
 
 fn should_buffer_response(record: &CdxRecord, local_path: &Path, rewrite_links: bool) -> bool {
@@ -4228,6 +4240,28 @@ mod tests {
             std::fs::read(root.join("_hosts/corporate.example.com/shared/bt_home_off.gif"))
                 .unwrap(),
             b"home"
+        );
+    }
+
+    /// Extra download CDX lookups must strip the referring page's volatile session ID
+    /// (`sid=...`) before querying Wayback so session-suffixed links do not issue two
+    /// redundant 5-second-spaced CDX queries, while preserving non-sorted multi-key order.
+    #[test]
+    fn extra_download_capture_targets_strip_volatile_session_params_without_duplicate_lookup() {
+        assert_eq!(
+            extra_download_capture_targets(
+                "http://www.smallrockets.com/forums/viewtopic.php?p=22745&sid=901279ef577c8c5e3a42029699bbda020"
+            ),
+            vec!["http://www.smallrockets.com/forums/viewtopic.php?p=22745".to_owned()]
+        );
+        assert_eq!(
+            extra_download_capture_targets(
+                "http://example.com/forums/viewtopic.php?t=7&p=9&sid=abcdef"
+            ),
+            vec![
+                "http://example.com/forums/viewtopic.php?t=7&p=9".to_owned(),
+                "http://example.com/forums/viewtopic.php?p=9&t=7".to_owned(),
+            ]
         );
     }
 }

@@ -238,6 +238,48 @@ pub fn normalize_lookup_url(input: &str) -> String {
     url.to_string()
 }
 
+/// Strips volatile session/tracking query parameters and fragments while keeping
+/// the original relative order of meaningful query parameters for exact CDX lookups.
+pub fn strip_volatile_query_params(input: &str) -> String {
+    let Ok(mut url) = Url::parse(input) else {
+        return input.to_owned();
+    };
+    url.set_fragment(None);
+    if let Some(host) = url.host_str() {
+        let host = normalize_host(host);
+        let _ = url.set_host(Some(&host));
+    }
+    let Some(query) = url.query() else {
+        return url.to_string();
+    };
+    if query.is_empty() {
+        url.set_query(None);
+        return url.to_string();
+    }
+    let pairs = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            let key = normalized_query_key(&key).to_owned();
+            if is_volatile_query_key(&key) {
+                None
+            } else {
+                Some((key, value.into_owned()))
+            }
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in pairs {
+            serializer.append_pair(&key, &value);
+        }
+        let cleaned = serializer.finish();
+        url.set_query(Some(&cleaned));
+    }
+    url.to_string()
+}
+
 /// Removes identity/replay wrappers without losing the original URL's query.
 pub(crate) fn unwrap_wayback_url(value: &str) -> String {
 	let wrapped = if value.starts_with("/web/") {
