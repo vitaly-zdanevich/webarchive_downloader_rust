@@ -3,9 +3,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use url::Url;
+
+use crate::pathmap::{canonical_query_without_volatile_params, unwrap_wayback_url};
+use crate::recovery::CaptureEvent;
 
 /// Topic identities are local to one forum directory, including its host prefix.
-type ScopedTopicIndex = HashMap<PathBuf, HashMap<String, Vec<PathBuf>>>;
+#[derive(Clone, Debug, Default)]
+struct ForumTopicScope {
+    title_index: HashMap<String, Vec<PathBuf>>,
+    post_index: HashMap<String, Vec<PathBuf>>,
+    topic_id_index: HashMap<String, Vec<PathBuf>>,
+    hash_index: HashMap<String, Vec<PathBuf>>,
+    file_topic_ids: HashMap<PathBuf, String>,
+    file_anchors: HashMap<PathBuf, HashSet<String>>,
+    file_reply_links: HashMap<PathBuf, HashSet<String>>,
+    file_topic_links: HashMap<PathBuf, HashSet<String>>,
+    file_start_offsets: HashMap<PathBuf, u64>,
+    forum_ids: HashSet<String>,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AliasRepairReport {
@@ -48,10 +64,9 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 	let root = fs::canonicalize(root).context("failed to open topic alias directory")?;
 	let root = root.as_path();
     let html_files = collect_html_files(root)?;
-    let title_index = build_topic_title_index(root, &html_files)?;
-    let post_index = build_post_anchor_index(root, &html_files)?;
+    let scopes = build_forum_topic_scopes(root, &html_files)?;
     let mut report = AliasRepairReport::default();
-	let empty_index = HashMap::new();
+	let empty_scope = ForumTopicScope::default();
 	let empty_anchors = HashSet::new();
 
     for file in &html_files {
@@ -68,17 +83,18 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
                 continue;
             }
 			let relative_target = target.strip_prefix(root)?;
-			let scope = relative_target.parent().unwrap_or(Path::new(""));
+			let scope_path = relative_target.parent().unwrap_or(Path::new(""));
 			let same_forum = file.parent() == target.parent();
+            let scope = scopes.get(scope_path).unwrap_or(&empty_scope);
             let source = match alias_source_for_link(
                 root,
                 file,
                 &input,
+                relative_target,
 				if same_forum { &current_anchors } else { &empty_anchors },
 				if same_forum { current_topic_title.as_deref() } else { None },
                 &link,
-				title_index.get(scope).unwrap_or(&empty_index),
-				post_index.get(scope).unwrap_or(&empty_index),
+				scope,
             ) {
                 AliasSource::Resolved(source) => source,
                 AliasSource::Unresolved => {
@@ -91,7 +107,7 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
                 }
             };
 
-			anyhow::ensure!(source.parent() == Some(scope), "topic alias source must share its destination directory");
+			anyhow::ensure!(source.parent() == Some(scope_path), "topic alias source must share its destination directory");
             let source = root.join(source);
 			let bytes = fs::read(&source)
 				.with_context(|| format!("failed to read topic source {}", source.display()))?;
@@ -130,49 +146,60 @@ fn collect_html_files_into(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn build_topic_title_index(
-    root: &Path,
-    html_files: &[PathBuf],
-) -> Result<ScopedTopicIndex> {
-	let mut index = ScopedTopicIndex::new();
-    for file in html_files {
-        if !file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("viewtopic.php"))
-        {
-            continue;
-        }
-
-        let input = read_lossy(file)?;
-        let Some(title) = extract_topic_title(&input) else {
-            continue;
-        };
-        let title = normalize_text(&title);
-        if title.is_empty() {
-            continue;
-        }
-
-        let relative = file
-            .strip_prefix(root)
-            .unwrap_or(file.as_path())
-            .to_path_buf();
-		let scope = relative.parent().unwrap_or(Path::new("")).to_path_buf();
-		index.entry(scope).or_default().entry(title).or_default().push(relative);
-    }
-
-	for candidates in index.values_mut().flat_map(|topics| topics.values_mut()) {
-        candidates.sort();
-        candidates.dedup();
-    }
-    Ok(index)
+#[derive(Clone, Debug, Default)]
+struct JournalTopicMetadata {
+    originals_by_path: HashMap<PathBuf, String>,
+    queries_by_hash: HashMap<String, (Option<String>, Option<String>)>,
+    forum_ids: HashSet<String>,
 }
 
-fn build_post_anchor_index(
+fn load_journal_topic_metadata(root: &Path) -> JournalTopicMetadata {
+    let journal_path = root.join(".wayback-state/captures.jsonl");
+    let Ok(bytes) = fs::read(&journal_path) else {
+        return JournalTopicMetadata::default();
+    };
+    let mut metadata = JournalTopicMetadata::default();
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let Ok(event) = serde_json::from_slice::<CaptureEvent>(line) else {
+            continue;
+        };
+        if event.outcome == "downloaded" {
+            metadata
+                .originals_by_path
+                .insert(event.local_path.clone(), event.record.original.clone());
+        }
+        for url_str in std::iter::once(&event.record.original).chain(event.references.iter()) {
+            let Ok(url) = Url::parse(url_str) else {
+                continue;
+            };
+            let path = url.path().to_ascii_lowercase();
+            if let Some(forum_id) = extract_numeric_query_param(&url, &["f", "forum"]) {
+                metadata.forum_ids.insert(forum_id);
+            }
+            if !path.ends_with("/viewtopic.php") {
+                continue;
+            }
+            let Some(canonical_query) = canonical_query_without_volatile_params(&url) else {
+                continue;
+            };
+            let hash = query_hash_hex(&canonical_query);
+            let topic_id = extract_numeric_query_param(&url, &["t", "topic"]);
+            let post_id = extract_numeric_query_param(&url, &["p", "post"]);
+            if topic_id.is_some() || post_id.is_some() {
+                metadata.queries_by_hash.insert(hash, (topic_id, post_id));
+            }
+        }
+    }
+    metadata
+}
+
+fn build_forum_topic_scopes(
     root: &Path,
     html_files: &[PathBuf],
-) -> Result<ScopedTopicIndex> {
-	let mut index = ScopedTopicIndex::new();
+) -> Result<HashMap<PathBuf, ForumTopicScope>> {
+    let journal = load_journal_topic_metadata(root);
+    let mut scopes: HashMap<PathBuf, ForumTopicScope> = HashMap::new();
+
     for file in html_files {
         if !file
             .file_name()
@@ -183,22 +210,291 @@ fn build_post_anchor_index(
         }
 
         let input = read_lossy(file)?;
+        if crate::soft_redirect::is_unusable_html_capture(&input) {
+            continue;
+        }
         let relative = file
             .strip_prefix(root)
             .unwrap_or(file.as_path())
             .to_path_buf();
+        let scope_path = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+        let scope = scopes.entry(scope_path).or_default();
+
+        if let Some(title) = extract_topic_title(&input) {
+            let title = normalize_text(&title);
+            if !title.is_empty() {
+                scope
+                    .title_index
+                    .entry(title)
+                    .or_default()
+                    .push(relative.clone());
+            }
+        }
+
         for anchor in extract_anchor_ids(&input) {
-			if anchor_variants(&anchor).is_empty() { continue; }
-			let scope = relative.parent().unwrap_or(Path::new("")).to_path_buf();
-			index.entry(scope).or_default().entry(anchor).or_default().push(relative.clone());
+            if anchor_variants(&anchor).is_empty() {
+                continue;
+            }
+            scope
+                .post_index
+                .entry(anchor.clone())
+                .or_default()
+                .push(relative.clone());
+            scope
+                .file_anchors
+                .entry(relative.clone())
+                .or_default()
+                .insert(anchor);
+        }
+
+        let mut topic_id = None;
+        if let Some(original) = journal.originals_by_path.get(&relative)
+            && let Ok(url) = Url::parse(original)
+        {
+            topic_id = extract_numeric_query_param(&url, &["t", "topic"]);
+            if let Some(forum_id) = extract_numeric_query_param(&url, &["f", "forum"]) {
+                scope.forum_ids.insert(forum_id);
+            }
+            if let Some(start) = extract_numeric_query_param(&url, &["start"])
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                scope.file_start_offsets.insert(relative.clone(), start);
+            } else if topic_id.is_some()
+                && extract_numeric_query_param(&url, &["p", "post"]).is_none()
+            {
+                scope.file_start_offsets.insert(relative.clone(), 0);
+            }
+        }
+
+        let (html_topic_id, html_forum_ids) = extract_self_topic_and_forum_ids(&input);
+        if topic_id.is_none() {
+            topic_id = html_topic_id;
+        }
+        scope.forum_ids.extend(html_forum_ids);
+
+        if let Some(topic_id) = topic_id {
+            scope
+                .file_topic_ids
+                .insert(relative.clone(), topic_id.clone());
+            scope
+                .topic_id_index
+                .entry(topic_id)
+                .or_default()
+                .push(relative.clone());
+        }
+
+        for link in extract_anchor_links(&input) {
+            let href_path = link
+                .href
+                .split_once('#')
+                .map_or(link.href.as_str(), |(path, _)| path)
+                .split_once('?')
+                .map_or_else(
+                    || {
+                        link.href
+                            .split_once('#')
+                            .map_or(link.href.as_str(), |(path, _)| path)
+                    },
+                    |(path, _)| path,
+                );
+            let Some(file_name) = Path::new(href_path).file_name().and_then(|name| name.to_str())
+            else {
+                continue;
+            };
+            if file_name.starts_with("posting.php__q_") {
+                scope
+                    .file_reply_links
+                    .entry(relative.clone())
+                    .or_default()
+                    .insert(file_name.to_owned());
+            } else if file_name.starts_with("viewtopic.php__q_") {
+                scope
+                    .file_topic_links
+                    .entry(relative.clone())
+                    .or_default()
+                    .insert(file_name.to_owned());
+            }
         }
     }
 
-	for candidates in index.values_mut().flat_map(|topics| topics.values_mut()) {
-        candidates.sort();
-        candidates.dedup();
+    for scope in scopes.values_mut() {
+        scope.forum_ids.extend(journal.forum_ids.iter().cloned());
+        for candidates in scope.title_index.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
+        for candidates in scope.post_index.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
+        for candidates in scope.topic_id_index.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
+
+        for (hash, (topic_id, post_id)) in &journal.queries_by_hash {
+            if let Some(post_id) = post_id
+                && let Some(files) = scope
+                    .post_index
+                    .get(&format!("p{post_id}"))
+                    .or_else(|| scope.post_index.get(post_id))
+            {
+                scope
+                    .hash_index
+                    .entry(hash.clone())
+                    .or_default()
+                    .extend(files.iter().cloned());
+            } else if let Some(topic_id) = topic_id
+                && let Some(files) = scope.topic_id_index.get(topic_id)
+            {
+                scope
+                    .hash_index
+                    .entry(hash.clone())
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+        }
+
+        let forum_ids: Vec<String> = scope.forum_ids.iter().cloned().collect();
+        for (anchor, files) in &scope.post_index {
+            let number = anchor.strip_prefix('p').unwrap_or(anchor);
+            if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            for query in [
+                format!("p={number}"),
+                format!("p={number}&start=0"),
+            ] {
+                scope
+                    .hash_index
+                    .entry(query_hash_hex(&query))
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+            for forum_id in &forum_ids {
+                let query = format!("f={forum_id}&p={number}");
+                scope
+                    .hash_index
+                    .entry(query_hash_hex(&query))
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+        }
+
+        for (topic_id, files) in &scope.topic_id_index {
+            for query in [
+                format!("t={topic_id}"),
+                format!("start=0&t={topic_id}"),
+                format!("t={topic_id}&view=print"),
+            ] {
+                scope
+                    .hash_index
+                    .entry(query_hash_hex(&query))
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+            for forum_id in &forum_ids {
+                for query in [
+                    format!("f={forum_id}&t={topic_id}"),
+                    format!("f={forum_id}&start=0&t={topic_id}"),
+                    format!("f={forum_id}&t={topic_id}&view=print"),
+                ] {
+                    scope
+                        .hash_index
+                        .entry(query_hash_hex(&query))
+                        .or_default()
+                        .extend(files.iter().cloned());
+                }
+            }
+        }
+
+        for candidates in scope.hash_index.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
     }
-    Ok(index)
+
+    Ok(scopes)
+}
+
+fn extract_numeric_query_param(url: &Url, names: &[&str]) -> Option<String> {
+    for (key, value) in url.query_pairs() {
+        let key = key.trim_start_matches("amp;");
+        if names.iter().any(|name| key.eq_ignore_ascii_case(name)) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn extract_self_topic_and_forum_ids(input: &str) -> (Option<String>, HashSet<String>) {
+    let mut topic_ids = HashSet::new();
+    let mut forum_ids = HashSet::new();
+    let Ok(base) = Url::parse("http://local.invalid/forums/") else {
+        return (None, forum_ids);
+    };
+
+    for link in extract_anchor_links(input) {
+        let decoded = decode_entities(&link.href);
+        let Ok(url) = base.join(&unwrap_wayback_url(decoded.trim())) else {
+            continue;
+        };
+        let path = url.path().to_ascii_lowercase();
+        if path.ends_with("/viewforum.php")
+            && let Some(f) = extract_numeric_query_param(&url, &["f", "forum"])
+        {
+            forum_ids.insert(f);
+        }
+        let is_self_topic_link = (path.ends_with("/posting.php")
+            && url.query_pairs().any(|(k, v)| {
+                k.trim_start_matches("amp;").eq_ignore_ascii_case("mode")
+                    && matches!(v.to_ascii_lowercase().as_str(), "reply" | "quote" | "bump")
+            }))
+            || (path.ends_with("/viewtopic.php")
+                && url.query_pairs().any(|(k, v)| {
+                    let k = k.trim_start_matches("amp;");
+                    (k.eq_ignore_ascii_case("watch") && v.eq_ignore_ascii_case("topic"))
+                        || (k.eq_ignore_ascii_case("unwatch") && v.eq_ignore_ascii_case("topic"))
+                        || (k.eq_ignore_ascii_case("view")
+                            && matches!(
+                                v.to_ascii_lowercase().as_str(),
+                                "next" | "previous" | "print" | "unread"
+                            ))
+                        || k.eq_ignore_ascii_case("bookmark")
+                }));
+        if is_self_topic_link {
+            if let Some(t) = extract_numeric_query_param(&url, &["t", "topic"]) {
+                topic_ids.insert(t);
+            }
+            if let Some(f) = extract_numeric_query_param(&url, &["f", "forum"]) {
+                forum_ids.insert(f);
+            }
+        }
+    }
+
+    let topic_id = (topic_ids.len() == 1)
+        .then(|| topic_ids.into_iter().next())
+        .flatten();
+    (topic_id, forum_ids)
+}
+
+fn query_hash_hex(canonical_query: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in canonical_query.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn extract_target_query_hash(relative_target: &Path) -> Option<&str> {
+    let file_name = relative_target.file_name()?.to_str()?;
+    let rest = file_name.strip_prefix("viewtopic.php__q_")?;
+    let hash = rest.strip_suffix(".html")?;
+    (!hash.is_empty()).then_some(hash)
 }
 
 fn extract_topic_title(input: &str) -> Option<String> {
@@ -244,11 +540,11 @@ fn alias_source_for_link(
     root: &Path,
     file: &Path,
     input: &str,
+    relative_target: &Path,
     current_anchors: &HashSet<String>,
     current_topic_title: Option<&str>,
     link: &AnchorLink,
-    title_index: &HashMap<String, Vec<PathBuf>>,
-    post_index: &HashMap<String, Vec<PathBuf>>,
+    scope: &ForumTopicScope,
 ) -> AliasSource {
     let current_relative = file.strip_prefix(root).unwrap_or(file).to_path_buf();
 
@@ -257,12 +553,20 @@ fn alias_source_for_link(
             if current_anchors.contains(&anchor) {
                 return AliasSource::Resolved(current_relative);
             }
-            if let Some(candidates) = post_index.get(&anchor)
-                && let Some(candidate) = candidates.first()
+            if let Some(candidates) = scope.post_index.get(&anchor)
+                && let Some(candidate) = resolve_same_topic_candidates(candidates, scope)
+                    .or_else(|| candidates.first().cloned())
             {
-                return AliasSource::Resolved(candidate.clone());
+                return AliasSource::Resolved(candidate);
             }
         }
+    }
+
+    if let Some(hash) = extract_target_query_hash(relative_target)
+        && let Some(candidates) = scope.hash_index.get(hash)
+        && let Some(resolved) = resolve_same_topic_candidates(candidates, scope)
+    {
+        return AliasSource::Resolved(resolved);
     }
 
     let text = normalize_text(&link.text);
@@ -273,23 +577,184 @@ fn alias_source_for_link(
         return AliasSource::Resolved(current_relative);
     }
 
-    let Some(candidates) = title_index.get(&text) else {
-        if let Some(source) =
-            container_alias_source(root, file, input, link, &text, title_index, post_index)
-        {
+    let Some(candidates) = scope.title_index.get(&text) else {
+        if let Some(source) = container_alias_source(
+            root,
+            file,
+            input,
+            link,
+            &text,
+            &scope.title_index,
+            &scope.post_index,
+        ) {
             return AliasSource::Resolved(source);
         }
         return AliasSource::Unresolved;
     };
     if candidates.len() == 1 {
         AliasSource::Resolved(candidates[0].clone())
-    } else if let Some(source) =
-        container_alias_source(root, file, input, link, &text, title_index, post_index)
-    {
+    } else if let Some(source) = container_alias_source(
+        root,
+        file,
+        input,
+        link,
+        &text,
+        &scope.title_index,
+        &scope.post_index,
+    ) {
+        AliasSource::Resolved(source)
+    } else if let Some(source) = resolve_same_topic_candidates(candidates, scope) {
         AliasSource::Resolved(source)
     } else {
         AliasSource::Ambiguous
     }
+}
+
+fn resolve_same_topic_candidates(
+    candidates: &[PathBuf],
+    scope: &ForumTopicScope,
+) -> Option<PathBuf> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+
+    let known_topic_ids: HashSet<&str> = candidates
+        .iter()
+        .filter_map(|candidate| scope.file_topic_ids.get(candidate).map(String::as_str))
+        .collect();
+    if known_topic_ids.len() > 1 {
+        return None;
+    }
+
+    let all_share_known_topic_id = known_topic_ids.len() == 1
+        && candidates
+            .iter()
+            .all(|candidate| scope.file_topic_ids.contains_key(candidate));
+
+    if !all_share_known_topic_id && !candidates_are_same_topic_connected(candidates, scope) {
+        return None;
+    }
+
+    candidates
+        .iter()
+        .min_by(|left, right| {
+            let left_start = scope
+                .file_start_offsets
+                .get(*left)
+                .copied()
+                .unwrap_or(u64::MAX);
+            let right_start = scope
+                .file_start_offsets
+                .get(*right)
+                .copied()
+                .unwrap_or(u64::MAX);
+            left_start
+                .cmp(&right_start)
+                .then_with(|| {
+                    min_post_number(*left, scope).cmp(&min_post_number(*right, scope))
+                })
+                .then_with(|| left.cmp(right))
+        })
+        .cloned()
+}
+
+fn candidates_are_same_topic_connected(
+    candidates: &[PathBuf],
+    scope: &ForumTopicScope,
+) -> bool {
+    let mut visited = vec![false; candidates.len()];
+    let mut queue = std::collections::VecDeque::new();
+    visited[0] = true;
+    queue.push_back(0usize);
+
+    while let Some(current) = queue.pop_front() {
+        for (other, seen) in visited.iter_mut().enumerate() {
+            if *seen {
+                continue;
+            }
+            if candidates_share_topic_evidence(&candidates[current], &candidates[other], scope) {
+                *seen = true;
+                queue.push_back(other);
+            }
+        }
+    }
+
+    visited.into_iter().all(|seen| seen)
+}
+
+fn candidates_share_topic_evidence(
+    left: &Path,
+    right: &Path,
+    scope: &ForumTopicScope,
+) -> bool {
+    if let (Some(left_id), Some(right_id)) = (
+        scope.file_topic_ids.get(left),
+        scope.file_topic_ids.get(right),
+    ) && left_id == right_id
+    {
+        return true;
+    }
+
+    if let (Some(left_anchors), Some(right_anchors)) = (
+        scope.file_anchors.get(left),
+        scope.file_anchors.get(right),
+    ) && left_anchors
+        .iter()
+        .any(|anchor| right_anchors.contains(anchor))
+    {
+        return true;
+    }
+
+    if let (Some(left_replies), Some(right_replies)) = (
+        scope.file_reply_links.get(left),
+        scope.file_reply_links.get(right),
+    ) && left_replies
+        .iter()
+        .any(|reply| right_replies.contains(reply))
+    {
+        return true;
+    }
+
+    let left_name = left.file_name().and_then(|name| name.to_str());
+    let right_name = right.file_name().and_then(|name| name.to_str());
+    if let Some(right_name) = right_name
+        && scope
+            .file_topic_links
+            .get(left)
+            .is_some_and(|links| links.contains(right_name))
+    {
+        return true;
+    }
+    if let Some(left_name) = left_name
+        && scope
+            .file_topic_links
+            .get(right)
+            .is_some_and(|links| links.contains(left_name))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn min_post_number(candidate: &Path, scope: &ForumTopicScope) -> u64 {
+    scope
+        .file_anchors
+        .get(candidate)
+        .into_iter()
+        .flatten()
+        .filter_map(|anchor| {
+            anchor
+                .strip_prefix('p')
+                .unwrap_or(anchor)
+                .parse::<u64>()
+                .ok()
+        })
+        .min()
+        .unwrap_or(u64::MAX)
 }
 
 fn container_alias_source(
@@ -794,5 +1259,72 @@ mod tests {
             fs::read_to_string(root.join("forums/viewtopic.php__q_missing.html")).unwrap(),
             fs::read_to_string(root.join("forums/viewtopic.php__q_latest.html")).unwrap()
         );
+    }
+
+    /// When one topic is downloaded under multiple query variants (e.g. `f=29&t=10150`
+    /// and `t=10150&start=0` or page 1 and page 2), title matching must recognize that
+    /// they belong to the same topic and pick the first page rather than failing as ambiguous.
+    #[test]
+    fn resolves_multi_capture_same_topic_candidates_to_first_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("forums")).unwrap();
+        fs::write(
+            root.join("forums/viewforum.html"),
+            r#"<a href="viewtopic.php__q_missing.html" class="topictitle">Idioma Castellano</a>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_page2.html"),
+            r#"<title>Small Rockets Forum &bull; View topic - Idioma Castellano</title><div id="p24350"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_page1.html"),
+            r#"<title>Small Rockets Forum &bull; View topic - Idioma Castellano</title><div id="p24306"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
+        )
+        .unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 1);
+        assert_eq!(report.ambiguous, 0);
+        assert_eq!(
+            fs::read_to_string(root.join("forums/viewtopic.php__q_missing.html")).unwrap(),
+            fs::read_to_string(root.join("forums/viewtopic.php__q_page1.html")).unwrap()
+        );
+    }
+
+    /// Links to `viewtopic.php?t=<id>` or `viewtopic.php?p=<id>` (rewritten to `__q_<hash>`)
+    /// must resolve directly via their topic/post query hash even when the anchor text is not
+    /// the topic title and no `#p...` fragment is present.
+    #[test]
+    fn resolves_missing_topic_alias_by_topic_or_post_query_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("forums")).unwrap();
+        let topic_hash = query_hash_hex("t=10150");
+        let post_hash = query_hash_hex("p=24306");
+        let missing_topic_file = format!("viewtopic.php__q_{topic_hash}.html");
+        let missing_post_file = format!("viewtopic.php__q_{post_hash}.html");
+
+        fs::write(
+            root.join("forums/source.html"),
+            format!(
+                r#"<a href="{missing_topic_file}">see this thread</a><a href="{missing_post_file}">latest post</a>"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_existing.html"),
+            r#"<title>Small Rockets Forum &bull; View topic - Idioma Castellano</title><div id="p24306"></div><a href="posting.php?mode=reply&amp;f=29&amp;t=10150">Reply</a>"#,
+        )
+        .unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 2);
+        assert!(root.join("forums").join(&missing_topic_file).exists());
+        assert!(root.join("forums").join(&missing_post_file).exists());
     }
 }
