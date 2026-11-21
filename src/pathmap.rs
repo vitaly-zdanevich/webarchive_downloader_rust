@@ -280,7 +280,7 @@ pub fn canonical_query_without_volatile_params(url: &Url) -> Option<String> {
         return None;
     }
 
-    pairs.sort();
+    pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in pairs {
@@ -311,7 +311,6 @@ pub fn is_volatile_query_key(key: &str) -> bool {
             | "sk"
             | "ticket"
             | "st"
-            | "view"
     )
 }
 
@@ -664,6 +663,52 @@ mod tests {
             normalize_lookup_url("http://example.com/forums/viewtopic.php?t=1&amp;sid=abc"),
             "http://example.com/forums/viewtopic.php?t=1"
         );
+    }
+
+    /// `view=next`, `view=previous`, and `view=print` select different topics or layouts
+    /// and must never overwrite the canonical `viewtopic.php?t=N` page.
+    #[test]
+    fn preserves_view_query_parameter_and_repeated_key_order() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let canonical = mapper
+            .local_path_for_url("http://example.com/forums/viewtopic.php?t=100", "text/html")
+            .unwrap();
+        let next = mapper
+            .local_path_for_url(
+                "http://example.com/forums/viewtopic.php?t=100&view=next",
+                "text/html",
+            )
+            .unwrap();
+        let prev = mapper
+            .local_path_for_url(
+                "http://example.com/forums/viewtopic.php?t=100&view=previous",
+                "text/html",
+            )
+            .unwrap();
+        let print = mapper
+            .local_path_for_url(
+                "http://example.com/forums/viewtopic.php?t=100&view=print",
+                "text/html",
+            )
+            .unwrap();
+        assert_ne!(canonical, next);
+        assert_ne!(canonical, prev);
+        assert_ne!(canonical, print);
+        assert_ne!(next, prev);
+
+        let first_a_then_b = mapper
+            .local_path_for_url(
+                "http://example.com/forums/memberlist.php?first_char=a&mode=&first_char=b",
+                "text/html",
+            )
+            .unwrap();
+        let first_b_then_a = mapper
+            .local_path_for_url(
+                "http://example.com/forums/memberlist.php?first_char=b&mode=&first_char=a",
+                "text/html",
+            )
+            .unwrap();
+        assert_ne!(first_a_then_b, first_b_then_a);
     }
 
 	/// Replay query strings identify different forum pages and must survive unwrapping.

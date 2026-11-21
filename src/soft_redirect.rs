@@ -41,6 +41,8 @@ fn forum_page_signals(input: &str) -> (bool, bool) {
 	let error = [
 		"the topic or post you requested does not exist",
 		"the requested topic does not exist",
+		"there are no newer topics in this forum",
+		"there are no older topics in this forum",
 		"sorry, but that user does not exist",
 		"the requested user does not exist",
 		"the forum you selected does not exist",
@@ -111,6 +113,8 @@ mod tests {
 	fn detects_structured_forum_errors_in_large_templates() {
 		for message in [
 			"The topic or post you requested does not exist",
+			"There are no newer topics in this forum",
+			"There are no older topics in this forum",
 			"Sorry, but that user does not exist.",
 			"The forum you selected does not exist.",
 		] {
