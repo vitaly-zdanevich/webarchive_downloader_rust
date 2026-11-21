@@ -1740,12 +1740,191 @@ async fn existing_static_asset_alias_source(
             matches.push(candidate);
         }
     }
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next());
+    }
 
-    Ok(if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
-        None
-    })
+    if let Some(smiley) = same_host_smiley_alias_candidate(target) {
+        let candidate = output_dir.join(smiley);
+        if has_non_empty_file(&candidate).await? {
+            return Ok(Some(candidate));
+        }
+    }
+
+    if let Some(template_source) = same_host_template_image_alias_source(output_dir, target).await? {
+        return Ok(Some(template_source));
+    }
+
+    cross_host_static_asset_alias_source(output_dir, target).await
+}
+
+fn same_host_smiley_alias_candidate(target: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = target
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    for index in 0..components.len().saturating_sub(2) {
+        if components[index].eq_ignore_ascii_case("images") {
+            let replacement = if components[index + 1].eq_ignore_ascii_case("smiles") {
+                Some("smilies")
+            } else if components[index + 1].eq_ignore_ascii_case("smilies") {
+                Some("smiles")
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
+                let mut candidate = PathBuf::new();
+                for (i, part) in components.iter().enumerate() {
+                    if i == index + 1 {
+                        candidate.push(replacement);
+                    } else {
+                        candidate.push(part);
+                    }
+                }
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+async fn same_host_template_image_alias_source(
+    output_dir: &Path,
+    target: &Path,
+) -> Result<Option<PathBuf>> {
+    let components: Vec<_> = target
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    for index in 0..components.len().saturating_sub(3) {
+        if components[index].eq_ignore_ascii_case("templates")
+            && components[index + 2].eq_ignore_ascii_case("images")
+        {
+            let mut templates_dir = output_dir.to_path_buf();
+            for part in &components[..=index] {
+                templates_dir.push(part);
+            }
+            let tail: PathBuf = components[index + 2..].iter().collect();
+
+            let preferred = templates_dir.join("subSilver").join(&tail);
+            if has_non_empty_file(&preferred).await? {
+                return Ok(Some(preferred));
+            }
+
+            let mut entries = match fs::read_dir(&templates_dir).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read directory {}", templates_dir.display())
+                    });
+                }
+            };
+            let mut candidates = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if !entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let candidate = entry.path().join(&tail);
+                if has_non_empty_file(&candidate).await? {
+                    candidates.push(candidate);
+                }
+            }
+            candidates.sort();
+            return unambiguous_file_source(&candidates).await;
+        }
+    }
+    Ok(None)
+}
+
+fn strip_host_prefix(target: &Path) -> &Path {
+    let mut components = target.components();
+    if matches!(
+        components.next(),
+        Some(Component::Normal(first)) if first == "_hosts"
+    ) && matches!(components.next(), Some(Component::Normal(_)))
+    {
+        let rest = components.as_path();
+        if !rest.as_os_str().is_empty() {
+            return rest;
+        }
+    }
+    target
+}
+
+async fn cross_host_static_asset_alias_source(
+    output_dir: &Path,
+    target: &Path,
+) -> Result<Option<PathBuf>> {
+    let relative_subpath = strip_host_prefix(target);
+    if relative_subpath.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    let mut subpaths = vec![relative_subpath.to_path_buf()];
+    if let Some(smiley) = same_host_smiley_alias_candidate(relative_subpath) {
+        subpaths.push(smiley);
+    }
+
+    let hosts_dir = output_dir.join("_hosts");
+    let mut host_roots = Vec::new();
+    if let Ok(mut entries) = fs::read_dir(&hosts_dir).await {
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                host_roots.push(entry.path());
+            }
+        }
+    }
+    host_roots.sort();
+
+    for subpath in subpaths {
+        let primary_candidate = output_dir.join(&subpath);
+        if primary_candidate != output_dir.join(target)
+            && has_non_empty_file(&primary_candidate).await?
+        {
+            return Ok(Some(primary_candidate));
+        }
+
+        let mut candidates = Vec::new();
+        for host_root in &host_roots {
+            let candidate = host_root.join(&subpath);
+            if candidate != output_dir.join(target) && has_non_empty_file(&candidate).await? {
+                candidates.push(candidate);
+            }
+        }
+        if let Some(resolved) = unambiguous_file_source(&candidates).await? {
+            return Ok(Some(resolved));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn unambiguous_file_source(candidates: &[PathBuf]) -> Result<Option<PathBuf>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() == 1 {
+        return Ok(Some(candidates[0].clone()));
+    }
+    let first_bytes = fs::read(&candidates[0])
+        .await
+        .with_context(|| format!("failed to read {}", candidates[0].display()))?;
+    for candidate in &candidates[1..] {
+        let bytes = fs::read(candidate)
+            .await
+            .with_context(|| format!("failed to read {}", candidate.display()))?;
+        if bytes != first_bytes {
+            return Ok(None);
+        }
+    }
+    Ok(Some(candidates[0].clone()))
 }
 
 fn static_asset_alias_candidates(target: &Path) -> Vec<PathBuf> {
@@ -3983,6 +4162,72 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&recovered_body.bytes)
                 .contains("Wakeboarding Unleashed Featuring Shaun Murray")
+        );
+    }
+
+    /// phpBB 2 `images/smiles/` references, custom phpBB `templates/<theme>/images/` icons,
+    /// and subdomain `_hosts/<host>/<subpath>` shared static assets must alias from existing
+    /// unambiguous local counterparts (`images/smilies/`, `templates/subSilver/images/`, and
+    /// primary/sibling host `<subpath>`).
+    #[tokio::test]
+    async fn creates_static_asset_aliases_for_phpbb_smilies_templates_and_shared_hosts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        std::fs::create_dir_all(root.join("forums/images/smilies")).unwrap();
+        std::fs::write(root.join("forums/images/smilies/icon_smile.gif"), b"smile").unwrap();
+
+        std::fs::create_dir_all(root.join("forums/templates/subSilver/images")).unwrap();
+        std::fs::write(
+            root.join("forums/templates/subSilver/images/icon_latest_reply.gif"),
+            b"reply",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("bimages")).unwrap();
+        std::fs::write(root.join("bimages/ic_logo.gif"), b"logo").unwrap();
+
+        std::fs::create_dir_all(root.join("_hosts/pc.example.com/shared")).unwrap();
+        std::fs::write(
+            root.join("_hosts/pc.example.com/shared/bt_home_off.gif"),
+            b"home",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("_hosts/corporate.example.com/forums")).unwrap();
+        std::fs::write(
+            root.join("forums/viewtopic.html"),
+            r#"<img src="images/smiles/icon_smile.gif"><img src="templates/SmallRockets/images/icon_latest_reply.gif">"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("_hosts/corporate.example.com/index.html"),
+            r#"<img src="bimages/ic_logo.gif"><img src="shared/bt_home_off.gif">"#,
+        )
+        .unwrap();
+
+        let created = create_missing_static_asset_aliases(root, &CancellationFlag::new())
+            .await
+            .unwrap();
+
+        assert_eq!(created, 4);
+        assert_eq!(
+            std::fs::read(root.join("forums/images/smiles/icon_smile.gif")).unwrap(),
+            b"smile"
+        );
+        assert_eq!(
+            std::fs::read(root.join("forums/templates/SmallRockets/images/icon_latest_reply.gif"))
+                .unwrap(),
+            b"reply"
+        );
+        assert_eq!(
+            std::fs::read(root.join("_hosts/corporate.example.com/bimages/ic_logo.gif")).unwrap(),
+            b"logo"
+        );
+        assert_eq!(
+            std::fs::read(root.join("_hosts/corporate.example.com/shared/bt_home_off.gif"))
+                .unwrap(),
+            b"home"
         );
     }
 }
