@@ -4,12 +4,53 @@ use crate::cdx::CdxRecord;
 use crate::pathmap::canonical_query_without_volatile_params;
 
 pub fn is_archive_noise_record(record: &CdxRecord) -> bool {
-    is_archive_noise_url_with_mimetype(&record.original, &record.mimetype)
+    is_archive_noise_record_url_with_mimetype(&record.original, &record.mimetype)
 }
 
 pub fn is_archive_noise_reference(original: &str) -> bool {
     let mimetype = static_mimetype_hint_from_url(original).unwrap_or("text/html");
     is_archive_noise_url_with_mimetype(original, mimetype)
+}
+
+fn is_archive_noise_record_url_with_mimetype(original: &str, mimetype: &str) -> bool {
+    let Ok(url) = Url::parse(original) else {
+        return false;
+    };
+    let path = url.path().to_ascii_lowercase();
+    if path.starts_with("/cgi-sys/")
+        || path.starts_with("/img-sys/")
+        || path.starts_with("/sys_cpanel/")
+    {
+        return true;
+    }
+
+    if is_hosting_placeholder_path(&path) {
+        return true;
+    }
+
+    if is_static_asset_mimetype(mimetype) {
+        return false;
+    }
+
+    if is_background_noise_script_path(&path) {
+        return true;
+    }
+
+    if is_query_required_forum_path(&path)
+        && canonical_query_without_volatile_params(&url).is_none()
+    {
+        return true;
+    }
+
+    if url.query().is_none() {
+        return false;
+    }
+
+    if has_interactive_action_query(&url) {
+        return true;
+    }
+
+    has_state_changing_query(&url)
 }
 
 pub fn is_archive_noise_url_with_mimetype(original: &str, mimetype: &str) -> bool {
@@ -120,6 +161,10 @@ fn is_query_required_forum_path(path: &str) -> bool {
     ["/viewforum.php", "/viewtopic.php"]
         .into_iter()
         .any(|suffix| path.ends_with(suffix))
+}
+
+fn is_background_noise_script_path(path: &str) -> bool {
+    path.ends_with("/cron.php")
 }
 
 fn has_interactive_action_query(url: &Url) -> bool {
@@ -279,5 +324,52 @@ mod tests {
         assert!(!is_archive_noise_url(
             "http://smallrockets.com/bimages/ic_logo.gif"
         ));
+    }
+
+    /// Valid pages captured in Wayback only with an empty `?` or volatile `?sid=...`
+    /// query must be preserved as CDX records (they map to the canonical local path
+    /// after stripping volatile parameters), while query-required forum endpoints
+    /// (`viewforum.php`, `viewtopic.php`) and `cron.php` remain noise without selectors.
+    #[test]
+    fn preserves_cdx_records_for_pages_captured_with_empty_or_session_only_queries() {
+        let html_record = |original: &str| CdxRecord {
+            timestamp: "20120722024921".to_owned(),
+            original: original.to_owned(),
+            mimetype: "text/html".to_owned(),
+            status_code: 200,
+            digest: "DIGEST".to_owned(),
+            length: Some(512),
+        };
+
+        for valid_url in [
+            "http://smallrockets.com:80/general/buyfree.htm?",
+            "http://www.smallrockets.com/forums/index.php?sid=323dd739f419e9cb0831aa765722b046",
+            "http://www.smallrockets.com/forums/faq.php?sid=323dd739f419e9cb0831aa765722b046",
+            "http://www.smallrockets.com/forums/memberlist.php?sid=323dd739f419e9cb0831aa765722b046",
+            "http://www.smallrockets.com/forums/viewonline.php?sid=323dd739f419e9cb0831aa765722b046",
+            "http://highscores.smallrockets.com:80/forums/index.php?sid=04c92890df0f160360cd840be03ee273",
+        ] {
+            assert!(
+                !is_archive_noise_record(&html_record(valid_url)),
+                "expected {valid_url} to be preserved as a valid CDX record"
+            );
+        }
+
+        for noise_url in [
+            "http://www.smallrockets.com:80/forums/viewforum.php",
+            "http://www.smallrockets.com:80/forums/viewforum.php?",
+            "http://www.smallrockets.com:80/forums/viewforum.php?sid=abcdef",
+            "http://www.smallrockets.com:80/forums/viewtopic.php",
+            "http://www.smallrockets.com:80/forums/viewtopic.php?",
+            "http://smallrockets.com/forums/viewtopic.php?sid=abcdef",
+            "http://smallrockets.com/forums/cron.php?cron_type=tidy_cache",
+            "http://smallrockets.com/forums/viewforum.php?f=10&mark=topics",
+            "http://smallrockets.com/basket.htm?action=add&skuid=ArtIsDeadPC1&ticket=0.123",
+        ] {
+            assert!(
+                is_archive_noise_record(&html_record(noise_url)),
+                "expected {noise_url} to be rejected as archive noise"
+            );
+        }
     }
 }
