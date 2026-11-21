@@ -635,7 +635,7 @@ fn retry_after_delay(headers: &HeaderMap, attempt: usize) -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn sort_records_for_strategy(records: &mut [CdxRecord], strategy: SnapshotStrategy) {
+pub(crate) fn sort_records_for_strategy(records: &mut [CdxRecord], strategy: SnapshotStrategy) {
     records.sort_by(|left, right| {
         let timestamp_order = match strategy {
             SnapshotStrategy::Latest => right.timestamp.cmp(&left.timestamp),

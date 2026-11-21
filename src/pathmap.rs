@@ -117,8 +117,10 @@ impl SiteMapper {
         let mut paths = HashMap::with_capacity(records.len());
         for record in records {
             let key = normalize_lookup_url(&record.original);
-            let local_path = self.local_path_for_url(&record.original, &record.mimetype)?;
-            paths.insert(key, local_path);
+            if !paths.contains_key(&key) {
+                let local_path = self.local_path_for_url(&record.original, &record.mimetype)?;
+                paths.insert(key, local_path);
+            }
         }
         Ok(paths)
     }

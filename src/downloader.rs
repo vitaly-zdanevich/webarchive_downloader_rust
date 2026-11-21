@@ -22,7 +22,7 @@ use crate::alias_repair::{create_missing_directory_aliases, create_missing_topic
 use crate::cdx::{
     CdxQuery, CdxRecord, CdxRetryPolicy, MAX_WAYBACK_RETRY_DELAY_SECONDS, MatchType,
     SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
-    is_cdx_connectivity_error,
+    is_cdx_connectivity_error, sort_records_for_strategy,
 };
 use crate::download_refs::extract_related_references;
 use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
@@ -147,6 +147,54 @@ struct FallbackOptions {
     strategy: SnapshotStrategy,
 	recovery: Arc<RecoveryState>,
 	originals_by_path: HashMap<PathBuf, CdxRecord>,
+	candidates_by_path: HashMap<PathBuf, Vec<CdxRecord>>,
+}
+
+impl FallbackOptions {
+    fn discovered_candidates_for(
+        &self,
+        local_path: Option<&Path>,
+        current_record: &CdxRecord,
+    ) -> Vec<CdxRecord> {
+        if let Some(path) = local_path
+            && let Some(candidates) = self.candidates_by_path.get(path)
+        {
+            return candidates.clone();
+        }
+        let normalized_current = normalize_lookup_url(&current_record.original);
+        for candidates in self.candidates_by_path.values() {
+            if candidates.iter().any(|candidate| {
+                candidate.original == current_record.original
+                    || normalize_lookup_url(&candidate.original) == normalized_current
+            }) {
+                return candidates.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    fn fallback_targets_for(
+        &self,
+        local_path: Option<&Path>,
+        current_record: &CdxRecord,
+    ) -> (Vec<String>, Vec<CdxRecord>) {
+        let discovered = self.discovered_candidates_for(local_path, current_record);
+        let mut targets = Vec::new();
+        let mut seen_targets = HashSet::new();
+        for target in fallback_capture_targets(&current_record.original) {
+            if seen_targets.insert(target.clone()) {
+                targets.push(target);
+            }
+        }
+        for candidate in &discovered {
+            for target in fallback_capture_targets(&candidate.original) {
+                if seen_targets.insert(target.clone()) {
+                    targets.push(target);
+                }
+            }
+        }
+        (targets, discovered)
+    }
 }
 
 /// Reuses exact CDX responses across fallback, linked, and static-asset passes.
@@ -174,13 +222,14 @@ pub async fn download_site(
     let mut records = fetch_latest_records(&client, &query).await?;
     let discovered = records.len();
     let skipped_archive_noise = filter_archive_noise(&mut records);
-    let mut known_paths = mapper.records_to_paths(&records)?;
+    let (mut known_paths, candidates_by_path, selected_records_by_path) =
+        index_records_by_local_path(&mapper, &records, query.strategy)?;
     let recovery_records_by_path = recoverable_static_records_by_path(
         &mapper,
         &records,
+        query.strategy,
         options.extra_download_max_bytes.unwrap_or(u64::MAX),
     )?;
-    let selected_records_by_path = records_by_local_path(&mapper, &records)?;
 
     fs::create_dir_all(&options.output_dir)
         .await
@@ -203,8 +252,12 @@ pub async fn download_site(
         };
 
         if seen_paths.insert(local_path.clone()) {
+            let selected = selected_records_by_path
+                .get(&local_path)
+                .cloned()
+                .unwrap_or(record);
             jobs.push(DownloadJob {
-                record,
+                record: selected,
                 local_path,
                 max_bytes: None,
             });
@@ -229,6 +282,7 @@ pub async fn download_site(
         strategy: query.strategy,
 		recovery: Arc::new(RecoveryState::open(&options.output_dir)?),
 		originals_by_path: selected_records_by_path.clone(),
+		candidates_by_path,
     };
     let archive_root = query.archive_root;
 
@@ -571,15 +625,17 @@ pub async fn repair_output_dir(
 
     if let Some(max_bytes) = options.extra_download_max_bytes {
         let records = fetch_recovery_records(&client, &mapper, &options).await?;
-        let selected_records_by_path = records_by_local_path(&mapper, &records)?;
+        let (_, candidates_by_path, selected_records_by_path) =
+            index_records_by_local_path(&mapper, &records, options.strategy)?;
         let recovery_records_by_path =
-            recoverable_static_records_by_path(&mapper, &records, max_bytes)?;
+            recoverable_static_records_by_path(&mapper, &records, options.strategy, max_bytes)?;
         let fallback_options = FallbackOptions {
             from: options.from.clone(),
             to: options.to.clone(),
             strategy: options.strategy,
 			recovery: Arc::new(RecoveryState::default()),
 			originals_by_path: selected_records_by_path.clone(),
+			candidates_by_path,
         };
         let recovery_report = recover_missing_static_assets(
             &client,
@@ -778,11 +834,14 @@ fn recovery_cdx_targets(mapper: &SiteMapper, match_type: MatchType) -> Vec<Strin
 fn recoverable_static_records_by_path(
     mapper: &SiteMapper,
     records: &[CdxRecord],
+    strategy: SnapshotStrategy,
     max_bytes: u64,
 ) -> Result<HashMap<PathBuf, CdxRecord>> {
+    let mut strategy_ordered = records.to_vec();
+    sort_records_for_strategy(&mut strategy_ordered, strategy);
     let mut records_by_path = HashMap::new();
 
-    for record in records {
+    for record in &strategy_ordered {
         if record.length.is_some_and(|length| length > max_bytes) {
             continue;
         }
@@ -800,20 +859,43 @@ fn recoverable_static_records_by_path(
     Ok(records_by_path)
 }
 
-fn records_by_local_path(
+fn index_records_by_local_path(
     mapper: &SiteMapper,
     records: &[CdxRecord],
-) -> Result<HashMap<PathBuf, CdxRecord>> {
-    let mut records_by_path = HashMap::new();
+    strategy: SnapshotStrategy,
+) -> Result<(
+    HashMap<String, PathBuf>,
+    HashMap<PathBuf, Vec<CdxRecord>>,
+    HashMap<PathBuf, CdxRecord>,
+)> {
+    let mut strategy_ordered = records.to_vec();
+    sort_records_for_strategy(&mut strategy_ordered, strategy);
+    let known_paths = mapper.records_to_paths(&strategy_ordered)?;
+    let mut candidates_by_path: HashMap<PathBuf, Vec<CdxRecord>> = HashMap::new();
 
-    for record in records {
-        let local_path = mapper.local_path_for_url(&record.original, &record.mimetype)?;
-        records_by_path
+    for record in strategy_ordered {
+        let key = normalize_lookup_url(&record.original);
+        let local_path = match known_paths.get(&key) {
+            Some(path) => path.clone(),
+            None => mapper.local_path_for_url(&record.original, &record.mimetype)?,
+        };
+        candidates_by_path
             .entry(local_path)
-            .or_insert_with(|| record.clone());
+            .or_default()
+            .push(record);
     }
 
-    Ok(records_by_path)
+    let selected_records_by_path = candidates_by_path
+        .iter()
+        .filter_map(|(path, candidates)| {
+            candidates
+                .first()
+                .cloned()
+                .map(|record| (path.clone(), record))
+        })
+        .collect();
+
+    Ok((known_paths, candidates_by_path, selected_records_by_path))
 }
 
 fn filter_archive_noise(records: &mut Vec<CdxRecord>) -> usize {
@@ -1492,8 +1574,10 @@ async fn alternate_text_records_for_source(
     let mut seen_records = HashSet::new();
     let mut seen_digests = HashSet::new();
     remember_digest(&mut seen_digests, source_record);
+    let (targets, discovered) =
+        fallback_options.fallback_targets_for(Some(source_path), source_record);
 
-    for target in fallback_capture_targets(&source_record.original) {
+    for (target_index, target) in targets.into_iter().enumerate() {
         let mut query = CdxQuery::new(
             target,
             MatchType::Exact,
@@ -1503,7 +1587,11 @@ async fn alternate_text_records_for_source(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records = recovery_records(client, &query, fallback_options).await?;
+        let mut records = recovery_records(client, &query, fallback_options).await?;
+        if target_index == 0 && !discovered.is_empty() {
+            records.extend(discovered.iter().cloned());
+            sort_records_for_strategy(&mut records, fallback_options.strategy);
+        }
         for record in records {
             if record.timestamp == source_record.timestamp
                 && record.original == source_record.original
@@ -2556,7 +2644,8 @@ async fn find_alternate_snapshot_record(
     max_bytes: Option<u64>,
     cancellation: &CancellationFlag,
 ) -> Result<Option<CdxRecord>> {
-    for target in fallback_capture_targets(&current_record.original) {
+    let (targets, discovered) = fallback_options.fallback_targets_for(None, current_record);
+    for (target_index, target) in targets.into_iter().enumerate() {
         let mut query = CdxQuery::new(
             target,
             MatchType::Exact,
@@ -2566,7 +2655,11 @@ async fn find_alternate_snapshot_record(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records = recovery_records(client, &query, fallback_options).await?;
+        let mut records = recovery_records(client, &query, fallback_options).await?;
+        if target_index == 0 && !discovered.is_empty() {
+            records.extend(discovered.iter().cloned());
+            sort_records_for_strategy(&mut records, fallback_options.strategy);
+        }
         if let Some(candidate) = alternate_snapshot_candidate_from_records(
             records,
             seen_records,
@@ -2958,8 +3051,15 @@ async fn find_usable_capture(
 ) -> Result<Option<(CdxRecord, SnapshotBody)>> {
     let identity_terms = site_identity_terms(&current_record.original);
     let mut seen_digests = HashSet::new();
+    let mut seen_candidates = HashSet::new();
     remember_digest(&mut seen_digests, current_record);
-    for target in fallback_capture_targets(&current_record.original) {
+    seen_candidates.insert((
+        current_record.timestamp.clone(),
+        current_record.original.clone(),
+    ));
+    let (targets, discovered) =
+        fallback_options.fallback_targets_for(Some(local_path), current_record);
+    for (target_index, target) in targets.into_iter().enumerate() {
         let mut query = CdxQuery::new(
             target,
             MatchType::Exact,
@@ -2969,14 +3069,16 @@ async fn find_usable_capture(
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
 
-        let records = recovery_records(client, &query, fallback_options).await?;
+        let mut records = recovery_records(client, &query, fallback_options).await?;
+        if target_index == 0 && !discovered.is_empty() {
+            records.extend(discovered.iter().cloned());
+            sort_records_for_strategy(&mut records, fallback_options.strategy);
+        }
         for candidate in records {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
-            if candidate.timestamp == current_record.timestamp
-                && candidate.original == current_record.original
-            {
+            if !seen_candidates.insert((candidate.timestamp.clone(), candidate.original.clone())) {
                 continue;
             }
             if !candidate.digest.is_empty() && candidate.digest != "-" && seen_digests.contains(&candidate.digest) {
@@ -3324,7 +3426,7 @@ mod tests {
 				.respond_with(ResponseTemplate::new(200).set_body_string(rows)).expect(1).mount(&server).await;
 		}
 		let client = build_client("lookup-test", Duration::from_secs(5), Vec::new()).unwrap();
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new(), candidates_by_path: HashMap::new() };
 		let query = CdxQuery::new(first.into(), MatchType::Exact, SnapshotStrategy::Latest, Url::parse(&server.uri()).unwrap());
 		assert!(recovery_records(&client, &query, &fallback).await.unwrap().is_empty());
 		let query = CdxQuery { target: second.into(), ..query };
@@ -3351,7 +3453,7 @@ mod tests {
 		}
 		let client = build_client("replay-test", Duration::from_secs(5), Vec::new()).unwrap();
 		let record = CdxRecord { timestamp: timestamp.into(), original: original.into(), mimetype: "text/html".into(), status_code: 200, digest: "PAGE".into(), length: None };
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new(), candidates_by_path: HashMap::new() };
 		let (saved, body) = fetch_record_bytes_with_alternate_capture(&client, &Url::parse(&server.uri()).unwrap(), &fallback, &record, &CancellationFlag::new()).await.unwrap();
 		assert_eq!(saved.original, alternate);
 		assert_eq!(body.bytes, b"<p>Preserved topic</p>");
@@ -3368,7 +3470,7 @@ mod tests {
 			.mount(&server).await;
 		let client = build_client("capture-test", Duration::from_secs(5), Vec::new()).unwrap();
 		let source = CdxRecord { timestamp: "20200201000000".into(), original: original.into(), mimetype: "text/html".into(), status_code: 200, digest: "SOURCE".into(), length: None };
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new(), candidates_by_path: HashMap::new() };
 		let candidates = alternate_text_records_for_source(&client, &Url::parse(&server.uri()).unwrap(), &fallback, &source, Path::new("page.html")).await.unwrap();
 		assert_eq!(candidates.len(), 23);
 	}
@@ -3406,7 +3508,7 @@ mod tests {
 		let mut seen = HashSet::new();
 		remember_snapshot_record(&mut seen, &current);
 		let mut switches = 20;
-		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new() };
+		let fallback = FallbackOptions { from: None, to: None, strategy: SnapshotStrategy::Latest, recovery: Arc::new(RecoveryState::default()), originals_by_path: HashMap::new(), candidates_by_path: HashMap::new() };
 		assert!(maybe_switch_to_alternate_snapshot(&client, &root, Some(&fallback), &mut current, &mut replay, &mut seen, &mut switches, None, 4, &error, &CancellationFlag::new()).await.unwrap());
 		assert_eq!(switches, 21);
 		assert_eq!(current.timestamp, "20200101000000");
@@ -3622,7 +3724,13 @@ mod tests {
             },
         ];
 
-        let records_by_path = recoverable_static_records_by_path(&mapper, &records, 1024).unwrap();
+        let records_by_path = recoverable_static_records_by_path(
+            &mapper,
+            &records,
+            SnapshotStrategy::Latest,
+            1024,
+        )
+        .unwrap();
 
         assert_eq!(
             records_by_path
@@ -3714,5 +3822,167 @@ mod tests {
 
         assert_eq!(created, 0);
         assert!(!root.join("pc/poker/images/screen4.jpg").exists());
+    }
+
+    /// Multiple URL variants (such as bare vs `www` host or different session IDs)
+    /// that map to the same local path must select the capture matching the requested
+    /// snapshot strategy (`Latest` or `Earliest`) rather than alphabetical URL order.
+    #[test]
+    fn selects_strategy_winning_record_per_local_path_instead_of_alphabetical_url() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let records = vec![
+            CdxRecord {
+                timestamp: "20070101000000".to_owned(),
+                original: "http://example.com/page.htm".to_owned(),
+                mimetype: "text/html".to_owned(),
+                status_code: 200,
+                digest: "OLD_HOST".to_owned(),
+                length: Some(500),
+            },
+            CdxRecord {
+                timestamp: "20120601000000".to_owned(),
+                original: "http://www.example.com/page.htm".to_owned(),
+                mimetype: "text/html".to_owned(),
+                status_code: 200,
+                digest: "NEW_HOST".to_owned(),
+                length: Some(600),
+            },
+            CdxRecord {
+                timestamp: "20050309024319".to_owned(),
+                original: "http://www.example.com/forums/viewforum.php?f=21&sid=0001".to_owned(),
+                mimetype: "application/octet-stream".to_owned(),
+                status_code: 200,
+                digest: "OLD_SID".to_owned(),
+                length: Some(700),
+            },
+            CdxRecord {
+                timestamp: "20101125010613".to_owned(),
+                original: "http://www.example.com/forums/viewforum.php?f=21&sid=ffff".to_owned(),
+                mimetype: "text/html".to_owned(),
+                status_code: 200,
+                digest: "NEW_SID".to_owned(),
+                length: Some(800),
+            },
+        ];
+
+        let (known_latest, candidates_latest, selected_latest) =
+            index_records_by_local_path(&mapper, &records, SnapshotStrategy::Latest).unwrap();
+        assert_eq!(
+            selected_latest
+                .get(Path::new("page.htm"))
+                .map(|record| record.timestamp.as_str()),
+            Some("20120601000000")
+        );
+        let forum_path = known_latest
+            .get("http://www.example.com/forums/viewforum.php?f=21")
+            .unwrap();
+        assert!(forum_path.to_string_lossy().ends_with(".html"));
+        assert_eq!(
+            selected_latest
+                .get(forum_path)
+                .map(|record| record.timestamp.as_str()),
+            Some("20101125010613")
+        );
+        assert_eq!(candidates_latest.get(Path::new("page.htm")).unwrap().len(), 2);
+
+        let (_, _, selected_earliest) =
+            index_records_by_local_path(&mapper, &records, SnapshotStrategy::Earliest).unwrap();
+        assert_eq!(
+            selected_earliest
+                .get(Path::new("page.htm"))
+                .map(|record| record.timestamp.as_str()),
+            Some("20070101000000")
+        );
+    }
+
+    /// When the newest capture for a forum path is an unusable error page and its exact
+    /// URL (or stripped URL) has no other captures in Wayback, fallback search must also
+    /// try earlier discovered captures that mapped to the same local path with a different `sid`.
+    #[tokio::test]
+    async fn unusable_capture_falls_back_to_discovered_session_variant_for_same_path() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let newer_unusable_url =
+            "http://www.smallrockets.com/forums/viewforum.php?f=21&sid=7afce7097ef2dc36c6e5da997c132d21";
+        let older_usable_url =
+            "http://www.smallrockets.com:80/forums/viewforum.php?f=21&sid=89fabdc30059268a44ec36a1f3fdde78";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("url", newer_unusable_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20061125010613 {newer_unusable_url} text/html 200 DEADFORUM 400\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(
+            "/web/20050309024319id_/http://www.smallrockets.com:80/forums/viewforum.php",
+        ))
+        .and(query_param("f", "21"))
+        .and(query_param("sid", "89fabdc30059268a44ec36a1f3fdde78"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<html><head><title>Small Rockets Forums :: View Forum - Wakeboarding Unleashed</title></head><body>Wakeboarding Unleashed Featuring Shaun Murray</body></html>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let mapper = SiteMapper::new("smallrockets.com").unwrap();
+        let current = CdxRecord {
+            timestamp: "20061125010613".to_owned(),
+            original: newer_unusable_url.to_owned(),
+            mimetype: "text/html".to_owned(),
+            status_code: 200,
+            digest: "DEADFORUM".to_owned(),
+            length: Some(400),
+        };
+        let older = CdxRecord {
+            timestamp: "20050309024319".to_owned(),
+            original: older_usable_url.to_owned(),
+            mimetype: "text/html".to_owned(),
+            status_code: 200,
+            digest: "GOODFORUM".to_owned(),
+            length: Some(500),
+        };
+        let local_path = mapper
+            .local_path_for_url(&current.original, &current.mimetype)
+            .unwrap();
+        let (_, candidates_by_path, selected_records_by_path) = index_records_by_local_path(
+            &mapper,
+            &[older.clone(), current.clone()],
+            SnapshotStrategy::Latest,
+        )
+        .unwrap();
+
+        let client = build_client("fallback-test", Duration::from_secs(5), Vec::new()).unwrap();
+        let fallback = FallbackOptions {
+            from: None,
+            to: None,
+            strategy: SnapshotStrategy::Latest,
+            recovery: Arc::new(RecoveryState::default()),
+            originals_by_path: selected_records_by_path,
+            candidates_by_path,
+        };
+
+        let (recovered_record, recovered_body) = find_usable_capture(
+            &client,
+            &Url::parse(&server.uri()).unwrap(),
+            &fallback,
+            &CancellationFlag::new(),
+            &current,
+            &local_path,
+        )
+        .await
+        .unwrap()
+        .expect("should recover older session variant");
+
+        assert_eq!(recovered_record.timestamp, "20050309024319");
+        assert_eq!(recovered_record.original, older_usable_url);
+        assert!(
+            String::from_utf8_lossy(&recovered_body.bytes)
+                .contains("Wakeboarding Unleashed Featuring Shaun Murray")
+        );
     }
 }
