@@ -155,6 +155,11 @@ impl<'a> RewriteContext<'a> {
     }
 
     fn fallback_same_site_path(&self, url: &Url, kind: ReferenceKind) -> Option<PathBuf> {
+        if kind == ReferenceKind::Resource
+            && (url.path().is_empty() || url.path().ends_with('/'))
+        {
+            return None;
+        }
 		if let Some(mapper) = self.mapper
 			&& mapper.is_related_host(url.host_str()?)
 		{
@@ -191,6 +196,11 @@ impl<'a> RewriteContext<'a> {
     }
 
     fn related_resource_fallback_path(&self, url: &Url, kind: ReferenceKind) -> Option<PathBuf> {
+        if kind == ReferenceKind::Resource
+            && (url.path().is_empty() || url.path().ends_with('/'))
+        {
+            return None;
+        }
         let host = url.host_str()?;
         if hosts_are_same_site(self.current_original.host_str()?, host) {
             return self.fallback_same_site_path(url, kind);
@@ -1335,5 +1345,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(rewritten, r#"<a href="downloads/file.exe">Download</a>"#);
+    }
+
+    /// Empty template variables in CSS `url(templates/subSilver/images/)` or resource
+    /// attributes ending in `/` must not be rewritten to `.../index.html`.
+    #[test]
+    fn does_not_rewrite_directory_only_resource_references_to_index_html() {
+        let known_paths = HashMap::new();
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let context = RewriteContext::new_with_mapper(
+            "http://example.com/forums/viewtopic.php?t=1",
+            PathBuf::from("forums/viewtopic.php__q_1.html"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap();
+
+        let html = r#"<style>th { background-image: url(templates/subSilver/images/); }</style><a href="templates/subSilver/">Theme dir</a>"#;
+        let rewritten = rewrite_html(html, &context).unwrap();
+
+        assert!(
+            rewritten.contains("url(templates/subSilver/images/)"),
+            "directory-only CSS resource must not become index.html: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("templates/subSilver/images/index.html"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"href="templates/subSilver/index.html""#),
+            "document anchor links to directories should still map to index.html: {rewritten}"
+        );
     }
 }

@@ -202,7 +202,17 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                 collect_attr!("q[cite]", "cite", references),
                 collect_attr!("del[cite]", "cite", references),
                 collect_attr!("ins[cite]", "cite", references),
-                collect_attr!("form[action]", "action", references),
+                element!("form[action]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if let Some(value) = decoded_attribute(element, "action")
+                            && !is_selectorless_query_required_form_action(&value)
+                        {
+                            references.borrow_mut().push(value);
+                        }
+                        Ok(())
+                    }
+                }),
                 collect_attr!("object[data]", "data", references),
                 collect_guarded_attr!("object[codebase]", "codebase", references),
                 collect_guarded_attr!("applet[code]", "code", references),
@@ -350,7 +360,11 @@ fn extract_meta_refresh_reference(input: &str) -> Option<String> {
 }
 
 fn extract_css_url_references(input: &str) -> Vec<String> {
-	crate::css_refs::references(input).into_iter().map(|reference| reference.value).collect()
+	crate::css_refs::references(input)
+		.into_iter()
+		.map(|reference| reference.value)
+		.filter(|value| !strip_query_and_fragment(value.trim()).ends_with('/'))
+		.collect()
 }
 
 fn parse_srcset_references(input: &str) -> Vec<String> {
@@ -561,7 +575,11 @@ fn existing_html_navigation_target(root: &Path, file: &Path, href: &str) -> Opti
 /// Resolves a relative reference inside the output tree without following symlinks.
 pub(crate) fn resolve_local_reference(root: &Path, from_file: &Path, href: &str) -> Option<PathBuf> {
     let trimmed = href.trim();
-    if trimmed.is_empty() || should_skip_reference(trimmed) || Url::parse(trimmed).is_ok() {
+    if trimmed.is_empty()
+        || should_skip_reference(trimmed)
+        || has_external_url_scheme(trimmed)
+        || Url::parse(trimmed).is_ok()
+    {
         return None;
     }
 
@@ -582,6 +600,34 @@ pub(crate) fn resolve_local_reference(root: &Path, from_file: &Path, href: &str)
     } else {
         None
     }
+}
+
+fn is_selectorless_query_required_form_action(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(base) = Url::parse("http://local.invalid/forums/") else {
+        return false;
+    };
+    let Ok(url) = base.join(&crate::pathmap::unwrap_wayback_url(trimmed)) else {
+        return false;
+    };
+    let path = url.path().to_ascii_lowercase();
+    (path.ends_with("/viewforum.php") || path.ends_with("/viewtopic.php"))
+        && crate::pathmap::canonical_query_without_volatile_params(&url).is_none()
+}
+
+fn has_external_url_scheme(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ftp://")
+        || lower.starts_with("irc://")
+        || lower.starts_with("news:")
+        || lower.starts_with("aim:")
+        || lower.starts_with("callto:")
+        || lower.starts_with("skype:")
 }
 
 fn target_exists_for_static_host(target: &Path) -> bool {
@@ -884,5 +930,28 @@ mod tests {
 
         assert_eq!(report.checked, 0);
         assert!(report.missing.is_empty());
+    }
+
+    /// Malformed external `http://` links with spaces, empty-variable CSS directory
+    /// `url(templates/subSilver/images/)` references, and GET jumpbox `<form action="viewforum.php">`
+    /// actions must not be reported as missing local files.
+    #[test]
+    fn ignores_malformed_external_urls_directory_css_urls_and_jumpbox_form_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("forums/templates/subSilver/images")).unwrap();
+        fs::write(
+            root.join("forums/viewtopic.html"),
+            r#"<style>th { background-image: url(templates/subSilver/images/); }</style>
+               <a href="http://online-schools.usabestlink.info - Online Schools">Spam signature</a>
+               <form method="get" name="jumpbox" action="viewforum.php"><select name="f"><option value="1">General</option></select></form>
+               <form method="get" name="jumpbox2" action="./viewforum.php?sid=abcdef"></form>"#,
+        )
+        .unwrap();
+
+        let report = validate_local_links(root).unwrap();
+
+        assert_eq!(report.checked, 0);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
     }
 }
