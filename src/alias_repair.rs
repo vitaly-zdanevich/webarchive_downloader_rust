@@ -30,17 +30,35 @@ pub struct AliasRepairReport {
     pub ambiguous: usize,
 }
 
-/// Restores missing index.html links from a usable index.htm in the same directory.
-/// Existing destinations and sources resolving outside the archive are never touched.
+/// Restores missing or retained-unusable index.html files from a usable index.htm
+/// in the same directory. Existing usable destinations, symlinks, and sources
+/// resolving outside the archive are never touched.
 pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 	let root = fs::canonicalize(root)?;
 	let report = crate::link_validation::validate_local_links(&root)?;
 	let mut created = 0;
 	let mut seen = HashSet::new();
-	for missing in report.missing {
-		let target = missing.target;
+	let candidates = report
+		.missing
+		.into_iter()
+		.map(|missing| (missing.target, false))
+		.chain(
+			report
+				.unusable_html
+				.into_iter()
+				.map(|target| (target, true)),
+		);
+	for (target, replace_unusable) in candidates {
 		if target.file_name().is_none_or(|name| name != "index.html")
-			|| !seen.insert(target.clone()) || fs::symlink_metadata(&target).is_ok() {
+			|| !seen.insert(target.clone())
+		{
+			continue;
+		}
+		if replace_unusable {
+			if !is_existing_unusable_regular_file(&target) {
+				continue;
+			}
+		} else if fs::symlink_metadata(&target).is_ok() {
 			continue;
 		}
 		let source = target.with_file_name("index.htm");
@@ -50,16 +68,16 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 		if bytes.is_empty() || crate::soft_redirect::is_unusable_html_capture(&String::from_utf8_lossy(&bytes)) {
 			continue;
 		}
-		let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
-		std::io::Write::write_all(&mut file, &bytes)?;
+		write_alias_file(&target, &canonical, &bytes, replace_unusable)?;
 		created += 1;
 	}
 	Ok(created)
 }
 
-/// Creates missing topic copies only beside their source, preserving relative URLs.
+/// Creates missing topic copies (or replaces retained-unusable topic error placeholders)
+/// only beside their usable source, preserving relative URLs.
 /// Post IDs and titles are scoped to the destination forum, not the referring page.
-/// Existing files are never replaced, and no cross-forum equivalence is inferred.
+/// Existing usable files and symlinks are never replaced, and no cross-forum equivalence is inferred.
 pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 	let root = fs::canonicalize(root).context("failed to open topic alias directory")?;
 	let root = root.as_path();
@@ -68,20 +86,27 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
     let mut report = AliasRepairReport::default();
 	let empty_scope = ForumTopicScope::default();
 	let empty_anchors = HashSet::new();
+    let mut written_targets = HashSet::new();
 
     for file in &html_files {
         let input = read_lossy(file)?;
-        let current_topic_title = extract_topic_title(&input).map(|title| normalize_text(&title));
-        let current_anchors = extract_anchor_ids(&input)
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let file_is_usable = !crate::soft_redirect::is_unusable_html_capture(&input);
+        let current_topic_title = file_is_usable
+            .then(|| extract_topic_title(&input).map(|title| normalize_text(&title)))
+            .flatten();
+        let current_anchors = if file_is_usable {
+            extract_anchor_ids(&input)
+                .into_iter()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         for link in extract_anchor_links(&input) {
-            let Some(target) = missing_topic_target(root, file, &link.href)? else {
+            let Some((target, replace_unusable)) =
+                alias_topic_target(root, file, &link.href, &written_targets)?
+            else {
                 continue;
             };
-            if fs::symlink_metadata(&target).is_ok() {
-                continue;
-            }
 			let relative_target = target.strip_prefix(root)?;
 			let scope_path = relative_target.parent().unwrap_or(Path::new(""));
 			let same_forum = file.parent() == target.parent();
@@ -98,29 +123,137 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
             ) {
                 AliasSource::Resolved(source) => source,
                 AliasSource::Unresolved => {
-                    report.unresolved += 1;
+                    if !replace_unusable {
+                        report.unresolved += 1;
+                    }
                     continue;
                 }
                 AliasSource::Ambiguous => {
-                    report.ambiguous += 1;
+                    if !replace_unusable {
+                        report.ambiguous += 1;
+                    }
                     continue;
                 }
             };
 
 			anyhow::ensure!(source.parent() == Some(scope_path), "topic alias source must share its destination directory");
             let source = root.join(source);
+            if source == target {
+                continue;
+            }
 			let bytes = fs::read(&source)
 				.with_context(|| format!("failed to read topic source {}", source.display()))?;
-			let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&target)
-				.with_context(|| format!("failed to create topic alias {}", target.display()))?;
-			file.set_permissions(fs::metadata(&source)?.permissions())?;
-			std::io::Write::write_all(&mut file, &bytes)
-				.with_context(|| format!("failed to write topic alias {}", target.display()))?;
+            write_alias_file(&target, &source, &bytes, replace_unusable)?;
+            written_targets.insert(target);
             report.created += 1;
         }
     }
 
+    // Also replace any remaining retained-unusable viewtopic.php__q_<hash>.html files whose
+    // query hash matches a usable topic or post already present in the same forum scope.
+    for file in &html_files {
+        if written_targets.contains(file) || !is_existing_unusable_regular_file(file) {
+            continue;
+        }
+        let Ok(relative) = file.strip_prefix(root) else {
+            continue;
+        };
+        let Some(hash) = extract_target_query_hash(relative) else {
+            continue;
+        };
+        let scope_path = relative.parent().unwrap_or(Path::new(""));
+        let Some(scope) = scopes.get(scope_path) else {
+            continue;
+        };
+        let Some(candidates) = scope.hash_index.get(hash) else {
+            continue;
+        };
+        let Some(source_relative) = resolve_same_topic_candidates(candidates, scope) else {
+            continue;
+        };
+        if source_relative == relative || source_relative.parent() != Some(scope_path) {
+            continue;
+        }
+        let source = root.join(source_relative);
+        let bytes = fs::read(&source)
+            .with_context(|| format!("failed to read topic source {}", source.display()))?;
+        write_alias_file(file, &source, &bytes, true)?;
+        written_targets.insert(file.clone());
+        report.created += 1;
+    }
+
     Ok(report)
+}
+
+fn is_existing_unusable_regular_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(input) = read_lossy(path) else {
+        return false;
+    };
+    crate::soft_redirect::is_unusable_html_capture(&input)
+}
+
+fn write_alias_file(
+    target: &Path,
+    source: &Path,
+    bytes: &[u8],
+    replace_unusable: bool,
+) -> Result<()> {
+    let permissions = fs::metadata(source)?.permissions();
+    if !replace_unusable {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .with_context(|| format!("failed to create alias {}", target.display()))?;
+        file.set_permissions(permissions)?;
+        std::io::Write::write_all(&mut file, bytes)
+            .with_context(|| format!("failed to write alias {}", target.display()))?;
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("failed to inspect existing alias target {}", target.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.file_type().is_file(),
+        "refusing to replace non-regular alias target {}",
+        target.display()
+    );
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "alias".into());
+    let temp_path = target.with_file_name(format!(".{file_name}.webarchive-alias.tmp"));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create temporary alias {}", temp_path.display()))?;
+        file.set_permissions(permissions)?;
+        std::io::Write::write_all(&mut file, bytes)
+            .with_context(|| format!("failed to write temporary alias {}", temp_path.display()))?;
+        std::io::Write::flush(&mut file)
+            .with_context(|| format!("failed to flush temporary alias {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, target).with_context(|| {
+            format!(
+                "failed to replace unusable capture {} with alias",
+                target.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn collect_html_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -505,7 +638,12 @@ fn extract_topic_title(input: &str) -> Option<String> {
     Some(title[start..].trim().to_owned())
 }
 
-fn missing_topic_target(root: &Path, from_file: &Path, href: &str) -> Result<Option<PathBuf>> {
+fn alias_topic_target(
+    root: &Path,
+    from_file: &Path,
+    href: &str,
+    written_targets: &HashSet<PathBuf>,
+) -> Result<Option<(PathBuf, bool)>> {
     if should_skip_reference(href) {
         return Ok(None);
     }
@@ -514,18 +652,21 @@ fn missing_topic_target(root: &Path, from_file: &Path, href: &str) -> Result<Opt
     if !target.starts_with(&normalize_path(root)) {
         return Ok(None);
     }
-    if target.exists() {
-        return Ok(None);
-    }
-
-    if target
+    if !target
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("viewtopic.php__q_") && name.ends_with(".html"))
     {
-        Ok(Some(target))
-    } else {
-        Ok(None)
+        return Ok(None);
+    }
+    if written_targets.contains(&target) {
+        return Ok(None);
+    }
+
+    match fs::symlink_metadata(&target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some((target, false))),
+        Ok(_) if is_existing_unusable_regular_file(&target) => Ok(Some((target, true))),
+        _ => Ok(None),
     }
 }
 
@@ -1326,5 +1467,64 @@ mod tests {
         assert_eq!(report.created, 2);
         assert!(root.join("forums").join(&missing_topic_file).exists());
         assert!(root.join("forums").join(&missing_post_file).exists());
+    }
+
+    /// A retained unusable error placeholder for `viewtopic.php?p=<id>` (e.g.
+    /// `"The topic or post you requested does not exist"`) must be replaced with the
+    /// usable topic file in the same forum containing post `<id>`, both when linked
+    /// and when matched directly by its query hash.
+    #[test]
+    fn replaces_retained_unusable_topic_placeholder_with_usable_topic_in_same_forum() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("forums")).unwrap();
+        let post_hash = query_hash_hex("p=20830");
+        let unlinked_post_hash = query_hash_hex("p=20831");
+        let linked_placeholder = format!("viewtopic.php__q_{post_hash}.html");
+        let unlinked_placeholder = format!("viewtopic.php__q_{unlinked_post_hash}.html");
+        let error_html = "<table><tr><td align='center'><span class='gen'>The topic or post you requested does not exist</span></td></tr></table>";
+        let valid_html = format!(
+            r#"<title>SmallRockets Discussion :: View topic - Creating A Restricted Game Server</title><a name="20830"></a><a name="20831"></a><a href="{linked_placeholder}#20830">Post</a>"#
+        );
+
+        fs::write(root.join("forums").join(&linked_placeholder), error_html).unwrap();
+        fs::write(root.join("forums").join(&unlinked_placeholder), error_html).unwrap();
+        fs::write(root.join("forums/viewtopic.php__q_valid.html"), &valid_html).unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 2);
+        assert_eq!(
+            fs::read_to_string(root.join("forums").join(&linked_placeholder)).unwrap(),
+            valid_html
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("forums").join(&unlinked_placeholder)).unwrap(),
+            valid_html
+        );
+        // Second run must be idempotent now that both placeholders are usable.
+        assert_eq!(create_missing_topic_aliases(root).unwrap().created, 0);
+    }
+
+    /// A retained unusable meta-refresh `index.html` must be replaced by a usable
+    /// sibling `index.htm` in the same directory.
+    #[test]
+    fn directory_aliases_replace_unusable_redirect_index_html_from_usable_index_htm() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("_hosts/pc.example.com")).unwrap();
+        fs::write(
+            root.path().join("_hosts/pc.example.com/index.html"),
+            r#"<META HTTP-EQUIV="Refresh" Content="1;URL=../../index.html">"#,
+        )
+        .unwrap();
+        let usable = b"<TITLE>Small Rockets - The Games Company</TITLE><p>Real page</p>";
+        fs::write(root.path().join("_hosts/pc.example.com/index.htm"), usable).unwrap();
+
+        assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 1);
+        assert_eq!(
+            fs::read(root.path().join("_hosts/pc.example.com/index.html")).unwrap(),
+            usable
+        );
+        assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 0);
     }
 }
