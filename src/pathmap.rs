@@ -125,7 +125,8 @@ impl SiteMapper {
         Ok(paths)
     }
 
-	/// Finds an exact capture path before considering equivalent output hosts/schemes.
+	/// Finds an exact capture path before considering equivalent output hosts/schemes
+	/// and standard directory-index fallbacks (e.g. `/dir/index.php` -> `/dir/`).
 	///
 	/// Only default-port HTTP(S) URLs on related hosts participate in fallback.
 	/// Primary www/bare hosts share an output root; other subdomains stay distinct.
@@ -149,21 +150,20 @@ impl SiteMapper {
 		} else {
 			vec![host]
 		};
-		let mut found = None;
-		for host in hosts {
-			for scheme in ["http", "https"] {
-				let mut candidate = url.clone();
-				candidate.set_host(Some(host)).ok()?;
-				candidate.set_scheme(scheme).ok()?;
-				if let Some(path) = known_paths.get(&normalize_lookup_url(candidate.as_str())) {
-					if found.is_some_and(|previous| previous != path) {
-						return None;
-					}
-					found = Some(path);
+		match lookup_across_hosts_and_schemes(url, &hosts, known_paths) {
+			HostLookup::Found(path) => Some(path),
+			HostLookup::Conflicting => None,
+			HostLookup::Missing => {
+				if canonical_query_without_volatile_params(url).is_some() {
+					return None;
+				}
+				let dir_url = directory_index_parent_url(url)?;
+				match lookup_across_hosts_and_schemes(&dir_url, &hosts, known_paths) {
+					HostLookup::Found(path) => Some(path),
+					HostLookup::Conflicting | HostLookup::Missing => None,
 				}
 			}
 		}
-		found
 	}
 
     pub fn original_url_candidates_for_local_path(&self, local_path: &Path) -> Vec<String> {
@@ -205,6 +205,72 @@ impl SiteMapper {
         candidates.dedup();
         candidates
     }
+}
+
+enum HostLookup<'a> {
+    Found(&'a PathBuf),
+    Missing,
+    Conflicting,
+}
+
+fn lookup_across_hosts_and_schemes<'a>(
+    url: &Url,
+    hosts: &[&str],
+    known_paths: &'a HashMap<String, PathBuf>,
+) -> HostLookup<'a> {
+    let mut found = None;
+    for host in hosts {
+        for scheme in ["http", "https"] {
+            let mut candidate = url.clone();
+            if candidate.set_host(Some(host)).is_err() || candidate.set_scheme(scheme).is_err() {
+                continue;
+            }
+            if let Some(path) = known_paths.get(&normalize_lookup_url(candidate.as_str())) {
+                if found.is_some_and(|previous| previous != path) {
+                    return HostLookup::Conflicting;
+                }
+                found = Some(path);
+            }
+        }
+    }
+    match found {
+        Some(path) => HostLookup::Found(path),
+        None => HostLookup::Missing,
+    }
+}
+
+fn directory_index_parent_url(url: &Url) -> Option<Url> {
+    let path = url.path();
+    let (prefix, file_name) = path.rsplit_once('/')?;
+    if !matches!(
+        file_name.to_ascii_lowercase().as_str(),
+        "index.php"
+            | "index.html"
+            | "index.htm"
+            | "index.shtml"
+            | "index.asp"
+            | "index.aspx"
+            | "index.jsp"
+            | "index.cfm"
+            | "index.cgi"
+            | "index.pl"
+            | "default.htm"
+            | "default.html"
+            | "default.asp"
+            | "default.aspx"
+    ) {
+        return None;
+    }
+    let mut parent = url.clone();
+    let dir_path = if prefix.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    parent.set_path(&dir_path);
+    parent.set_query(None);
+    parent.set_fragment(None);
+    Some(parent)
 }
 
 fn build_original_url_candidate(scheme: &str, host: &str, components: &[String]) -> Option<String> {
@@ -780,5 +846,44 @@ mod tests {
             relative_link(Path::new("index.html"), Path::new("about/index.html")),
             "about/index.html"
         );
+    }
+
+    /// Standard directory index filenames (like `/forums/index.php?sid=abc` or `/docs/default.asp`)
+    /// with no meaningful query parameters must resolve to a captured `/forums/` or `/docs/`
+    /// directory page on the same host when the explicit index filename was not captured,
+    /// without crossing subdomains or dropping meaningful query selectors.
+    #[test]
+    fn falls_back_from_uncaptured_directory_index_filename_to_captured_directory() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let known = HashMap::from([
+            (
+                "http://sub.example.com/forums/".to_owned(),
+                PathBuf::from("_hosts/sub.example.com/forums/index.html"),
+            ),
+            (
+                "http://example.com/docs/".to_owned(),
+                PathBuf::from("docs/index.html"),
+            ),
+        ]);
+
+        let session_index = Url::parse("http://sub.example.com/forums/index.php?sid=abc").unwrap();
+        assert_eq!(
+            mapper.known_path_for_url(&session_index, &known),
+            Some(&PathBuf::from("_hosts/sub.example.com/forums/index.html"))
+        );
+
+        let default_asp = Url::parse("https://www.example.com/docs/default.asp").unwrap();
+        assert_eq!(
+            mapper.known_path_for_url(&default_asp, &known),
+            Some(&PathBuf::from("docs/index.html"))
+        );
+
+        // Meaningful query selectors must not collapse onto the bare directory index.
+        let query_index = Url::parse("http://sub.example.com/forums/index.php?c=3").unwrap();
+        assert_eq!(mapper.known_path_for_url(&query_index, &known), None);
+
+        // Subdomains remain strictly isolated.
+        let other_sub = Url::parse("http://other.example.com/forums/index.php?sid=abc").unwrap();
+        assert_eq!(mapper.known_path_for_url(&other_sub, &known), None);
     }
 }
