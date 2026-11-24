@@ -94,6 +94,25 @@ pub(crate) fn is_interactive_forum_extra_reference(url: &Url) -> bool {
         });
     }
 
+    if path.ends_with("/viewtopic.php") {
+        return url.query_pairs().any(|(key, value)| {
+            let key = key.trim_start_matches("amp;");
+            key.eq_ignore_ascii_case("view")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "next" | "previous" | "print" | "unread"
+                )
+        });
+    }
+
+    if path.ends_with("/search.php") {
+        return url.query_pairs().any(|(key, _)| {
+            let key = key.trim_start_matches("amp;");
+            key.eq_ignore_ascii_case("search_author")
+                || key.eq_ignore_ascii_case("search_keywords")
+        });
+    }
+
     false
 }
 
@@ -277,6 +296,11 @@ mod tests {
 			   <a href="ucp.php?mode=login&amp;redirect=viewtopic.php">Login</a>
 			   <a href="login.php?redirect=posting.php&amp;mode=quote&amp;p=100">Login2</a>
 			   <a href="profile.php?mode=email&amp;u=2">Email</a>
+			   <a href="viewtopic.php?t=1&amp;view=next">Next</a>
+			   <a href="viewtopic.php?t=1&amp;view=previous">Prev</a>
+			   <a href="viewtopic.php?t=1&amp;view=print">Print</a>
+			   <a href="search.php?search_author=Bullfrog">Author posts</a>
+			   <a href="search.php?search_id=active_topics">Active topics</a>
 			   <a href="memberlist.php?mode=viewprofile&amp;u=2">Profile</a>
 			   <a href="viewtopic.php?t=2">Next Topic</a>"#,
 			&base,
@@ -289,6 +313,7 @@ mod tests {
 			references,
 			vec![
 				"http://www.example.com/forums/memberlist.php?mode=viewprofile&u=2".to_owned(),
+				"http://www.example.com/forums/search.php?search_id=active_topics".to_owned(),
 				"http://www.example.com/forums/viewtopic.php?t=2".to_owned(),
 			]
 		);

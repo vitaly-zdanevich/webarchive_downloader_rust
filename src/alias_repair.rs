@@ -34,9 +34,13 @@ pub struct AliasRepairReport {
 /// in the same directory. Existing usable destinations, symlinks, and sources
 /// resolving outside the archive are never touched.
 pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
+	Ok(create_missing_directory_aliases_tracking(root)?.len())
+}
+
+pub(crate) fn create_missing_directory_aliases_tracking(root: &Path) -> Result<Vec<PathBuf>> {
 	let root = fs::canonicalize(root)?;
 	let report = crate::link_validation::validate_local_links(&root)?;
-	let mut created = 0;
+	let mut created = Vec::new();
 	let mut seen = HashSet::new();
 	let candidates = report
 		.missing
@@ -69,7 +73,9 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 			continue;
 		}
 		write_alias_file(&target, &canonical, &bytes, replace_unusable)?;
-		created += 1;
+		if let Ok(relative) = target.strip_prefix(&root) {
+			created.push(relative.to_path_buf());
+		}
 	}
 	Ok(created)
 }
@@ -79,6 +85,12 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 /// Post IDs and titles are scoped to the destination forum, not the referring page.
 /// Existing usable files and symlinks are never replaced, and no cross-forum equivalence is inferred.
 pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
+	Ok(create_missing_topic_aliases_tracking(root)?.0)
+}
+
+pub(crate) fn create_missing_topic_aliases_tracking(
+	root: &Path,
+) -> Result<(AliasRepairReport, Vec<PathBuf>)> {
 	let root = fs::canonicalize(root).context("failed to open topic alias directory")?;
 	let root = root.as_path();
     let html_files = collect_html_files(root)?;
@@ -87,6 +99,7 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 	let empty_scope = ForumTopicScope::default();
 	let empty_anchors = HashSet::new();
     let mut written_targets = HashSet::new();
+    let mut created_paths = Vec::new();
 
     for file in &html_files {
         let input = read_lossy(file)?;
@@ -144,6 +157,7 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 			let bytes = fs::read(&source)
 				.with_context(|| format!("failed to read topic source {}", source.display()))?;
             write_alias_file(&target, &source, &bytes, replace_unusable)?;
+            created_paths.push(relative_target.to_path_buf());
             written_targets.insert(target);
             report.created += 1;
         }
@@ -178,11 +192,12 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
         let bytes = fs::read(&source)
             .with_context(|| format!("failed to read topic source {}", source.display()))?;
         write_alias_file(file, &source, &bytes, true)?;
+        created_paths.push(relative.to_path_buf());
         written_targets.insert(file.clone());
         report.created += 1;
     }
 
-    Ok(report)
+    Ok((report, created_paths))
 }
 
 fn is_existing_unusable_regular_file(path: &Path) -> bool {

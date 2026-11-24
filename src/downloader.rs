@@ -18,7 +18,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::alias_repair::{create_missing_directory_aliases, create_missing_topic_aliases};
+use crate::alias_repair::{
+    create_missing_directory_aliases, create_missing_directory_aliases_tracking,
+    create_missing_topic_aliases, create_missing_topic_aliases_tracking,
+};
 use crate::cdx::{
     CdxQuery, CdxRecord, CdxRetryPolicy, MAX_WAYBACK_RETRY_DELAY_SECONDS, MatchType,
     SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
@@ -339,11 +342,29 @@ pub async fn download_site(
     }
 
     if options.rewrite_links && report.cancelled == 0 {
+        let mut aliased_paths = HashSet::new();
+        let (alias_report, topic_alias_paths) =
+            create_missing_topic_aliases_tracking(&options.output_dir)?;
+        if alias_report.created > 0 {
+            println!(
+                "created {} local alias files for missing topic links",
+                alias_report.created
+            );
+        }
+        aliased_paths.extend(topic_alias_paths);
+		let directory_alias_paths =
+			create_missing_directory_aliases_tracking(&options.output_dir)?;
+		let directory_aliases = directory_alias_paths.len();
+		if directory_aliases > 0 { println!("created {directory_aliases} local directory index aliases"); }
+        aliased_paths.extend(directory_alias_paths);
+        report.aliases_created = alias_report.created + directory_aliases;
+
         if let Some(max_bytes) = options.extra_download_max_bytes {
+			let extra_downloads_before = report.extra_downloads;
 			let mut checked_references = HashSet::new();
 			while !extra_download_refs.is_empty() && !options.cancellation.is_cancelled() {
 				extra_download_refs.retain(|reference| {
-					checked_references.insert(normalize_lookup_url(reference))
+					checked_references.insert(canonical_extra_reference_key(&mapper, reference))
 				});
 				if extra_download_refs.is_empty() {
 					break;
@@ -354,6 +375,7 @@ pub async fn download_site(
 					&mapper,
 					&fallback_options,
 					&extra_download_refs,
+					&aliased_paths,
 					&mut known_paths,
 					&mut seen_paths,
 					max_bytes,
@@ -416,18 +438,36 @@ pub async fn download_site(
 					}
 				}
 			}
+
+			if report.extra_downloads > extra_downloads_before && !options.cancellation.is_cancelled() {
+				let post_alias_report = create_missing_topic_aliases(&options.output_dir)?;
+				if post_alias_report.created > 0 {
+					println!(
+						"created {} local alias files for missing topic links",
+						post_alias_report.created
+					);
+				}
+				let post_dir_aliases = create_missing_directory_aliases(&options.output_dir)?;
+				if post_dir_aliases > 0 {
+					println!("created {post_dir_aliases} local directory index aliases");
+				}
+				report.aliases_created += post_alias_report.created + post_dir_aliases;
+			}
         }
 
-        let alias_report = create_missing_topic_aliases(&options.output_dir)?;
-        if alias_report.created > 0 {
-            println!(
-                "created {} local alias files for missing topic links",
-                alias_report.created
-            );
-        }
-		let directory_aliases = create_missing_directory_aliases(&options.output_dir)?;
-		if directory_aliases > 0 { println!("created {directory_aliases} local directory index aliases"); }
-        report.aliases_created = alias_report.created + directory_aliases;
+        let pre_recovery_static_aliases = if !options.cancellation.is_cancelled() {
+            let created =
+                create_missing_static_asset_aliases(&options.output_dir, &options.cancellation)
+                    .await?;
+            if created > 0 {
+                println!(
+                    "created {created} local aliases for missing static assets before Wayback recovery"
+                );
+            }
+            created
+        } else {
+            0
+        };
 
         if let Some(max_bytes) = options.extra_download_max_bytes {
             let recovery_report = recover_missing_static_assets(
@@ -466,17 +506,18 @@ pub async fn download_site(
             println!("created {alternate_page_aliases} local aliases from alternate page captures");
         }
 
-        let local_static_asset_aliases =
+        let post_recovery_static_aliases =
             create_missing_static_asset_aliases(&options.output_dir, &options.cancellation).await?;
-        if local_static_asset_aliases > 0 {
+        if post_recovery_static_aliases > 0 {
             println!(
-                "created {local_static_asset_aliases} local aliases for missing static assets"
+                "created {post_recovery_static_aliases} local aliases for missing static assets"
             );
         }
-        report.static_asset_aliases_created = alternate_page_aliases + local_static_asset_aliases;
+        report.static_asset_aliases_created =
+            pre_recovery_static_aliases + alternate_page_aliases + post_recovery_static_aliases;
         report.unavailable_static_assets = report
             .unavailable_static_assets
-            .saturating_sub(report.static_asset_aliases_created);
+            .saturating_sub(alternate_page_aliases + post_recovery_static_aliases);
         if report.unavailable_static_assets > 0 {
             if options
                 .extra_download_max_bytes
@@ -624,6 +665,21 @@ pub async fn repair_output_dir(
 	if directory_aliases > 0 { println!("created {directory_aliases} local directory index aliases"); }
     report.aliases_created = alias_report.created + directory_aliases;
 
+    let pre_recovery_static_aliases = if !options.cancellation.is_cancelled() {
+        let created =
+            create_missing_static_asset_aliases(&options.output_dir, &options.cancellation).await?;
+        if created > 0 {
+            println!(
+                "created {created} local aliases for missing static assets before Wayback recovery"
+            );
+        }
+        created
+    } else {
+        0
+    };
+    report.static_asset_aliases_created += pre_recovery_static_aliases;
+    let mut post_recovery_aliases = 0;
+
     if let Some(max_bytes) = options.extra_download_max_bytes {
         let records = fetch_recovery_records(&client, &mapper, &options).await?;
         let (_, candidates_by_path, selected_records_by_path) =
@@ -676,6 +732,7 @@ pub async fn repair_output_dir(
                 );
             }
             report.static_asset_aliases_created += alternate_page_aliases;
+            post_recovery_aliases += alternate_page_aliases;
         }
     }
 
@@ -686,9 +743,10 @@ pub async fn repair_output_dir(
             println!("created {static_asset_aliases} local aliases for missing static assets");
         }
         report.static_asset_aliases_created += static_asset_aliases;
+        post_recovery_aliases += static_asset_aliases;
         report.unavailable_static_assets = report
             .unavailable_static_assets
-            .saturating_sub(report.static_asset_aliases_created);
+            .saturating_sub(post_recovery_aliases);
         if report.unavailable_static_assets > 0 {
             if options
                 .extra_download_max_bytes
@@ -1160,12 +1218,33 @@ struct ExtraDownloadResolution {
     unavailable: usize,
 }
 
+fn canonical_extra_reference_key(mapper: &SiteMapper, reference: &str) -> String {
+    let normalized = normalize_lookup_url(reference);
+    let Ok(mut url) = Url::parse(&normalized) else {
+        return normalized;
+    };
+    if matches!(url.scheme(), "http" | "https")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| mapper.is_primary_host(host))
+    {
+        let _ = url.set_scheme("http");
+        let _ = url.set_host(Some(mapper.cdx_target()));
+        return url.to_string();
+    }
+    normalized
+}
+
 async fn resolve_extra_download_jobs(
     client: &WaybackClient,
     archive_root: &Url,
     mapper: &SiteMapper,
     fallback_options: &FallbackOptions,
     references: &HashSet<String>,
+    aliased_paths: &HashSet<PathBuf>,
     known_paths: &mut HashMap<String, PathBuf>,
     seen_paths: &mut HashSet<PathBuf>,
     max_bytes: u64,
@@ -1182,6 +1261,14 @@ async fn resolve_extra_download_jobs(
         }
         let lookup_key = normalize_lookup_url(&reference);
         if Url::parse(&reference).ok().and_then(|url| mapper.known_path_for_url(&url, known_paths)).is_some() {
+            continue;
+        }
+        if !aliased_paths.is_empty()
+            && let Ok(aliased_path) = mapper.local_path_for_url(&reference, "text/html")
+            && aliased_paths.contains(&aliased_path)
+        {
+            known_paths.insert(lookup_key, aliased_path.clone());
+            seen_paths.insert(aliased_path);
             continue;
         }
 
@@ -4263,5 +4350,103 @@ mod tests {
                 "http://example.com/forums/viewtopic.php?p=9&t=7".to_owned(),
             ]
         );
+    }
+
+    /// Primary host bare/`www` and `http`/`https` variants map to the same Wayback SURT
+    /// key and must deduplicate in extra-download lookups, while non-primary subdomains
+    /// remain distinct.
+    #[test]
+    fn canonical_extra_reference_key_deduplicates_primary_host_variants() {
+        let mapper = SiteMapper::new("smallrockets.com").unwrap();
+        let bare = canonical_extra_reference_key(
+            &mapper,
+            "http://smallrockets.com/forums/viewtopic.php?p=18412&sid=aaa",
+        );
+        let www = canonical_extra_reference_key(
+            &mapper,
+            "https://www.smallrockets.com/forums/viewtopic.php?p=18412&sid=bbb",
+        );
+        let sub = canonical_extra_reference_key(
+            &mapper,
+            "http://highscores.smallrockets.com/forums/viewtopic.php?p=18412",
+        );
+
+        assert_eq!(bare, www);
+        assert_ne!(bare, sub);
+    }
+
+    /// When a linked `viewtopic.php?p=<id>` target is already resolved locally by topic
+    /// aliasing from a primary downloaded topic page, `download_site` must create the alias
+    /// before extra-download lookups and skip issuing an exact CDX query for that post URL.
+    #[tokio::test]
+    async fn download_site_skips_extra_cdx_lookup_for_locally_aliased_topic_links() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let topic_url = "http://www.example.com/forums/viewtopic.php?t=1";
+        let index_url = "http://www.example.com/forums/index.htm";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 IDX 100\n{timestamp} {topic_url} text/html 200 TOP 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="viewtopic.php?p=42#p42">Shared topic</a>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!(
+            "/web/{timestamp}id_/http://www.example.com/forums/viewtopic.php"
+        )))
+        .and(query_param("t", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<title>Forum :: View topic - Shared topic</title><p id="p42">Preserved post</p>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let report = download_site(
+            build_client("alias-before-extra-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 2);
+        assert_eq!(report.aliases_created, 1);
+        assert_eq!(report.linked_files_unavailable, 0);
+        assert_eq!(report.missing_local_links, 0);
     }
 }
