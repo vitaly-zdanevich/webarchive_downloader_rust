@@ -270,7 +270,11 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
             attr_rewriter!("iframe[src]", "src", context, ReferenceKind::Document),
             attr_rewriter!("img[src]", "src", context, ReferenceKind::Resource),
             attr_rewriter!("input[src]", "src", context, ReferenceKind::Resource),
-            attr_rewriter!("link[href]", "href", context, ReferenceKind::Resource),
+            element!("link[href]", move |element| {
+                let kind = link_reference_kind(element);
+                rewrite_attr_url(element, "href", context, kind);
+                Ok(())
+            }),
             attr_rewriter!("object[data]", "data", context, ReferenceKind::Resource),
             attr_rewriter!("script[src]", "src", context, ReferenceKind::Resource),
             attr_rewriter!("source[src]", "src", context, ReferenceKind::Resource),
@@ -392,6 +396,67 @@ pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
 	}
 	rewritten.push_str(&input[offset..]);
 	rewritten
+}
+
+fn link_reference_kind(element: &Element<'_, '_>) -> ReferenceKind {
+    let Some(rel) = element.get_attribute("rel") else {
+        return ReferenceKind::Resource;
+    };
+    let mut has_document_rel = false;
+    for token in rel.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "stylesheet"
+                | "icon"
+                | "shortcut"
+                | "apple-touch-icon"
+                | "apple-touch-icon-precomposed"
+                | "mask-icon"
+                | "manifest"
+                | "preload"
+                | "modulepreload"
+                | "prefetch"
+                | "dns-prefetch"
+                | "preconnect"
+                | "pingback"
+                | "search-plugin"
+        ) {
+            return ReferenceKind::Resource;
+        }
+        if matches!(
+            lower.as_str(),
+            "author"
+                | "bookmark"
+                | "canonical"
+                | "chapter"
+                | "contents"
+                | "copyright"
+                | "first"
+                | "glossary"
+                | "help"
+                | "home"
+                | "index"
+                | "last"
+                | "license"
+                | "next"
+                | "prev"
+                | "previous"
+                | "search"
+                | "section"
+                | "start"
+                | "subsection"
+                | "top"
+                | "up"
+        ) {
+            has_document_rel = true;
+        }
+    }
+    if has_document_rel {
+        ReferenceKind::Document
+    } else {
+        ReferenceKind::Resource
+    }
 }
 
 fn rewrite_attr_url(
@@ -1376,5 +1441,49 @@ mod tests {
             rewritten.contains(r#"href="templates/subSilver/index.html""#),
             "document anchor links to directories should still map to index.html: {rewritten}"
         );
+    }
+
+    /// Navigation `<link rel="prev|next|up|chapter|top|help">` tags point to HTML documents
+    /// and must map to `*.php__q_<hash>.html` / `*.php.html` rather than `application/octet-stream`
+    /// paths like `viewtopic__q_<hash>.php`, while `<link rel="stylesheet">` stays a resource.
+    #[test]
+    fn rewrites_navigation_link_elements_as_documents_and_stylesheets_as_resources() {
+        let known_paths = HashMap::new();
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let context = RewriteContext::new_with_mapper(
+            "http://example.com/forums/viewtopic.php?t=100",
+            PathBuf::from("forums/viewtopic.php__q_100.html"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap();
+
+        let html = concat!(
+            r#"<link rel="stylesheet" href="style.php?id=1">"#,
+            r#"<link rel="prev" href="viewtopic.php?t=100&amp;view=previous">"#,
+            r#"<link rel="chapter" href="viewforum.php?f=1">"#,
+            r#"<link rel="help" href="faq.php">"#,
+        );
+        let rewritten = rewrite_html(html, &context).unwrap();
+
+        assert!(
+            rewritten.contains(r#"<link rel="stylesheet" href="style__q_"#)
+                && rewritten.contains(r#".php">"#),
+            "stylesheet link should remain a resource: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"<link rel="prev" href="viewtopic.php__q_"#),
+            "prev link must map as HTML document: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"<link rel="chapter" href="viewforum.php__q_"#),
+            "chapter link must map as HTML document: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"<link rel="help" href="faq.php.html">"#),
+            "help link must map as HTML document: {rewritten}"
+        );
+        assert!(!rewritten.contains("viewtopic__q_"), "{rewritten}");
+        assert!(!rewritten.contains("viewforum__q_"), "{rewritten}");
     }
 }
