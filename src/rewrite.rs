@@ -775,8 +775,9 @@ fn rewrite_javascript_string_urls(input: &str, context: &RewriteContext<'_>) -> 
 	for literal in crate::javascript::strings(input) {
 		let value = literal.value.as_str();
 		let replacement = if !literal.is_concatenated && looks_like_javascript_url_reference(value) {
+			let kind = javascript_reference_kind(value);
 			context
-				.rewrite_url_reference(value)
+				.rewrite_url_reference_as(value, kind)
 				.map(url_rewrite_to_javascript_string)
 		} else {
 			rewrite_html_fragment_in_javascript_string(value, context)
@@ -791,6 +792,24 @@ fn rewrite_javascript_string_urls(input: &str, context: &RewriteContext<'_>) -> 
 
 	rewritten.push_str(&input[cursor..]);
 	rewritten
+}
+
+fn javascript_reference_kind(value: &str) -> ReferenceKind {
+    let path = strip_query_and_fragment(value.trim());
+    let Some(file_name) = path.rsplit('/').next() else {
+        return ReferenceKind::Resource;
+    };
+    let Some((_, extension)) = file_name.rsplit_once('.') else {
+        return ReferenceKind::Resource;
+    };
+    if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "html" | "htm" | "xhtml" | "shtml" | "php" | "asp" | "aspx" | "jsp" | "cfm" | "cgi"
+    ) {
+        ReferenceKind::Document
+    } else {
+        ReferenceKind::Resource
+    }
 }
 
 fn url_rewrite_to_javascript_string(rewrite: UrlRewrite) -> String {
@@ -1485,5 +1504,35 @@ mod tests {
         );
         assert!(!rewritten.contains("viewtopic__q_"), "{rewritten}");
         assert!(!rewritten.contains("viewforum__q_"), "{rewritten}");
+    }
+
+    /// JavaScript string literals referencing dynamic document pages (e.g. `viewtopic.php?...`
+    /// or `page.asp?...`) must use document path mapping (`*.php__q_<hash>.html`) rather than
+    /// `application/octet-stream` (`viewtopic__q_<hash>.php`), while static assets remain resources.
+    #[test]
+    fn rewrites_javascript_document_url_literals_with_html_mapping() {
+        let known_paths = HashMap::new();
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let context = RewriteContext::new_with_mapper(
+            "http://example.com/forums/viewtopic.php?t=100",
+            PathBuf::from("forums/viewtopic.php__q_100.html"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap();
+
+        let html = r#"<script>var base_url = './viewtopic.php?f=10&t=200'; var img = '/img/logo.gif';</script>"#;
+        let rewritten = rewrite_html(html, &context).unwrap();
+
+        assert!(
+            rewritten.contains("var base_url = 'viewtopic.php__q_")
+                && rewritten.contains(".html';"),
+            "JS document literal should map as HTML: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("var img = '../img/logo.gif';"),
+            "JS static asset literal should stay a resource: {rewritten}"
+        );
+        assert!(!rewritten.contains("viewtopic__q_"), "{rewritten}");
     }
 }
