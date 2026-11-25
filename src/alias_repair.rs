@@ -324,7 +324,7 @@ fn load_journal_topic_metadata(root: &Path) -> JournalTopicMetadata {
             if let Some(forum_id) = extract_numeric_query_param(&url, &["f", "forum"]) {
                 metadata.forum_ids.insert(forum_id);
             }
-            if !path.ends_with("/viewtopic.php") {
+            if !path.ends_with("/viewtopic.php") || is_adjacent_topic_navigation_url(&url) {
                 continue;
             }
             let Some(canonical_query) = canonical_query_without_volatile_params(&url) else {
@@ -398,6 +398,7 @@ fn build_forum_topic_scopes(
         let mut topic_id = None;
         if let Some(original) = journal.originals_by_path.get(&relative)
             && let Ok(url) = Url::parse(original)
+            && !is_adjacent_topic_navigation_url(&url)
         {
             topic_id = extract_numeric_query_param(&url, &["t", "topic"]);
             if let Some(forum_id) = extract_numeric_query_param(&url, &["f", "forum"]) {
@@ -563,6 +564,13 @@ fn build_forum_topic_scopes(
     }
 
     Ok(scopes)
+}
+
+fn is_adjacent_topic_navigation_url(url: &Url) -> bool {
+    url.query_pairs().any(|(key, value)| {
+        key.trim_start_matches("amp;").eq_ignore_ascii_case("view")
+            && matches!(value.to_ascii_lowercase().as_str(), "next" | "previous")
+    })
 }
 
 fn extract_numeric_query_param(url: &Url, names: &[&str]) -> Option<String> {
@@ -1541,5 +1549,83 @@ mod tests {
             usable
         );
         assert_eq!(create_missing_directory_aliases(root.path()).unwrap(), 0);
+    }
+
+    /// `viewtopic.php?t=N&view=next` and `view=previous` request an adjacent topic,
+    /// not topic `N` itself. Journal metadata for those URLs must neither alias missing
+    /// next/previous links back to topic `N` nor overwrite unusable next/previous captures
+    /// with topic `N`.
+    #[test]
+    fn does_not_alias_view_next_or_previous_back_to_source_topic() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("forums")).unwrap();
+        fs::create_dir_all(root.join(".wayback-state")).unwrap();
+
+        let topic_hash = query_hash_hex("t=10269");
+        let next_hash = query_hash_hex("t=10269&view=next");
+        let prev_hash = query_hash_hex("t=10269&view=previous");
+        let topic_file = format!("viewtopic.php__q_{topic_hash}.html");
+        let next_file = format!("viewtopic.php__q_{next_hash}.html");
+        let prev_file = format!("viewtopic.php__q_{prev_hash}.html");
+
+        let topic_html = format!(
+            r#"<title>Forum :: View topic - A Fun Game</title><a href="{next_file}">View next topic</a><a href="{prev_file}">View previous topic</a><a href="posting.php?mode=reply&amp;t=10269">Reply</a>"#
+        );
+        let no_newer_html =
+            "<table><tr><td align='center'><span class='gen'>There are no newer topics in this forum</span></td></tr></table>";
+
+        fs::write(root.join("forums").join(&topic_file), &topic_html).unwrap();
+        fs::write(root.join("forums").join(&next_file), no_newer_html).unwrap();
+
+        let journal_events = [
+            CaptureEvent {
+                record: crate::cdx::CdxRecord {
+                    timestamp: "20061125000000".to_owned(),
+                    original: "http://www.example.com/forums/viewtopic.php?t=10269".to_owned(),
+                    mimetype: "text/html".to_owned(),
+                    status_code: 200,
+                    digest: "TOPIC".to_owned(),
+                    length: Some(300),
+                },
+                local_path: PathBuf::from(format!("forums/{topic_file}")),
+                outcome: "downloaded".to_owned(),
+                references: vec![
+                    "http://www.example.com/forums/viewtopic.php?t=10269&view=next".to_owned(),
+                    "http://www.example.com/forums/viewtopic.php?t=10269&view=previous".to_owned(),
+                ],
+                error: None,
+            },
+            CaptureEvent {
+                record: crate::cdx::CdxRecord {
+                    timestamp: "20061125000001".to_owned(),
+                    original: "http://www.example.com/forums/viewtopic.php?t=10269&view=next"
+                        .to_owned(),
+                    mimetype: "text/html".to_owned(),
+                    status_code: 200,
+                    digest: "NONEWER".to_owned(),
+                    length: Some(200),
+                },
+                local_path: PathBuf::from(format!("forums/{next_file}")),
+                outcome: "unusable".to_owned(),
+                references: Vec::new(),
+                error: None,
+            },
+        ];
+        let journal = journal_events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join(".wayback-state/captures.jsonl"), format!("{journal}\n")).unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 0);
+        assert_eq!(
+            fs::read_to_string(root.join("forums").join(&next_file)).unwrap(),
+            no_newer_html
+        );
+        assert!(!root.join("forums").join(&prev_file).exists());
     }
 }
