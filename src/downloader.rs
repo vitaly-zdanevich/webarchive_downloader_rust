@@ -48,6 +48,8 @@ pub struct DownloadOptions {
 	/// Replaces recognized local HTML error pages only after a usable capture is found.
 	pub recover_existing: bool,
     pub rewrite_links: bool,
+    /// Inserts a non-visible Wayback Machine snapshot URL comment at the top of rewritten HTML pages.
+    pub add_wayback_comment: bool,
     pub extra_download_max_bytes: Option<u64>,
     pub validate_links: bool,
     pub cancellation: CancellationFlag,
@@ -1107,6 +1109,7 @@ async fn download_one_inner(
             return Ok(DownloadStatus::Cancelled);
         }
 
+        let is_css = is_css_document(&record, &job.local_path);
         retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
             && is_unusable_html_capture(&body.html_for_inspection());
 		let text = if options.rewrite_links && should_rewrite_as_text(&record, &job.local_path) {
@@ -1114,7 +1117,7 @@ async fn download_one_inner(
 				decode_text(
 					&body.bytes,
 					body.content_type.as_deref(),
-					is_css_mimetype(&record.mimetype),
+					is_css,
 				)
 				.with_context(|| format!("failed to decode {}", record.original))?,
 			)
@@ -1123,7 +1126,7 @@ async fn download_one_inner(
 		};
 
 		let extra_download_refs = if let Some(text) = text.as_deref() {
-            extract_related_references(text, &Url::parse(&record.original)?, mapper, is_css_mimetype(&record.mimetype))?
+            extract_related_references(text, &Url::parse(&record.original)?, mapper, is_css)?
         } else {
             Vec::new()
         };
@@ -1156,11 +1159,15 @@ async fn download_one_inner(
                 known_paths,
                 mapper,
             )?;
-            let rewritten = if is_css_mimetype(&record.mimetype) {
+            let mut rewritten = if is_css {
                 rewrite_css(text, &context)
             } else {
                 rewrite_html(text, &context)?
             };
+            if !is_css && options.add_wayback_comment {
+                let replay_url = wayback_replay_url(archive_root, &record)?;
+                rewritten = insert_wayback_source_comment(&rewritten, replay_url.as_str());
+            }
 			write_bytes_atomic(&destination, &utf8_bytes(rewritten)).await?;
 			fallback_options.recovery.record(CaptureEvent {
 				record, local_path: job.local_path.clone(),
@@ -3483,6 +3490,15 @@ fn compact_identity_text(input: &str) -> String {
         .collect()
 }
 
+fn is_css_document(record: &CdxRecord, local_path: &Path) -> bool {
+    is_css_mimetype(&record.mimetype)
+        || (!is_html_mimetype(&record.mimetype)
+            && local_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("css")))
+}
+
 fn should_rewrite_as_text(record: &CdxRecord, local_path: &Path) -> bool {
     is_html_mimetype(&record.mimetype)
         || is_css_mimetype(&record.mimetype)
@@ -3687,6 +3703,132 @@ pub fn snapshot_url(archive_root: &Url, record: &CdxRecord) -> Result<Url> {
     archive_root
         .join(&format!("/web/{}id_/{}", record.timestamp, record.original))
         .context("failed to build Wayback snapshot URL")
+}
+
+/// Builds the browseable Wayback Machine replay URL for an archived capture.
+pub fn wayback_replay_url(archive_root: &Url, record: &CdxRecord) -> Result<Url> {
+    archive_root
+        .join(&format!("/web/{}/{}", record.timestamp, record.original))
+        .context("failed to build Wayback replay URL")
+}
+
+/// Inserts a non-visible Wayback Machine provenance comment at the top of an HTML document.
+///
+/// Places the comment right after any leading XML declaration and `<!DOCTYPE ...>` prologue
+/// so browsers remain in standards mode and XHTML prologues stay well-formed.
+pub fn insert_wayback_source_comment(html: &str, replay_url: &str) -> String {
+    let comment = format!(
+        "<!-- Archived from Wayback Machine: {} -->",
+        sanitize_html_comment_url(replay_url)
+    );
+    let insert_at = html_prologue_end(html);
+    let (prefix, rest) = html.split_at(insert_at);
+    if rest.trim_start_matches(['\r', '\n']).starts_with(&comment) {
+        return html.to_owned();
+    }
+
+    let mut output = String::with_capacity(html.len() + comment.len() + 4);
+    output.push_str(prefix);
+    if prefix.is_empty() || prefix == "\u{feff}" {
+        output.push_str(&comment);
+        output.push('\n');
+        output.push_str(rest);
+    } else if rest.starts_with("\r\n") {
+        output.push_str("\r\n");
+        output.push_str(&comment);
+        output.push_str(rest);
+    } else if rest.starts_with('\n') {
+        output.push('\n');
+        output.push_str(&comment);
+        output.push_str(rest);
+    } else {
+        output.push('\n');
+        output.push_str(&comment);
+        output.push('\n');
+        output.push_str(rest);
+    }
+    output
+}
+
+/// Percent-encodes comment-breaking sequences so archived URLs cannot close `<!-- ... -->`.
+fn sanitize_html_comment_url(url: &str) -> String {
+    url.replace("--", "%2D%2D")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Returns the byte offset right after any leading BOM, XML declaration, and `<!DOCTYPE ...>`.
+fn html_prologue_end(html: &str) -> usize {
+    let mut pos = if html.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+
+    let after_ws = skip_ascii_whitespace(html, pos);
+    if let Some(xml_end) = xml_declaration_end(html, after_ws) {
+        pos = xml_end;
+    }
+
+    let after_ws = skip_ascii_whitespace(html, pos);
+    if let Some(doctype_end) = doctype_declaration_end(html, after_ws) {
+        pos = doctype_end;
+    }
+
+    pos
+}
+
+fn skip_ascii_whitespace(input: &str, start: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn xml_declaration_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = &input.as_bytes()[start..];
+    if bytes.len() < 5 || !bytes[..5].eq_ignore_ascii_case(b"<?xml") {
+        return None;
+    }
+    let next = *bytes.get(5)?;
+    if !next.is_ascii_whitespace() && next != b'?' {
+        return None;
+    }
+    let close = input[start + 5..].find("?>")?;
+    Some(start + 5 + close + 2)
+}
+
+fn doctype_declaration_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = &input.as_bytes()[start..];
+    if bytes.len() < 9 || !bytes[..9].eq_ignore_ascii_case(b"<!doctype") {
+        return None;
+    }
+    let next = *bytes.get(9)?;
+    if !next.is_ascii_whitespace() && next != b'>' {
+        return None;
+    }
+    let mut quote: Option<u8> = None;
+    let mut bracket_depth = 0usize;
+    for (offset, &byte) in bytes.iter().enumerate().skip(9) {
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'>' if bracket_depth == 0 => return Some(start + offset + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub fn build_client(
@@ -4466,6 +4608,7 @@ mod tests {
                 no_clobber: true,
                 recover_existing: false,
                 rewrite_links: true,
+                add_wayback_comment: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -4478,5 +4621,106 @@ mod tests {
         assert_eq!(report.aliases_created, 1);
         assert_eq!(report.linked_files_unavailable, 0);
         assert_eq!(report.missing_local_links, 0);
+    }
+
+    #[test]
+    fn wayback_replay_url_uses_browseable_snapshot_path() {
+        let root = Url::parse("https://web.archive.org").unwrap();
+        let record = CdxRecord {
+            timestamp: "20120805042739".into(),
+            original: "http://www.example.com:80/forums/viewtopic.php?t=42&f=3".into(),
+            mimetype: "text/html".into(),
+            status_code: 200,
+            digest: "ABC".into(),
+            length: None,
+        };
+
+        let replay = wayback_replay_url(&root, &record).unwrap();
+        assert_eq!(
+            replay.as_str(),
+            "https://web.archive.org/web/20120805042739/http://www.example.com:80/forums/viewtopic.php?t=42&f=3"
+        );
+    }
+
+    #[test]
+    fn insert_wayback_source_comment_places_after_doctype_and_xml_prologue() {
+        let url = "https://web.archive.org/web/20120805042739/http://example.com/";
+        let comment = format!("<!-- Archived from Wayback Machine: {url} -->");
+
+        assert_eq!(
+            insert_wayback_source_comment("<html><body>Hi</body></html>", url),
+            format!("{comment}\n<html><body>Hi</body></html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("<!DOCTYPE html>\n<html><body>Hi</body></html>", url),
+            format!("<!DOCTYPE html>\n{comment}\n<html><body>Hi</body></html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("<!DOCTYPE html>\r\n<html><body>Hi</body></html>", url),
+            format!("<!DOCTYPE html>\r\n{comment}\r\n<html><body>Hi</body></html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("<!DOCTYPE html><html><body>Hi</body></html>", url),
+            format!("<!DOCTYPE html>\n{comment}\n<html><body>Hi</body></html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment(
+                "  \n<!doctype HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n<html>",
+                url
+            ),
+            format!(
+                "  \n<!doctype HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n{comment}\n<html>"
+            )
+        );
+        assert_eq!(
+            insert_wayback_source_comment(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n<html>",
+                url
+            ),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n{comment}\n<html>"
+            )
+        );
+        assert_eq!(
+            insert_wayback_source_comment(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html>",
+                url
+            ),
+            format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{comment}\n<html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment(
+                "<!DOCTYPE html [ <!ENTITY foo \"bar\"> ]>\n<html>",
+                url
+            ),
+            format!("<!DOCTYPE html [ <!ENTITY foo \"bar\"> ]>\n{comment}\n<html>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("<p>\u{65e5}\u{672c} \u{1f680}</p>", url),
+            format!("{comment}\n<p>\u{65e5}\u{672c} \u{1f680}</p>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("\u{feff}<p>Hi</p>", url),
+            format!("\u{feff}{comment}\n<p>Hi</p>")
+        );
+        assert_eq!(
+            insert_wayback_source_comment("<!DOCTYPE html", url),
+            format!("{comment}\n<!DOCTYPE html")
+        );
+
+        let once = insert_wayback_source_comment("<!DOCTYPE html>\n<html></html>", url);
+        assert_eq!(insert_wayback_source_comment(&once, url), once);
+    }
+
+    #[test]
+    fn insert_wayback_source_comment_sanitizes_comment_breaking_sequences() {
+        let html = insert_wayback_source_comment(
+            "<p>Page</p>",
+            "https://web.archive.org/web/20120805042739/http://example.com/a--b---c<d>e\r\nf",
+        );
+        assert_eq!(
+            html,
+            "<!-- Archived from Wayback Machine: https://web.archive.org/web/20120805042739/http://example.com/a%2D%2Db%2D%2D-c%3Cd%3Ee%0D%0Af -->\n<p>Page</p>"
+        );
     }
 }

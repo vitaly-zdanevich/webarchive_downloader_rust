@@ -45,12 +45,21 @@ async fn default_domain_discovery_downloads_unlinked_subdomain_content() {
 		assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
 		assert_eq!(
 			std::fs::read_to_string(output.path().join("index.html")).unwrap(),
-			"<p>Main site</p>",
+			format!(
+				"<!-- Archived from Wayback Machine: {}/web/20260918000000/http://example.com/index.html -->\n<p>Main site</p>",
+				server.uri()
+			),
 		);
 		let history = output.path().join("_hosts/archive.example.com/history.html");
 		assert_eq!(history.is_file(), includes_subdomains);
 		if includes_subdomains {
-			assert_eq!(std::fs::read_to_string(history).unwrap(), "<p>Unlinked history</p>");
+			assert_eq!(
+				std::fs::read_to_string(history).unwrap(),
+				format!(
+					"<!-- Archived from Wayback Machine: {}/web/20260918000000/http://archive.example.com/history.html -->\n<p>Unlinked history</p>",
+					server.uri()
+				),
+			);
 		}
 	}
 }
@@ -189,9 +198,17 @@ async fn snapshot_retries_server_errors_before_starting_ssh() {
 		let stderr = String::from_utf8_lossy(&result.stderr);
 		assert!(result.status.success(), "{stderr}");
 		assert!(!stderr.contains("mock SSH startup failed"), "{stderr}");
+		let expected = if mime == "text/html" {
+			format!(
+				"<!-- Archived from Wayback Machine: {}/web/20260911000000/http://example.com/{name} -->\nexample archived content",
+				server.uri()
+			)
+		} else {
+			"example archived content".to_owned()
+		};
 		assert_eq!(
 			std::fs::read_to_string(output.path().join(name)).unwrap(),
-			"example archived content"
+			expected
 		);
 	}
 }
@@ -290,11 +307,17 @@ async fn completion_reports_retained_unusable_captures() {
 	assert!(stdout.contains("retained unusable captures: 1"), "{stdout}");
 	assert_eq!(
 		std::fs::read_to_string(output.path().join("blocked.html")).unwrap(),
-		blocked
+		format!(
+			"<!-- Archived from Wayback Machine: {}/web/20260911000000/http://example.com/blocked.html -->\n{blocked}",
+			server.uri()
+		)
 	);
 	assert_eq!(
 		std::fs::read_to_string(output.path().join("recovered.html")).unwrap(),
-		usable
+		format!(
+			"<!-- Archived from Wayback Machine: {}/web/20260910000000/http://example.com/recovered.html -->\n{usable}",
+			server.uri()
+		)
 	);
 }
 

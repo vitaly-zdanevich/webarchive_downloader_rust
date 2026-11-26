@@ -73,12 +73,16 @@ async fn download_and_resume_prepare_github_pages_without_clobbering_marker() {
     assert_success(&run_cli(&output, &server.uri(), &[]).await);
     assert_eq!(fs::read(&marker).unwrap(), b"");
     let history = output.join("_hosts/archive.example.com/history.html");
-    assert_eq!(fs::read_to_string(&history).unwrap(), "<p>History</p>");
+    let expected_history = format!(
+        "<!-- Archived from Wayback Machine: {}/web/20060101000000/http://archive.example.com/history.html -->\n<p>History</p>",
+        server.uri()
+    );
+    assert_eq!(fs::read_to_string(&history).unwrap(), expected_history);
 
     fs::remove_file(&marker).unwrap();
     assert_success(&run_cli(&output, &server.uri(), &[]).await);
     assert_eq!(fs::read(&marker).unwrap(), b"");
-    assert_eq!(fs::read_to_string(&history).unwrap(), "<p>History</p>");
+    assert_eq!(fs::read_to_string(&history).unwrap(), expected_history);
 
     fs::write(&marker, b"existing deployment marker\n").unwrap();
     assert_success(&run_cli(&output, &server.uri(), &["--overwrite"]).await);

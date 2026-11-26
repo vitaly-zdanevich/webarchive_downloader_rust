@@ -41,6 +41,7 @@ This is an early but working Rust CLI. It:
 - streams binary files to disk
 - recursively discovers linked pages and resources on related hosts, including pages omitted from the initial CDX result
 - rewrites common HTML and CSS links to local relative paths
+- inserts a non-visible HTML comment at the top of rewritten HTML pages with the Wayback Machine snapshot URL (disable with `--no-wayback-comment`)
 - can repair an existing output directory by fetching missing static assets that are present in Wayback
 - queries Wayback directly for missing local static assets that were not present in the initial CDX result
 - creates conservative local aliases for obvious static asset filename variants, such as `screen4.jpg` to an archived `screenshot4.jpg`
@@ -240,6 +241,7 @@ Useful options:
 --overwrite
 --recover-existing
 --no-rewrite
+--no-wayback-comment
 --no-validate-links
 --strict-validate-links
 --max-extra-download-size-mib N
@@ -315,7 +317,7 @@ waiting. CDX requests begin five seconds apart. Each 429 doubles that minimum
 spacing up to five minutes, while sustained successful requests gradually reduce
 it again.
 
-The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes.
+The downloader uses Wayback `id_` snapshot URLs so it gets archived bytes with minimal Wayback rewriting, then performs local HTML/CSS rewrites itself. The rewrite pass handles ordinary links and resources, `srcset`, inline CSS, common JavaScript URL strings, old image rollover handlers, dropdown `option` values that contain URLs, meta-refresh targets, and legacy applet/object/param resource attributes. Rewritten HTML pages also receive a non-visible `<!-- Archived from Wayback Machine: ... -->` comment at the top (after any leading XML declaration or `<!DOCTYPE ...>`), linking directly to the saved capture on Wayback Machine; pass `--no-wayback-comment` to omit it, or `--no-rewrite` to keep original archived bytes completely untouched.
 
 Before rewriting HTML/CSS, the downloader decodes text with
 [`encoding_rs`](https://docs.rs/encoding_rs/). Encoding selection checks byte-order

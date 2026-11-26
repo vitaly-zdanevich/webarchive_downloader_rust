@@ -48,6 +48,7 @@ fn options(output_dir: &Path, max_bytes: Option<u64>) -> DownloadOptions {
 		no_clobber: true,
 		recover_existing: false,
 		rewrite_links: true,
+		add_wayback_comment: true,
 		extra_download_max_bytes: max_bytes,
 		validate_links: true,
 		cancellation: CancellationFlag::new(),
@@ -560,7 +561,10 @@ async fn missing_replay_search_checks_more_than_twenty_captures() {
 	assert_eq!(report.failed, 0);
 	assert_eq!(
 		std::fs::read_to_string(output.path().join("index.html")).unwrap(),
-		body
+		format!(
+			"<!-- Archived from Wayback Machine: {}/web/20260801000000/{original} -->\n{body}",
+			server.uri()
+		)
 	);
 	let requests = server.received_requests().await.unwrap();
 	assert_eq!(requests.iter().filter(|request| request.url.path() == "/cdx/search/cdx"

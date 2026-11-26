@@ -78,6 +78,10 @@ struct Cli {
     #[arg(long)]
     no_rewrite: bool,
 
+    /// Omit the Wayback Machine snapshot URL comment normally inserted at the top of rewritten HTML pages.
+    #[arg(long)]
+    no_wayback_comment: bool,
+
     /// Skip post-download validation of generated local links.
     #[arg(long)]
     no_validate_links: bool,
@@ -227,6 +231,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
 			no_clobber: !cli.overwrite,
 			recover_existing: cli.recover_existing,
             rewrite_links: !cli.no_rewrite,
+            add_wayback_comment: !cli.no_wayback_comment,
             extra_download_max_bytes,
             validate_links: !cli.no_validate_links,
             cancellation: cancellation.clone(),
@@ -636,5 +641,19 @@ mod tests {
             format_completion_summary(Duration::from_secs(1), finished_at),
             "elapsed time: 1s\nFinished at 2026 September 12, Saturday, 00:05"
         );
+    }
+
+    #[test]
+    fn wayback_comment_is_enabled_by_default_and_disabled_by_flag() {
+        let default_cli = Cli::try_parse_from(["webarchive-downloader-rust", "example.com"]).unwrap();
+        assert!(!default_cli.no_wayback_comment);
+
+        let disabled_cli = Cli::try_parse_from([
+            "webarchive-downloader-rust",
+            "example.com",
+            "--no-wayback-comment",
+        ])
+        .unwrap();
+        assert!(disabled_cli.no_wayback_comment);
     }
 }
