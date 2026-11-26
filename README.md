@@ -245,8 +245,20 @@ Useful options:
 --max-extra-download-size-mib N
 --timeout-seconds N
 --ssh USER@HOST  (repeatable)
---user-agent "webarchive-downloader-rust/0.4.5 your-email@example.com"
+--user-agent "webarchive-downloader-rust/0.4.6 your-email@example.com"
 ```
+
+## GitHub Pages
+
+Downloads (including resumed runs), `--repair-output`, and `--repair-local-links`
+create an empty `.nojekyll` file in the output directory when it is absent.
+Keep this file at the root of your GitHub Pages publishing source: it disables
+Jekyll processing so archived paths such as `_hosts/` are published.
+Existing marker files are preserved. `--list` and `--validate-only` remain
+read-only and do not create the marker.
+
+See GitHub's [static site publishing instructions](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-github-pages-site)
+and [Jekyll file exclusions](https://docs.github.com/en/pages/setting-up-a-github-pages-site-with-jekyll/about-github-pages-and-jekyll).
 
 ## GitLab Pages
 

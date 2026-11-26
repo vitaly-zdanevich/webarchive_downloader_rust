@@ -243,6 +243,7 @@ pub async fn download_site(
                 options.output_dir.display()
             )
         })?;
+    ensure_nojekyll_marker(&options.output_dir).await?;
 
     let mut jobs = Vec::new();
     let mut seen_paths = HashSet::new();
@@ -618,6 +619,7 @@ pub struct LocalLinkRepairReport {
 /// This is explicit rather than part of resume, which promises not to overwrite files.
 pub async fn repair_local_links(root: &Path) -> Result<LocalLinkRepairReport> {
 	let root = fs::canonicalize(root).await.context("failed to open local repair directory")?;
+	ensure_nojekyll_marker(&root).await?;
 	let mut files = Vec::new();
 	collect_html_files(&root, &mut files)?;
 	files.sort();
@@ -648,6 +650,7 @@ pub async fn repair_output_dir(
                 options.output_dir.display()
             )
         })?;
+    ensure_nojekyll_marker(&options.output_dir).await?;
 
     let mut report = RepairReport {
         output_dir: options.output_dir.clone(),
@@ -3583,6 +3586,33 @@ async fn stream_response_to_file_limited(
 
 fn is_unlimited_extra_download_size(max_bytes: u64) -> bool {
     max_bytes == u64::MAX
+}
+
+/// Disables Jekyll so GitHub Pages publishes underscore-prefixed archive paths.
+///
+/// Creates an empty marker exclusively, preserving any existing regular file.
+/// Other filesystem entries and write failures must not silently leave an unusable marker.
+async fn ensure_nojekyll_marker(root: &Path) -> Result<()> {
+    let marker = root.join(".nojekyll");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&marker)
+                .await
+                .with_context(|| format!("failed to inspect {}", marker.display()))?;
+            if !metadata.is_file() {
+                bail!("GitHub Pages marker {} must be a regular file", marker.display());
+            }
+            Ok(())
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to create GitHub Pages marker {}", marker.display())),
+    }
 }
 
 async fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
