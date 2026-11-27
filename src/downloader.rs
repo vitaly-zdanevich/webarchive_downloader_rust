@@ -35,7 +35,9 @@ use crate::pathmap::{
     strip_volatile_query_params, unwrap_wayback_url,
 };
 use crate::retry::{format_retry_delay, should_try_ssh_after_status};
-use crate::rewrite::{RewriteContext, rewrite_css, rewrite_html};
+use crate::rewrite::{
+    RewriteContext, remap_local_css_paths, remap_local_html_paths, rewrite_css, rewrite_html,
+};
 use crate::soft_redirect::is_unusable_html_capture;
 use crate::text_encoding::{decode_text, utf8_bytes};
 use crate::wayback_client::WaybackClient;
@@ -299,9 +301,11 @@ pub async fn download_site(
         ..DownloadReport::default()
     };
     let mut extra_download_refs = HashSet::new();
+    let mut rewritten_files: Vec<(PathBuf, RewrittenDocumentKind)> = Vec::new();
 
     let primary_total = jobs.len();
     for (index, job) in jobs.into_iter().enumerate() {
+        let local_path = job.local_path.clone();
         let result = download_one(
             &client,
             &mapper,
@@ -316,10 +320,14 @@ pub async fn download_site(
             Ok(DownloadStatus::Downloaded {
                 extra_download_refs: refs,
                 retained_unusable,
+                rewritten,
             }) => {
                 report.downloaded += 1;
                 report.retained_unusable_captures += usize::from(retained_unusable);
                 extra_download_refs.extend(refs);
+                if let Some(kind) = rewritten {
+                    rewritten_files.push((local_path, kind));
+                }
             }
             Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
                 report.skipped += 1;
@@ -346,6 +354,7 @@ pub async fn download_site(
     if options.rewrite_links && report.cancelled == 0 {
         if let Some(max_bytes) = options.extra_download_max_bytes {
 			let mut checked_references = HashSet::new();
+			let mut candidate_remappings: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
 			while !extra_download_refs.is_empty() && !options.cancellation.is_cancelled() {
 				extra_download_refs.retain(|reference| {
 					checked_references.insert(canonical_extra_reference_key(&mapper, reference))
@@ -366,6 +375,7 @@ pub async fn download_site(
 				)
 				.await?;
 				extra_download_refs.clear();
+				merge_candidate_remappings(&mut candidate_remappings, extra_resolution.remappings);
 				if !extra_resolution.jobs.is_empty() {
 					if is_unlimited_extra_download_size(max_bytes) {
 						println!("selected {} linked files without size cap", extra_resolution.jobs.len());
@@ -383,6 +393,7 @@ pub async fn download_site(
 				report.linked_files_unavailable += extra_resolution.unavailable;
 
 				for job in extra_resolution.jobs {
+					let local_path = job.local_path.clone();
 					let result = download_one(
 						&client,
 						&mapper,
@@ -394,11 +405,18 @@ pub async fn download_site(
 					)
 					.await;
 					match result {
-						Ok(DownloadStatus::Downloaded { retained_unusable, extra_download_refs: refs }) => {
+						Ok(DownloadStatus::Downloaded {
+							retained_unusable,
+							extra_download_refs: refs,
+							rewritten,
+						}) => {
 							report.downloaded += 1;
 							report.retained_unusable_captures += usize::from(retained_unusable);
 							report.extra_downloads += 1;
 							extra_download_refs.extend(refs);
+							if let Some(kind) = rewritten {
+								rewritten_files.push((local_path, kind));
+							}
 						}
 						Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
 							report.skipped += 1;
@@ -434,6 +452,27 @@ pub async fn download_site(
 							"created {redirect_aliases} local redirects from archived 3xx captures"
 						);
 						report.aliases_created += redirect_aliases;
+					}
+				}
+			}
+
+			if !candidate_remappings.is_empty()
+				&& !rewritten_files.is_empty()
+				&& !options.cancellation.is_cancelled()
+			{
+				let confirmed =
+					confirm_late_path_remappings(&options.output_dir, candidate_remappings).await?;
+				if !confirmed.is_empty() {
+					let updated = apply_late_path_remappings(
+						&options.output_dir,
+						&rewritten_files,
+						&confirmed,
+					)
+					.await?;
+					if updated > 0 {
+						println!(
+							"updated {updated} files after late extra-download path discovery"
+						);
 					}
 				}
 			}
@@ -946,9 +985,19 @@ fn filter_archive_noise(records: &mut Vec<CdxRecord>) -> usize {
     before - records.len()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RewrittenDocumentKind {
+    Html,
+    Css,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DownloadStatus {
-    Downloaded { extra_download_refs: Vec<String>, retained_unusable: bool },
+    Downloaded {
+        extra_download_refs: Vec<String>,
+        retained_unusable: bool,
+        rewritten: Option<RewrittenDocumentKind>,
+    },
     Skipped { extra_download_refs: Vec<String> },
     SizeLimitExceeded,
     Cancelled,
@@ -1155,6 +1204,11 @@ async fn download_one_inner(
             return Ok(DownloadStatus::Downloaded {
                 extra_download_refs,
                 retained_unusable,
+                rewritten: Some(if is_css {
+                    RewrittenDocumentKind::Css
+                } else {
+                    RewrittenDocumentKind::Html
+                }),
             });
         } else {
             write_bytes_atomic(&destination, &body.bytes).await?;
@@ -1197,6 +1251,7 @@ async fn download_one_inner(
     Ok(DownloadStatus::Downloaded {
         extra_download_refs: Vec::new(),
         retained_unusable,
+        rewritten: None,
     })
 }
 
@@ -1206,7 +1261,102 @@ const MAX_ARCHIVED_REDIRECT_HOPS: usize = 5;
 struct ExtraDownloadResolution {
     jobs: Vec<DownloadJob>,
     redirects: Vec<PendingArchivedRedirect>,
+    remappings: Vec<(PathBuf, PathBuf)>,
     unavailable: usize,
+}
+
+fn record_fallback_path_remappings(
+    mapper: &SiteMapper,
+    url: &str,
+    actual_path: &Path,
+    remappings: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    for fallback_mime in ["application/octet-stream", "text/html"] {
+        if let Ok(fallback_path) = mapper.local_path_for_url(url, fallback_mime)
+            && fallback_path != actual_path
+        {
+            remappings.push((fallback_path, actual_path.to_path_buf()));
+        }
+    }
+}
+
+fn merge_candidate_remappings(
+    target: &mut HashMap<PathBuf, Option<PathBuf>>,
+    remappings: Vec<(PathBuf, PathBuf)>,
+) {
+    for (stale, actual) in remappings {
+        match target.entry(stale) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Some(actual));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if slot.get().as_ref().is_some_and(|existing| existing != &actual) {
+                    slot.insert(None);
+                }
+            }
+        }
+    }
+}
+
+async fn confirm_late_path_remappings(
+    output_dir: &Path,
+    candidates: HashMap<PathBuf, Option<PathBuf>>,
+) -> Result<HashMap<PathBuf, PathBuf>> {
+    let mut confirmed = HashMap::new();
+    for (stale, actual) in candidates {
+        let Some(actual) = actual else {
+            continue;
+        };
+        if stale == actual {
+            continue;
+        }
+        if output_dir.join(&stale).is_file() {
+            continue;
+        }
+        if !has_non_empty_file(&output_dir.join(&actual)).await? {
+            continue;
+        }
+        confirmed.insert(stale, actual);
+    }
+    Ok(confirmed)
+}
+
+async fn apply_late_path_remappings(
+    output_dir: &Path,
+    rewritten_files: &[(PathBuf, RewrittenDocumentKind)],
+    remapped_paths: &HashMap<PathBuf, PathBuf>,
+) -> Result<usize> {
+    let mut visited = HashSet::new();
+    let mut updated_files = 0usize;
+    for (local_path, kind) in rewritten_files {
+        if !visited.insert(local_path) {
+            continue;
+        }
+        let full_path = output_dir.join(local_path);
+        if !full_path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&full_path)
+            .await
+            .with_context(|| format!("failed to read {}", full_path.display()))?;
+        let Ok(input) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let updated = match kind {
+            RewrittenDocumentKind::Html => {
+                remap_local_html_paths(&input, local_path, remapped_paths)
+                    .with_context(|| format!("failed to remap HTML links in {}", full_path.display()))?
+            }
+            RewrittenDocumentKind::Css => {
+                remap_local_css_paths(&input, local_path, remapped_paths)
+            }
+        };
+        if let Some(updated) = updated {
+            write_bytes_atomic(&full_path, &utf8_bytes(updated)).await?;
+            updated_files += 1;
+        }
+    }
+    Ok(updated_files)
 }
 
 #[derive(Clone, Debug)]
@@ -1277,6 +1427,18 @@ async fn resolve_extra_download_jobs(
         match lookup {
             ExtraDownloadOutcome::Direct(record) => {
                 let local_path = mapper.local_path_for_url(&record.original, &record.mimetype)?;
+                record_fallback_path_remappings(
+                    mapper,
+                    &reference,
+                    &local_path,
+                    &mut resolution.remappings,
+                );
+                record_fallback_path_remappings(
+                    mapper,
+                    &record.original,
+                    &local_path,
+                    &mut resolution.remappings,
+                );
                 known_paths.insert(lookup_key, local_path.clone());
                 known_paths.insert(normalize_lookup_url(&record.original), local_path.clone());
                 if seen_paths.insert(local_path.clone()) {
@@ -1295,6 +1457,18 @@ async fn resolve_extra_download_jobs(
                     mapper.local_path_for_url(&final_record.original, &final_record.mimetype)?;
                 let source_local_path =
                     mapper.local_path_for_url(&reference, &final_record.mimetype)?;
+                record_fallback_path_remappings(
+                    mapper,
+                    &reference,
+                    &source_local_path,
+                    &mut resolution.remappings,
+                );
+                record_fallback_path_remappings(
+                    mapper,
+                    &final_record.original,
+                    &target_local_path,
+                    &mut resolution.remappings,
+                );
                 known_paths.insert(
                     normalize_lookup_url(&final_record.original),
                     target_local_path.clone(),
@@ -1325,6 +1499,12 @@ async fn resolve_extra_download_jobs(
                     "application/octet-stream"
                 };
                 let source_local_path = mapper.local_path_for_url(&reference, target_mime)?;
+                record_fallback_path_remappings(
+                    mapper,
+                    &reference,
+                    &source_local_path,
+                    &mut resolution.remappings,
+                );
                 known_paths.insert(lookup_key, source_local_path.clone());
                 if source_local_path != target_local_path && seen_paths.insert(source_local_path.clone()) {
                     resolution.redirects.push(PendingArchivedRedirect {
@@ -5743,5 +5923,219 @@ mod tests {
         let saved_page = std::fs::read_to_string(output.path().join("archive/old.html")).unwrap();
         assert!(!saved_page.contains("<base"), "{saved_page}");
         assert!(saved_page.contains(r#"src="../sub/dir/logo.gif""#), "{saved_page}");
+    }
+
+    /// When extra-download waves resolve resources whose real MIME type yields a different local
+    /// filename than the earlier fallback guess, referring HTML and CSS files must be updated.
+    #[tokio::test]
+    async fn download_site_updates_stale_fallback_links_after_late_extra_discovery() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let page_url = "http://example.com/sub/index.html";
+        let photo_url = "http://example.com/photo";
+        let thumb_url = "http://example.com/thumb.php?id=5";
+        let style_url = "http://example.com/style.php?id=1";
+        let bg_url = "http://example.com/bg";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {page_url} text/html 200 PAGE 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (url, mime, digest, len) in [
+            (photo_url, "image/jpeg", "PHOTO", 4),
+            (thumb_url, "image/jpeg", "THUMB", 4),
+            (style_url, "text/css", "STYLE", 35),
+            (bg_url, "image/png", "BG", 4),
+        ] {
+            Mock::given(path("/cdx/search/cdx"))
+                .and(query_param("matchType", "exact"))
+                .and(query_param("url", url))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "{timestamp} {url} {mime} 200 {digest} {len}\n"
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path(format!("/web/{timestamp}id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                r#"<!DOCTYPE html><html><head><link rel="stylesheet" href="/style.php?id=1"></head>"#,
+                r#"<body><img src="/photo"><img src="/thumb.php?id=5"></body></html>"#,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{photo_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xd9".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/http://example.com/thumb.php")))
+            .and(query_param("id", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xd9".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/http://example.com/style.php")))
+            .and(query_param("id", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body { background: url(/bg); }"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{bg_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNG".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let expected_thumb = mapper.local_path_for_url(thumb_url, "image/jpeg").unwrap();
+        let expected_style = mapper.local_path_for_url(style_url, "text/css").unwrap();
+
+        let report = download_site(
+            build_client("late-path-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            mapper,
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 5);
+        assert_eq!(report.extra_downloads, 4);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("photo.jpg").is_file());
+        assert!(output.path().join(&expected_thumb).is_file());
+        assert!(output.path().join(&expected_style).is_file());
+        assert!(output.path().join("bg.png").is_file());
+
+        let saved_page = std::fs::read_to_string(output.path().join("sub/index.html")).unwrap();
+        assert!(
+            saved_page.contains("Archived from Wayback Machine:"),
+            "{saved_page}"
+        );
+        assert!(saved_page.contains(r#"src="../photo.jpg""#), "{saved_page}");
+        assert!(
+            saved_page.contains(&format!(r#"src="../{}""#, expected_thumb.display())),
+            "{saved_page}"
+        );
+        assert!(
+            saved_page.contains(&format!(r#"href="../{}""#, expected_style.display())),
+            "{saved_page}"
+        );
+
+        let saved_css = std::fs::read_to_string(output.path().join(&expected_style)).unwrap();
+        assert_eq!(saved_css, "body { background: url(bg.png); }");
+    }
+
+    /// Late-discovered remapping must never redirect links away from an actual captured file
+    /// that exists at the fallback path (e.g. `photo/index.html`), while still updating
+    /// resource links (`photo` -> `photo.jpg`) when `photo` is only a directory.
+    #[tokio::test]
+    async fn download_site_never_remaps_away_from_existing_captured_file() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let index_url = "http://example.com/index.html";
+        let gallery_url = "http://example.com/photo/";
+        let photo_url = "http://example.com/photo";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 INDEX 100\n\
+                 {timestamp} {gallery_url} text/html 200 GALLERY 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", photo_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {photo_url} image/jpeg 200 PHOTO 4\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/photo/">Gallery</a><img src="/photo">"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{gallery_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<h1>Photo gallery</h1>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{photo_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xd9".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("late-path-collision-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 3);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("photo/index.html").is_file());
+        assert!(output.path().join("photo.jpg").is_file());
+        let saved_index = std::fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert!(
+            saved_index.contains(r#"href="photo/index.html""#),
+            "existing gallery page link must not be remapped: {saved_index}"
+        );
+        assert!(
+            saved_index.contains(r#"src="photo.jpg""#),
+            "extensionless image link must be remapped to photo.jpg: {saved_index}"
+        );
     }
 }

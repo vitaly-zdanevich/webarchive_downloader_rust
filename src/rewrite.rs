@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
@@ -64,6 +64,72 @@ pub enum UrlRewrite {
 enum ReferenceKind {
     Document,
     Resource,
+}
+
+trait ReferenceRewriter {
+    fn rewrite_reference(&self, value: &str, kind: ReferenceKind) -> Option<UrlRewrite>;
+    fn rewrite_embedded_html(&self, value: &str) -> Option<String>;
+}
+
+struct LocalPathRemapper<'a> {
+    current_local_path: &'a Path,
+    remapped_paths: &'a HashMap<PathBuf, PathBuf>,
+    changed: Cell<bool>,
+}
+
+impl ReferenceRewriter for RewriteContext<'_> {
+    fn rewrite_reference(&self, value: &str, kind: ReferenceKind) -> Option<UrlRewrite> {
+        self.rewrite_url_reference_as(value, kind)
+    }
+
+    fn rewrite_embedded_html(&self, value: &str) -> Option<String> {
+        let rewritten = rewrite_html(value, self).ok()?;
+        (rewritten != value).then_some(rewritten)
+    }
+}
+
+impl ReferenceRewriter for LocalPathRemapper<'_> {
+    fn rewrite_reference(&self, value: &str, _kind: ReferenceKind) -> Option<UrlRewrite> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || should_skip_reference(trimmed) {
+            return None;
+        }
+        let (without_fragment, fragment) = split_fragment(trimmed);
+        if without_fragment.is_empty()
+            || without_fragment.contains('?')
+            || without_fragment.ends_with('/')
+        {
+            return None;
+        }
+        let virtual_root = Path::new("/__webarchive_root__");
+        let from_file = virtual_root.join(self.current_local_path);
+        let resolved = crate::link_validation::resolve_local_reference(
+            virtual_root,
+            &from_file,
+            without_fragment,
+        )?;
+        let relative_target = resolved.strip_prefix(virtual_root).ok()?;
+        let actual_target = self.remapped_paths.get(relative_target)?;
+        let mut rewritten = relative_link(self.current_local_path, actual_target);
+        if let Some(fragment) = fragment {
+            rewritten.push('#');
+            rewritten.push_str(fragment);
+        }
+        if rewritten == value {
+            return None;
+        }
+        self.changed.set(true);
+        Some(UrlRewrite::Rewrite(rewritten))
+    }
+
+    fn rewrite_embedded_html(&self, value: &str) -> Option<String> {
+        let rewritten =
+            remap_local_html_paths(value, self.current_local_path, self.remapped_paths)
+                .ok()
+                .flatten()?;
+        self.changed.set(true);
+        Some(rewritten)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -468,14 +534,24 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
 ///
 /// CSS tokens preserve quoting and correctly distinguish escaped URLs from comments or strings.
 pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
+	rewrite_css_references(input, context, true)
+}
+
+fn rewrite_css_references<R: ReferenceRewriter>(
+	input: &str,
+	rewriter: &R,
+	normalize_charset: bool,
+) -> String {
 	let mut rewritten = String::with_capacity(input.len());
 	let mut offset = 0;
-	if let Some((_, end)) = crate::text_encoding::css_charset(input) {
+	if normalize_charset && let Some((_, end)) = crate::text_encoding::css_charset(input) {
 		rewritten.push_str("@charset \"UTF-8\";");
 		offset = end;
 	}
 	for reference in crate::css_refs::references(input) {
-		if let Some(UrlRewrite::Rewrite(value)) = context.rewrite_url_reference(&reference.value) {
+		if let Some(UrlRewrite::Rewrite(value)) =
+			rewriter.rewrite_reference(&reference.value, ReferenceKind::Resource)
+		{
 			rewritten.push_str(&input[offset..reference.range.start]);
 			rewritten.push_str(&reference.replacement(&value));
 			offset = reference.range.end;
@@ -483,6 +559,167 @@ pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
 	}
 	rewritten.push_str(&input[offset..]);
 	rewritten
+}
+
+/// Updates already-rewritten local references in one CSS document when late extra-download
+/// discovery resolves a fallback path to a different on-disk filename.
+///
+/// Returns `None` when no reference changed so untouched files stay unmodified.
+pub(crate) fn remap_local_css_paths(
+	input: &str,
+	current_local_path: &Path,
+	remapped_paths: &HashMap<PathBuf, PathBuf>,
+) -> Option<String> {
+	let remapper = LocalPathRemapper {
+		current_local_path,
+		remapped_paths,
+		changed: Cell::new(false),
+	};
+	let rewritten = rewrite_css_references(input, &remapper, false);
+	remapper.changed.get().then_some(rewritten)
+}
+
+/// Updates already-rewritten local references in one HTML document when late extra-download
+/// discovery resolves a fallback path to a different on-disk filename.
+///
+/// Returns `Ok(None)` when no reference changed so untouched files stay unmodified.
+pub(crate) fn remap_local_html_paths(
+	input: &str,
+	current_local_path: &Path,
+	remapped_paths: &HashMap<PathBuf, PathBuf>,
+) -> Result<Option<String>> {
+	let remapper = LocalPathRemapper {
+		current_local_path,
+		remapped_paths,
+		changed: Cell::new(false),
+	};
+	let remapper_ref = &remapper;
+	let mut output = Vec::with_capacity(input.len());
+	let mut style_text = String::new();
+	let mut script_text = String::new();
+	let javascript_script = Rc::new(Cell::new(true));
+	let settings = Settings {
+		element_content_handlers: vec![
+			element!("script", {
+				let javascript_script = Rc::clone(&javascript_script);
+				move |element| {
+					javascript_script.set(crate::javascript::is_javascript_element(element));
+					Ok(())
+				}
+			}),
+			attr_rewriter!("a[href]", "href", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("blockquote[cite]", "cite", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("q[cite]", "cite", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("del[cite]", "cite", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("ins[cite]", "cite", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("area[href]", "href", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("audio[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("embed[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("form[action]", "action", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("frame[src]", "src", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("iframe[src]", "src", remapper_ref, ReferenceKind::Document),
+			attr_rewriter!("img[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("input[src]", "src", remapper_ref, ReferenceKind::Resource),
+			element!("link[href]", move |element| {
+				let kind = link_reference_kind(element);
+				rewrite_attr_url(element, "href", remapper_ref, kind);
+				Ok(())
+			}),
+			attr_rewriter!("object[data]", "data", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("script[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("source[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("track[src]", "src", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("video[poster]", "poster", remapper_ref, ReferenceKind::Resource),
+			attr_rewriter!("video[src]", "src", remapper_ref, ReferenceKind::Resource),
+			guarded_attr_rewriter!("applet[code]", "code", remapper_ref, ReferenceKind::Resource),
+			guarded_attr_rewriter!(
+				"object[codebase]",
+				"codebase",
+				remapper_ref,
+				ReferenceKind::Document
+			),
+			guarded_attr_rewriter!("option[value]", "value", remapper_ref, ReferenceKind::Document),
+			guarded_attr_rewriter!("param[value]", "value", remapper_ref, ReferenceKind::Resource),
+			element!("*[srcset]", move |element| {
+				rewrite_attr_srcset(element, "srcset", remapper_ref);
+				Ok(())
+			}),
+			element!("applet[archive]", move |element| {
+				rewrite_attr_comma_separated_urls(
+					element,
+					"archive",
+					remapper_ref,
+					ReferenceKind::Resource,
+				);
+				Ok(())
+			}),
+			attr_rewriter!(
+				"*[background]",
+				"background",
+				remapper_ref,
+				ReferenceKind::Resource
+			),
+			element!("meta[http-equiv][content]", move |element| {
+				rewrite_meta_refresh(element, remapper_ref);
+				Ok(())
+			}),
+			element!("*[style]", move |element| {
+				rewrite_attr_css(element, "style", remapper_ref);
+				Ok(())
+			}),
+			js_attr_rewriter!("*[onclick]", "onclick", remapper_ref),
+			js_attr_rewriter!("*[onload]", "onload", remapper_ref),
+			js_attr_rewriter!("*[onmousedown]", "onmousedown", remapper_ref),
+			js_attr_rewriter!("*[onmouseover]", "onmouseover", remapper_ref),
+			js_attr_rewriter!("*[onmouseout]", "onmouseout", remapper_ref),
+			js_attr_rewriter!("*[onmouseup]", "onmouseup", remapper_ref),
+			js_attr_rewriter!("*[onfocus]", "onfocus", remapper_ref),
+			js_attr_rewriter!("*[onblur]", "onblur", remapper_ref),
+			js_attr_rewriter!("*[onchange]", "onchange", remapper_ref),
+			text!("style", move |chunk| {
+				style_text.push_str(chunk.as_str());
+				if chunk.last_in_text_node() {
+					let rewritten = rewrite_css_references(&style_text, remapper_ref, false);
+					chunk.replace(&rewritten, ContentType::Html);
+					style_text.clear();
+				} else {
+					chunk.remove();
+				}
+				Ok(())
+			}),
+			text!("script", move |chunk| {
+				script_text.push_str(chunk.as_str());
+				if chunk.last_in_text_node() {
+					let rewritten = if javascript_script.get() {
+						rewrite_javascript_string_urls(&script_text, remapper_ref)
+					} else {
+						script_text.clone()
+					};
+					chunk.replace(&rewritten, ContentType::Html);
+					script_text.clear();
+				} else {
+					chunk.remove();
+				}
+				Ok(())
+			}),
+		],
+		..Settings::default()
+	};
+
+	let mut rewriter = HtmlRewriter::new(settings, |chunk: &[u8]| output.extend_from_slice(chunk));
+	rewriter
+		.write(input.as_bytes())
+		.context("failed to remap HTML references")?;
+	rewriter
+		.end()
+		.context("failed to finish HTML reference remapping")?;
+
+	if !remapper.changed.get() {
+		return Ok(None);
+	}
+	String::from_utf8(output)
+		.context("remapped HTML is not valid UTF-8")
+		.map(Some)
 }
 
 fn link_reference_kind(element: &Element<'_, '_>) -> ReferenceKind {
@@ -546,16 +783,16 @@ fn link_reference_kind(element: &Element<'_, '_>) -> ReferenceKind {
     }
 }
 
-fn rewrite_attr_url(
+fn rewrite_attr_url<R: ReferenceRewriter>(
     element: &mut Element<'_, '_>,
     attr: &str,
-    context: &RewriteContext<'_>,
+    rewriter: &R,
     kind: ReferenceKind,
 ) {
     let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
-    match context.rewrite_url_reference_as(&value, kind) {
+    match rewriter.rewrite_reference(&value, kind) {
         Some(UrlRewrite::Rewrite(rewritten)) => {
             set_decoded_attribute(element, attr, &rewritten).ok();
         }
@@ -567,10 +804,10 @@ fn rewrite_attr_url(
 ///
 /// Legacy attributes such as `option[value]` and `param[value]` often contain
 /// arbitrary values, so this avoids treating labels like `Action` as paths.
-fn rewrite_attr_url_if_reference_like(
+fn rewrite_attr_url_if_reference_like<R: ReferenceRewriter>(
     element: &mut Element<'_, '_>,
     attr: &str,
-    context: &RewriteContext<'_>,
+    rewriter: &R,
     kind: ReferenceKind,
 ) {
     let Some(value) = decoded_attribute(element, attr) else {
@@ -579,7 +816,7 @@ fn rewrite_attr_url_if_reference_like(
     if !looks_like_url_reference_or_file(&value) {
         return;
     }
-    match context.rewrite_url_reference_as(&value, kind) {
+    match rewriter.rewrite_reference(&value, kind) {
         Some(UrlRewrite::Rewrite(rewritten)) => {
             set_decoded_attribute(element, attr, &rewritten).ok();
         }
@@ -587,11 +824,15 @@ fn rewrite_attr_url_if_reference_like(
     }
 }
 
-fn rewrite_attr_srcset(element: &mut Element<'_, '_>, attr: &str, context: &RewriteContext<'_>) {
+fn rewrite_attr_srcset<R: ReferenceRewriter>(
+    element: &mut Element<'_, '_>,
+    attr: &str,
+    rewriter: &R,
+) {
     let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
-    let Some(rewritten) = rewrite_srcset(&value, context) else {
+    let Some(rewritten) = rewrite_srcset(&value, rewriter) else {
         return;
     };
     if rewritten.is_empty() {
@@ -601,7 +842,7 @@ fn rewrite_attr_srcset(element: &mut Element<'_, '_>, attr: &str, context: &Rewr
     }
 }
 
-fn rewrite_srcset(input: &str, context: &RewriteContext<'_>) -> Option<String> {
+fn rewrite_srcset<R: ReferenceRewriter>(input: &str, rewriter: &R) -> Option<String> {
     let mut changed = false;
     let mut candidates = Vec::new();
 
@@ -612,7 +853,7 @@ fn rewrite_srcset(input: &str, context: &RewriteContext<'_>) -> Option<String> {
         }
         let url_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
         let (url, descriptor) = trimmed.split_at(url_end);
-        match context.rewrite_url_reference(url) {
+        match rewriter.rewrite_reference(url, ReferenceKind::Resource) {
             Some(UrlRewrite::Rewrite(rewritten)) => {
                 changed = true;
                 candidates.push(format!("{rewritten}{descriptor}"));
@@ -625,10 +866,10 @@ fn rewrite_srcset(input: &str, context: &RewriteContext<'_>) -> Option<String> {
 }
 
 /// Rewrites comma-separated legacy URL lists such as `applet archive`.
-fn rewrite_attr_comma_separated_urls(
+fn rewrite_attr_comma_separated_urls<R: ReferenceRewriter>(
     element: &mut Element<'_, '_>,
     attr: &str,
-    context: &RewriteContext<'_>,
+    rewriter: &R,
     kind: ReferenceKind,
 ) {
     let Some(value) = decoded_attribute(element, attr) else {
@@ -641,7 +882,7 @@ fn rewrite_attr_comma_separated_urls(
         if trimmed.is_empty() {
             continue;
         }
-        match context.rewrite_url_reference_as(trimmed, kind) {
+        match rewriter.rewrite_reference(trimmed, kind) {
             Some(UrlRewrite::Rewrite(rewritten)) => {
                 changed = true;
                 rewritten_values.push(rewritten);
@@ -659,7 +900,7 @@ fn rewrite_attr_comma_separated_urls(
 }
 
 /// Rewrites `meta http-equiv=refresh` targets while preserving the delay prefix.
-fn rewrite_meta_refresh(element: &mut Element<'_, '_>, context: &RewriteContext<'_>) {
+fn rewrite_meta_refresh<R: ReferenceRewriter>(element: &mut Element<'_, '_>, rewriter: &R) {
     let Some(http_equiv) = element.get_attribute("http-equiv") else {
         return;
     };
@@ -669,13 +910,16 @@ fn rewrite_meta_refresh(element: &mut Element<'_, '_>, context: &RewriteContext<
     let Some(content) = decoded_attribute(element, "content") else {
         return;
     };
-    let Some(rewritten) = rewrite_meta_refresh_content(&content, context) else {
+    let Some(rewritten) = rewrite_meta_refresh_content(&content, rewriter) else {
         return;
     };
     set_decoded_attribute(element, "content", &rewritten).ok();
 }
 
-fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Option<String> {
+fn rewrite_meta_refresh_content<R: ReferenceRewriter>(
+    input: &str,
+    rewriter: &R,
+) -> Option<String> {
     let lower = input.to_ascii_lowercase();
     let url_marker = lower.find("url=")?;
     let value_start = url_marker + 4;
@@ -705,8 +949,7 @@ fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Op
             (None, &rest[..end], &rest[end..])
         };
 
-    let UrlRewrite::Rewrite(rewritten) =
-        context.rewrite_url_reference_as(url, ReferenceKind::Document)?;
+    let UrlRewrite::Rewrite(rewritten) = rewriter.rewrite_reference(url, ReferenceKind::Document)?;
     let mut output = String::with_capacity(input.len());
     output.push_str(&input[..value_start]);
     if let Some(quote) = quote {
@@ -720,26 +963,30 @@ fn rewrite_meta_refresh_content(input: &str, context: &RewriteContext<'_>) -> Op
     Some(output)
 }
 
-fn rewrite_attr_css(element: &mut Element<'_, '_>, attr: &str, context: &RewriteContext<'_>) {
+fn rewrite_attr_css<R: ReferenceRewriter>(
+    element: &mut Element<'_, '_>,
+    attr: &str,
+    rewriter: &R,
+) {
     let Some(value) = decoded_attribute(element, attr) else {
         return;
     };
-    let rewritten = rewrite_css(&value, context);
+    let rewritten = rewrite_css_references(&value, rewriter, false);
     if rewritten != value {
         set_decoded_attribute(element, attr, &rewritten).ok();
     }
 }
 
-fn rewrite_attr_javascript_urls(
+fn rewrite_attr_javascript_urls<R: ReferenceRewriter>(
 	element: &mut Element<'_, '_>,
 	attr: &str,
-	context: &RewriteContext<'_>,
+	rewriter: &R,
 ) {
 	let Some(value) = element.get_attribute(attr) else {
 		return;
 	};
 	let decoded = html_escape::decode_html_entities(&value);
-	let rewritten = rewrite_javascript_string_urls(&decoded, context);
+	let rewritten = rewrite_javascript_string_urls(&decoded, rewriter);
 	if rewritten != decoded {
 		let encoded = html_escape::encode_double_quoted_attribute(&rewritten);
 		element.set_attribute(attr, &encoded).ok();
@@ -856,18 +1103,18 @@ fn extract_rollover_image_sources_from_javascript(
 }
 
 /// Rewrites decoded literal values and escapes each edited value for its original delimiter.
-fn rewrite_javascript_string_urls(input: &str, context: &RewriteContext<'_>) -> String {
+fn rewrite_javascript_string_urls<R: ReferenceRewriter>(input: &str, rewriter: &R) -> String {
 	let mut rewritten = String::with_capacity(input.len());
 	let mut cursor = 0;
 	for literal in crate::javascript::strings(input) {
 		let value = literal.value.as_str();
 		let replacement = if !literal.is_concatenated && looks_like_javascript_url_reference(value) {
 			let kind = javascript_reference_kind(value);
-			context
-				.rewrite_url_reference_as(value, kind)
+			rewriter
+				.rewrite_reference(value, kind)
 				.map(url_rewrite_to_javascript_string)
 		} else {
-			rewrite_html_fragment_in_javascript_string(value, context)
+			rewrite_html_fragment_in_javascript_string(value, rewriter)
 		};
 
 		if let Some(replacement) = replacement.filter(|replacement| replacement != value) {
@@ -904,16 +1151,15 @@ fn url_rewrite_to_javascript_string(rewrite: UrlRewrite) -> String {
     value
 }
 
-fn rewrite_html_fragment_in_javascript_string(
+fn rewrite_html_fragment_in_javascript_string<R: ReferenceRewriter>(
     value: &str,
-    context: &RewriteContext<'_>,
+    rewriter: &R,
 ) -> Option<String> {
     if !value.contains('<') || !value.contains('>') {
         return None;
     }
 
-    let rewritten = rewrite_html(value, context).ok()?;
-    (rewritten != value).then_some(rewritten)
+    rewriter.rewrite_embedded_html(value)
 }
 
 fn looks_like_javascript_url_reference(value: &str) -> bool {
@@ -1668,6 +1914,93 @@ mod tests {
         assert!(
             empty_first_rewritten.contains(r#"src="local.gif""#),
             "an empty first <base href> must ignore later <base href> elements: {empty_first_rewritten}"
+        );
+    }
+
+    /// Late extra-download remapping must update stale fallback paths in HTML and CSS
+    /// while leaving unrelated links, comments, directory URLs, queries, and plain JS text intact.
+    #[test]
+    fn remaps_stale_local_paths_in_html_and_css_without_touching_unrelated_content() {
+        let mut remapped = HashMap::new();
+        remapped.insert(PathBuf::from("photo"), PathBuf::from("photo.jpg"));
+        remapped.insert(PathBuf::from("my photo"), PathBuf::from("my photo.jpg"));
+        remapped.insert(
+            PathBuf::from("thumb__q_abc.php"),
+            PathBuf::from("thumb.php__q_abc.jpg"),
+        );
+        remapped.insert(
+            PathBuf::from("manual/index.html"),
+            PathBuf::from("manual.pdf"),
+        );
+        remapped.insert(PathBuf::from("dir"), PathBuf::from("dir/index.html"));
+
+        let html = concat!(
+            "<!-- Saved from Wayback Machine: https://web.archive.org/web/20060101/http://example.com/sub/index.html -->\n",
+            r#"<img src="../photo" srcset="../my%20photo 1x, ../thumb__q_abc.php 2x">"#,
+            r#"<a href="../manual/index.html#sec2">Manual</a>"#,
+            r#"<a href="../photo?keep=1">Query</a>"#,
+            r#"<div style="background:url(../photo)"></div>"#,
+            r#"<style>body { background: url(../dir/); } .hero { background: url(../my%20photo); }</style>"#,
+            r#"<script>var word = 'photo'; var src = '../thumb__q_abc.php'; document.write('<img src="../photo">');</script>"#,
+        );
+
+        let updated = remap_local_html_paths(html, Path::new("sub/index.html"), &remapped)
+            .unwrap()
+            .expect("HTML should be updated");
+
+        assert!(
+            updated.starts_with("<!-- Saved from Wayback Machine:"),
+            "{updated}"
+        );
+        assert!(updated.contains(r#"src="../photo.jpg""#), "{updated}");
+        assert!(
+            updated.contains(r#"srcset="../my%20photo.jpg 1x, ../thumb.php__q_abc.jpg 2x""#),
+            "{updated}"
+        );
+        assert!(updated.contains(r#"href="../manual.pdf#sec2""#), "{updated}");
+        assert!(
+            updated.contains(r#"href="../photo?keep=1""#),
+            "query-bearing links must not be stripped: {updated}"
+        );
+        assert!(updated.contains("background:url(../photo.jpg)"), "{updated}");
+        assert!(
+            updated.contains("background: url(../dir/);"),
+            "directory-only CSS URLs must not be remapped: {updated}"
+        );
+        assert!(
+            updated.contains("background: url(../my%20photo.jpg);"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("var word = 'photo';"),
+            "plain JS text must not be remapped: {updated}"
+        );
+        assert!(
+            updated.contains("var src = '../thumb.php__q_abc.jpg';"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(r#"document.write('<img src="../photo.jpg">');"#),
+            "{updated}"
+        );
+
+        let untouched_html = r#"<img src="../existing.gif">"#;
+        assert_eq!(
+            remap_local_html_paths(untouched_html, Path::new("sub/index.html"), &remapped)
+                .unwrap(),
+            None
+        );
+
+        let css = "body { background: url(photo); } .keep { background: url(dir/); }";
+        let updated_css =
+            remap_local_css_paths(css, Path::new("style.css"), &remapped).unwrap();
+        assert_eq!(
+            updated_css,
+            "body { background: url(photo.jpg); } .keep { background: url(dir/); }"
+        );
+        assert_eq!(
+            remap_local_css_paths("body { color: red; }", Path::new("style.css"), &remapped),
+            None
         );
     }
 }
