@@ -122,6 +122,8 @@ pub struct CdxQuery {
     pub limit: Option<usize>,
     pub strategy: SnapshotStrategy,
     pub archive_root: Url,
+    /// When true, also include HTTP 3xx redirect captures alongside 200 OK captures.
+    pub include_redirects: bool,
 }
 
 impl CdxQuery {
@@ -139,6 +141,7 @@ impl CdxQuery {
             limit: None,
             strategy,
             archive_root,
+            include_redirects: false,
         }
     }
 
@@ -158,6 +161,12 @@ impl CdxQuery {
             .join("/cdx/search/cdx")
             .context("archive root must be an absolute URL")?;
 
+        let status_filter = if self.include_redirects {
+            "statuscode:(200|301|302|303|307|308)"
+        } else {
+            "statuscode:200"
+        };
+
         {
             let mut pairs = url.query_pairs_mut();
             pairs
@@ -165,7 +174,7 @@ impl CdxQuery {
                 .append_pair("matchType", self.match_type.as_cdx())
                 .append_pair("output", "txt")
                 .append_pair("fl", "urlkey,timestamp,original,mimetype,statuscode,digest,length")
-                .append_pair("filter", "statuscode:200")
+                .append_pair("filter", status_filter)
                 .append_pair("showResumeKey", "true");
 
             if let Some(from) = &self.from {
@@ -889,6 +898,10 @@ pub fn parse_cdx_line(line: &str) -> Result<CdxRecord> {
     })
 }
 
+pub fn is_redirect_status_code(status_code: u16) -> bool {
+    matches!(status_code, 301 | 302 | 303 | 307 | 308)
+}
+
 pub fn canonical_original_key(original: &str) -> String {
     let Ok(mut url) = Url::parse(original) else {
         return original.to_owned();
@@ -937,6 +950,11 @@ mod tests {
         assert!(url.contains("fl=urlkey%2Ctimestamp%2Coriginal%2Cmimetype%2Cstatuscode%2Cdigest%2Clength"));
         assert!(url.contains("filter=statuscode%3A200"));
         assert!(url.contains("showResumeKey=true"));
+
+        let mut redirect_query = query;
+        redirect_query.include_redirects = true;
+        let redirect_url = redirect_query.search_url().unwrap().to_string();
+        assert!(redirect_url.contains("filter=statuscode%3A%28200%7C301%7C302%7C303%7C307%7C308%29"), "{redirect_url}");
     }
 
     #[test]

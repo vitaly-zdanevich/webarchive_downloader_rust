@@ -39,7 +39,7 @@ This is an early but working Rust CLI. It:
 - falls back to older captures when the latest HTML capture is only a soft redirect
 - skips duplicate session-only URLs and hosting placeholder captures by default
 - streams binary files to disk
-- recursively discovers linked pages and resources on related hosts, including pages omitted from the initial CDX result
+- recursively discovers linked pages and resources on related hosts, including pages omitted from the initial CDX result and linked URLs that were only archived as HTTP 3xx redirects to related-host 200 captures
 - rewrites common HTML and CSS links to local relative paths
 - inserts a non-visible HTML comment at the top of rewritten HTML pages with the Wayback Machine snapshot URL (disable with `--no-wayback-comment`)
 - can repair an existing output directory by fetching missing static assets that are present in Wayback

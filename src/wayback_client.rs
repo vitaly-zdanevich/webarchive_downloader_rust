@@ -19,21 +19,27 @@ pub struct WaybackClient {
     inner: Arc<WaybackClientInner>,
 }
 
+#[derive(Clone)]
+struct ClientPair {
+    standard: Client,
+    no_redirect: Client,
+}
+
 struct WaybackClientInner {
-    direct: Client,
+    direct: ClientPair,
     active: Mutex<ActiveWaybackClient>,
     ssh_fallbacks: Vec<SshFallback>,
 }
 
 enum ActiveWaybackClient {
     Direct,
-    Ssh { index: usize, client: Client },
+    Ssh { index: usize, clients: ClientPair },
 }
 
 impl WaybackClient {
     /// Builds a direct client and lazily configured SSH fallback routes.
     pub fn new(user_agent: &str, timeout: Duration, ssh_destinations: Vec<String>) -> Result<Self> {
-        let direct = build_reqwest_client(user_agent, timeout, None)?;
+        let direct = build_client_pair(user_agent, timeout, None)?;
         let ssh_fallbacks = ssh_destinations
             .into_iter()
             .map(|destination| SshFallback::new(destination, user_agent.to_owned(), timeout))
@@ -50,7 +56,13 @@ impl WaybackClient {
 
     /// Creates a GET request through the currently active route.
     pub fn get(&self, url: Url) -> RequestBuilder {
-        self.active_client().get(url)
+        self.active_clients().standard.get(url)
+    }
+
+    /// Creates a GET request that does not auto-follow HTTP 3xx redirects, for inspecting
+    /// archived redirect headers safely through the currently active route.
+    pub fn get_no_redirect(&self, url: Url) -> RequestBuilder {
+        self.active_clients().no_redirect.get(url)
     }
 
     /// Activates the next SSH fallback that is not in a temporary cooldown.
@@ -125,8 +137,8 @@ impl WaybackClient {
     ) -> Result<bool> {
         for index in start_index..self.inner.ssh_fallbacks.len() {
             let ssh_fallback = &self.inner.ssh_fallbacks[index];
-            let client = match ssh_fallback.client() {
-                Ok(Some(client)) => client,
+            let clients = match ssh_fallback.clients() {
+                Ok(Some(clients)) => clients,
                 // The failure already announced this cooldown; do not repeat it per request.
                 Ok(None) => continue,
                 Err(error) => {
@@ -141,7 +153,7 @@ impl WaybackClient {
                 "Wayback unavailable via current route ({reason}); switching to SSH tunnel {}",
                 ssh_fallback.destination()
             );
-            *active = ActiveWaybackClient::Ssh { index, client };
+            *active = ActiveWaybackClient::Ssh { index, clients };
             return Ok(true);
         }
 
@@ -163,10 +175,10 @@ impl WaybackClient {
         self.inner.ssh_fallbacks[index].retry_remaining_at(Instant::now())
     }
 
-    fn active_client(&self) -> Client {
+    fn active_clients(&self) -> ClientPair {
         match &*lock_unpoisoned(&self.inner.active) {
             ActiveWaybackClient::Direct => self.inner.direct.clone(),
-            ActiveWaybackClient::Ssh { client, .. } => client.clone(),
+            ActiveWaybackClient::Ssh { clients, .. } => clients.clone(),
         }
     }
 }
@@ -179,7 +191,7 @@ struct SshFallback {
 }
 
 struct SshFallbackState {
-    client: Option<Client>,
+    clients: Option<ClientPair>,
     tunnel: Option<SshTunnel>,
     retry_at: Option<Instant>,
     consecutive_failures: usize,
@@ -200,7 +212,7 @@ impl SshFallback {
             user_agent,
             timeout,
             state: Mutex::new(SshFallbackState {
-                client: None,
+                clients: None,
                 tunnel: None,
                 retry_at: None,
                 consecutive_failures: 0,
@@ -212,22 +224,22 @@ impl SshFallback {
         &self.destination
     }
 
-    fn client(&self) -> Result<Option<Client>> {
+    fn clients(&self) -> Result<Option<ClientPair>> {
         let mut state = lock_unpoisoned(&self.state);
         if state.retry_remaining_at(Instant::now()).is_some() {
             return Ok(None);
         }
         state.retry_at = None;
-        if let Some(client) = &state.client {
-            return Ok(Some(client.clone()));
+        if let Some(clients) = &state.clients {
+            return Ok(Some(clients.clone()));
         }
 
-        match self.start_client() {
-            Ok((tunnel, client)) => {
+        match self.start_clients() {
+            Ok((tunnel, clients)) => {
                 state.tunnel = Some(tunnel);
-                state.client = Some(client.clone());
+                state.clients = Some(clients.clone());
                 state.consecutive_failures = 0;
-                Ok(Some(client))
+                Ok(Some(clients))
             }
             Err(error) => {
                 let retry_delay = state.remember_failure(Instant::now());
@@ -254,18 +266,17 @@ impl SshFallback {
         lock_unpoisoned(&self.state).retry_at = Some(Instant::now());
     }
 
-    fn start_client(&self) -> Result<(SshTunnel, Client)> {
+    fn start_clients(&self) -> Result<(SshTunnel, ClientPair)> {
         let tunnel = SshTunnel::start(&self.destination)?;
-        let proxy = Proxy::all(format!("socks5h://{}", tunnel.local_addr()))
-            .context("failed to configure SSH SOCKS proxy")?;
-        let client = build_reqwest_client(&self.user_agent, self.timeout, Some(proxy))?;
-        Ok((tunnel, client))
+        let proxy_url = format!("socks5h://{}", tunnel.local_addr());
+        let clients = build_client_pair(&self.user_agent, self.timeout, Some(&proxy_url))?;
+        Ok((tunnel, clients))
     }
 }
 
 impl SshFallbackState {
     fn remember_failure(&mut self, now: Instant) -> Duration {
-        self.client = None;
+        self.clients = None;
         self.tunnel = None;
         let delay = ssh_retry_delay(self.consecutive_failures);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -371,16 +382,41 @@ fn wait_for_ssh_tunnel(child: &mut Child, local_addr: SocketAddr, timeout: Durat
     }
 }
 
+fn build_client_pair(
+    user_agent: &str,
+    timeout: Duration,
+    proxy_url: Option<&str>,
+) -> Result<ClientPair> {
+    let standard = build_reqwest_client(
+        user_agent,
+        timeout,
+        proxy_url,
+        reqwest::redirect::Policy::limited(10),
+    )?;
+    let no_redirect = build_reqwest_client(
+        user_agent,
+        timeout,
+        proxy_url,
+        reqwest::redirect::Policy::none(),
+    )?;
+    Ok(ClientPair {
+        standard,
+        no_redirect,
+    })
+}
+
 fn build_reqwest_client(
     user_agent: &str,
     timeout: Duration,
-    proxy: Option<Proxy>,
+    proxy_url: Option<&str>,
+    redirect: reqwest::redirect::Policy,
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .user_agent(user_agent)
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(10));
-    if let Some(proxy) = proxy {
+        .redirect(redirect);
+    if let Some(proxy_url) = proxy_url {
+        let proxy = Proxy::all(proxy_url).context("failed to configure SSH SOCKS proxy")?;
         builder = builder.proxy(proxy);
     }
     builder.build().context("failed to build HTTP client")
@@ -437,7 +473,7 @@ mod tests {
 
     #[test]
     fn active_ssh_failure_temporarily_cools_fallback() {
-        let direct = build_reqwest_client(
+        let direct = build_client_pair(
             crate::DEFAULT_USER_AGENT,
             Duration::from_secs(1),
             None,
@@ -454,7 +490,7 @@ mod tests {
                 direct: direct.clone(),
                 active: Mutex::new(ActiveWaybackClient::Ssh {
                     index: 0,
-                    client: direct,
+                    clients: direct,
                 }),
                 ssh_fallbacks: vec![fallback],
             }),

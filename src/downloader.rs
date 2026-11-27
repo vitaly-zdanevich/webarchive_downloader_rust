@@ -24,7 +24,7 @@ use crate::alias_repair::{
 use crate::cdx::{
     CdxQuery, CdxRecord, CdxRetryPolicy, MAX_WAYBACK_RETRY_DELAY_SECONDS, MatchType,
     SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
-    is_cdx_connectivity_error, sort_records_for_strategy,
+    is_cdx_connectivity_error, is_redirect_status_code, sort_records_for_strategy,
 };
 use crate::download_refs::{extract_related_references, is_interactive_forum_extra_reference};
 use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
@@ -32,7 +32,7 @@ use crate::recovery::{AliasEvent, CaptureEvent, RecoveryState, record_alias_even
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
-    strip_volatile_query_params,
+    strip_volatile_query_params, unwrap_wayback_url,
 };
 use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::rewrite::{RewriteContext, rewrite_css, rewrite_html};
@@ -420,6 +420,22 @@ pub async fn download_site(
 						}
 					}
 				}
+
+				if !extra_resolution.redirects.is_empty() && !options.cancellation.is_cancelled() {
+					let redirect_aliases = materialize_archived_redirects(
+						&options.output_dir,
+						&archive_root,
+						&extra_resolution.redirects,
+						options.add_wayback_comment,
+					)
+					.await?;
+					if redirect_aliases > 0 {
+						println!(
+							"created {redirect_aliases} local redirects from archived 3xx captures"
+						);
+						report.aliases_created += redirect_aliases;
+					}
+				}
 			}
         }
 
@@ -435,7 +451,7 @@ pub async fn download_site(
             if directory_aliases > 0 {
                 println!("created {directory_aliases} local directory index aliases");
             }
-            report.aliases_created = alias_report.created + directory_aliases;
+            report.aliases_created += alias_report.created + directory_aliases;
         }
 
         if let Some(max_bytes) = options.extra_download_max_bytes
@@ -1184,10 +1200,20 @@ async fn download_one_inner(
     })
 }
 
+const MAX_ARCHIVED_REDIRECT_HOPS: usize = 5;
+
 #[derive(Clone, Debug, Default)]
 struct ExtraDownloadResolution {
     jobs: Vec<DownloadJob>,
+    redirects: Vec<PendingArchivedRedirect>,
     unavailable: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PendingArchivedRedirect {
+    redirect_record: CdxRecord,
+    source_local_path: PathBuf,
+    target_local_path: PathBuf,
 }
 
 fn canonical_extra_reference_key(mapper: &SiteMapper, reference: &str) -> String {
@@ -1240,13 +1266,16 @@ async fn resolve_extra_download_jobs(
         let lookup = find_extra_download_record(
             client,
             archive_root,
+            mapper,
             fallback_options,
+            known_paths,
             &reference,
             max_bytes,
+            cancellation,
         )
         .await?;
-        match lookup.record {
-            Some(record) => {
+        match lookup {
+            ExtraDownloadOutcome::Direct(record) => {
                 let local_path = mapper.local_path_for_url(&record.original, &record.mimetype)?;
                 known_paths.insert(lookup_key, local_path.clone());
                 known_paths.insert(normalize_lookup_url(&record.original), local_path.clone());
@@ -1258,13 +1287,149 @@ async fn resolve_extra_download_jobs(
                     });
                 }
             }
-            None => {
+            ExtraDownloadOutcome::RedirectToDownload {
+                redirect_record,
+                final_record,
+            } => {
+                let target_local_path =
+                    mapper.local_path_for_url(&final_record.original, &final_record.mimetype)?;
+                let source_local_path =
+                    mapper.local_path_for_url(&reference, &final_record.mimetype)?;
+                known_paths.insert(
+                    normalize_lookup_url(&final_record.original),
+                    target_local_path.clone(),
+                );
+                known_paths.insert(lookup_key, source_local_path.clone());
+                if seen_paths.insert(target_local_path.clone()) {
+                    resolution.jobs.push(DownloadJob {
+                        record: final_record,
+                        local_path: target_local_path.clone(),
+                        max_bytes: Some(max_bytes),
+                    });
+                }
+                if source_local_path != target_local_path && seen_paths.insert(source_local_path.clone()) {
+                    resolution.redirects.push(PendingArchivedRedirect {
+                        redirect_record,
+                        source_local_path,
+                        target_local_path,
+                    });
+                }
+            }
+            ExtraDownloadOutcome::RedirectToExisting {
+                redirect_record,
+                target_local_path,
+            } => {
+                let target_mime = if is_html_path(&target_local_path) {
+                    "text/html"
+                } else {
+                    "application/octet-stream"
+                };
+                let source_local_path = mapper.local_path_for_url(&reference, target_mime)?;
+                known_paths.insert(lookup_key, source_local_path.clone());
+                if source_local_path != target_local_path && seen_paths.insert(source_local_path.clone()) {
+                    resolution.redirects.push(PendingArchivedRedirect {
+                        redirect_record,
+                        source_local_path,
+                        target_local_path,
+                    });
+                }
+            }
+            ExtraDownloadOutcome::Unavailable => {
                 resolution.unavailable += 1;
             }
         }
     }
 
     Ok(resolution)
+}
+
+async fn materialize_archived_redirects(
+    output_dir: &Path,
+    archive_root: &Url,
+    redirects: &[PendingArchivedRedirect],
+    add_wayback_comment: bool,
+) -> Result<usize> {
+    let mut created = 0usize;
+    for redirect in redirects {
+        let target_file = output_dir.join(&redirect.target_local_path);
+        if !has_non_empty_file(&target_file).await? {
+            continue;
+        }
+        let destination = output_dir.join(&redirect.source_local_path);
+        if has_non_empty_file(&destination).await? {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        if is_html_path(&redirect.source_local_path) {
+            let relative = relative_link(&redirect.source_local_path, &redirect.target_local_path);
+            let replay_url = wayback_replay_url(archive_root, &redirect.redirect_record)?;
+            let stub = build_archived_redirect_stub(
+                redirect.redirect_record.status_code,
+                &relative,
+                replay_url.as_str(),
+                add_wayback_comment,
+            );
+            write_bytes_atomic(&destination, &utf8_bytes(stub)).await?;
+        } else {
+            fs::copy(&target_file, &destination).await.with_context(|| {
+                format!(
+                    "failed to materialize archived redirect {} from {}",
+                    destination.display(),
+                    target_file.display()
+                )
+            })?;
+        }
+        record_alias_event(
+            output_dir,
+            &AliasEvent {
+                target_path: redirect.source_local_path.clone(),
+                source_path: redirect.target_local_path.clone(),
+                reason: format!(
+                    "archived_http_{}_redirect",
+                    redirect.redirect_record.status_code
+                ),
+                replaced_unusable: false,
+                referred_from: None,
+            },
+        )?;
+        created += 1;
+    }
+    Ok(created)
+}
+
+fn build_archived_redirect_stub(
+    status_code: u16,
+    relative_target: &str,
+    replay_url: &str,
+    add_wayback_comment: bool,
+) -> String {
+    let escaped_attr = html_escape::encode_double_quoted_attribute(relative_target);
+    let escaped_text = html_escape::encode_text(relative_target);
+    let comment_line = if add_wayback_comment {
+        format!(
+            "<!-- Archived HTTP {status_code} redirect from Wayback Machine: {} -->\n",
+            sanitize_html_comment_url(replay_url)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<!DOCTYPE html>\n{comment_line}<html data-webarchive-redirect=\"{status_code}\"><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={escaped_attr}\"><title>Redirecting</title></head><body><p>Archived HTTP {status_code} redirect to <a href=\"{escaped_attr}\">{escaped_text}</a>.</p></body></html>\n"
+    )
+}
+
+fn is_html_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html")
+                || extension.eq_ignore_ascii_case("htm")
+                || extension.eq_ignore_ascii_case("xhtml")
+        })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2260,14 +2425,72 @@ async fn find_missing_static_asset_record(
     Ok(lookup)
 }
 
+enum ExtraDownloadOutcome {
+    Direct(CdxRecord),
+    RedirectToDownload {
+        redirect_record: CdxRecord,
+        final_record: CdxRecord,
+    },
+    RedirectToExisting {
+        redirect_record: CdxRecord,
+        target_local_path: PathBuf,
+    },
+    Unavailable,
+}
+
 async fn find_extra_download_record(
+    client: &WaybackClient,
+    archive_root: &Url,
+    mapper: &SiteMapper,
+    fallback_options: &FallbackOptions,
+    known_paths: &HashMap<String, PathBuf>,
+    reference: &str,
+    max_bytes: u64,
+    cancellation: &CancellationFlag,
+) -> Result<ExtraDownloadOutcome> {
+    let mut visited = HashSet::new();
+    visited.insert(normalize_lookup_url(reference));
+
+    let (direct, redirects) =
+        query_extra_download_candidates(client, archive_root, fallback_options, reference, max_bytes)
+            .await?;
+    if let Some(record) = direct {
+        return Ok(ExtraDownloadOutcome::Direct(record));
+    }
+
+    for first_redirect in redirects {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if let Some(resolved) = follow_archived_redirect_chain(
+            client,
+            archive_root,
+            mapper,
+            fallback_options,
+            known_paths,
+            first_redirect,
+            max_bytes,
+            &mut visited,
+            cancellation,
+        )
+        .await?
+        {
+            return Ok(resolved);
+        }
+    }
+
+    Ok(ExtraDownloadOutcome::Unavailable)
+}
+
+async fn query_extra_download_candidates(
     client: &WaybackClient,
     archive_root: &Url,
     fallback_options: &FallbackOptions,
     reference: &str,
     max_bytes: u64,
-) -> Result<ExtraDownloadLookup> {
-    let mut lookup = ExtraDownloadLookup::default();
+) -> Result<(Option<CdxRecord>, Vec<CdxRecord>)> {
+    let mut redirect_candidates = Vec::new();
+    let mut seen_redirects = HashSet::new();
 
     for target in extra_download_capture_targets(reference) {
         let mut query = CdxQuery::new(
@@ -2278,26 +2501,229 @@ async fn find_extra_download_record(
         );
         query.from = fallback_options.from.clone();
         query.to = fallback_options.to.clone();
+        query.include_redirects = true;
 
-        let records =
-            match recovery_records(client, &query, fallback_options).await {
-                Ok(records) => records,
-                Err(error) if is_cdx_connectivity_error(&error) => return Err(error),
-                Err(error) => {
-                    eprintln!("extra download CDX lookup failed for {target}: {error:#}");
-                    continue;
-                }
-            };
+        let records = match recovery_records(client, &query, fallback_options).await {
+            Ok(records) => records,
+            Err(error) if is_cdx_connectivity_error(&error) => return Err(error),
+            Err(error) => {
+                eprintln!("extra download CDX lookup failed for {target}: {error:#}");
+                continue;
+            }
+        };
 
+        for record in &records {
+            if record.status_code == 200 && extra_download_record_fits_limit(record, max_bytes) {
+                return Ok((Some(record.clone()), Vec::new()));
+            }
+        }
         for record in records {
-            if extra_download_record_fits_limit(&record, max_bytes) {
-                lookup.record = Some(record);
-                return Ok(lookup);
+            if is_redirect_status_code(record.status_code)
+                && seen_redirects.insert((record.timestamp.clone(), record.original.clone()))
+            {
+                redirect_candidates.push(record);
             }
         }
     }
 
-    Ok(lookup)
+    Ok((None, redirect_candidates))
+}
+
+async fn follow_archived_redirect_chain(
+    client: &WaybackClient,
+    archive_root: &Url,
+    mapper: &SiteMapper,
+    fallback_options: &FallbackOptions,
+    known_paths: &HashMap<String, PathBuf>,
+    first_redirect: CdxRecord,
+    max_bytes: u64,
+    visited: &mut HashSet<String>,
+    cancellation: &CancellationFlag,
+) -> Result<Option<ExtraDownloadOutcome>> {
+    let mut current_redirect = first_redirect.clone();
+
+    for _hop in 0..MAX_ARCHIVED_REDIRECT_HOPS {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(target_url) = fetch_archived_redirect_target(
+            client,
+            archive_root,
+            mapper,
+            &current_redirect,
+            cancellation,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(existing_path) = mapper.known_path_for_url(&target_url, known_paths) {
+            return Ok(Some(ExtraDownloadOutcome::RedirectToExisting {
+                redirect_record: first_redirect,
+                target_local_path: existing_path.clone(),
+            }));
+        }
+
+        let normalized_target = normalize_lookup_url(target_url.as_str());
+        if !visited.insert(normalized_target) {
+            return Ok(None);
+        }
+
+        let (direct, next_redirects) = query_extra_download_candidates(
+            client,
+            archive_root,
+            fallback_options,
+            target_url.as_str(),
+            max_bytes,
+        )
+        .await?;
+        if let Some(final_record) = direct {
+            return Ok(Some(ExtraDownloadOutcome::RedirectToDownload {
+                redirect_record: first_redirect,
+                final_record,
+            }));
+        }
+        let Some(next_redirect) = next_redirects.into_iter().next() else {
+            return Ok(None);
+        };
+        current_redirect = next_redirect;
+    }
+
+    Ok(None)
+}
+
+async fn fetch_archived_redirect_target(
+    client: &WaybackClient,
+    archive_root: &Url,
+    mapper: &SiteMapper,
+    record: &CdxRecord,
+    cancellation: &CancellationFlag,
+) -> Result<Option<Url>> {
+    let url = snapshot_url(archive_root, record)?;
+    let mut attempt = 0usize;
+    let started_at = Instant::now();
+    let mut suppressed_retry_messages = 0usize;
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let route = client.active_route_label();
+        let response = match client.get_no_redirect(url.clone()).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context(format!("failed to inspect redirect {}", record.original));
+                if try_activate_ssh_for_snapshot_error(client, record, &error) {
+                    attempt = 0;
+                    suppressed_retry_messages = 0;
+                    continue;
+                }
+                retry_snapshot_after_error(
+                    record,
+                    &route,
+                    &mut attempt,
+                    started_at,
+                    &mut suppressed_retry_messages,
+                    &error,
+                    cancellation,
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if is_retryable_snapshot_status(status) {
+            let headers = response.headers().clone();
+            if try_activate_ssh_for_snapshot_status(client, record, status, attempt) {
+                attempt = 0;
+                suppressed_retry_messages = 0;
+                continue;
+            }
+            retry_snapshot_after_status(
+                record,
+                &route,
+                &mut attempt,
+                started_at,
+                &mut suppressed_retry_messages,
+                &headers,
+                status,
+                cancellation,
+            )
+            .await?;
+            continue;
+        }
+        if status == StatusCode::FORBIDDEN
+            && try_activate_ssh_for_snapshot_status(client, record, status, attempt)
+        {
+            attempt = 0;
+            suppressed_retry_messages = 0;
+            continue;
+        }
+        if is_unavailable_snapshot_status(status) || !status.is_redirection() {
+            return Ok(None);
+        }
+
+        let Some(target) =
+            extract_archived_redirect_location(archive_root, &record.original, response.headers())
+        else {
+            return Ok(None);
+        };
+        if !target
+            .host_str()
+            .is_some_and(|host| mapper.is_related_host(host))
+        {
+            return Ok(None);
+        }
+        if normalize_lookup_url(target.as_str()) == normalize_lookup_url(&record.original) {
+            return Ok(None);
+        }
+        return Ok(Some(target));
+    }
+}
+
+fn extract_archived_redirect_location(
+    archive_root: &Url,
+    record_original: &str,
+    headers: &HeaderMap,
+) -> Option<Url> {
+    let raw = headers
+        .get("x-archive-orig-location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| unwrap_archive_root_url(archive_root, value))
+        })?;
+
+    let base = Url::parse(record_original).ok()?;
+    let mut resolved = base.join(&raw).ok()?;
+    resolved.set_fragment(None);
+    matches!(resolved.scheme(), "http" | "https").then_some(resolved)
+}
+
+fn unwrap_archive_root_url(archive_root: &Url, value: &str) -> String {
+    if let Ok(parsed) = Url::parse(value)
+        && parsed.origin() == archive_root.origin()
+        && let Some((_, original)) = parsed
+            .path()
+            .strip_prefix("/web/")
+            .and_then(|path| path.split_once('/'))
+        && let Ok(mut original_url) = Url::parse(original)
+    {
+        original_url.set_query(parsed.query());
+        original_url.set_fragment(parsed.fragment());
+        return original_url.to_string();
+    }
+    unwrap_wayback_url(value)
 }
 
 fn extra_download_capture_targets(reference: &str) -> Vec<String> {
@@ -4807,6 +5233,285 @@ mod tests {
         assert_eq!(
             html,
             "<!-- Archived from Wayback Machine: https://web.archive.org/web/20120805042739/http://example.com/a%2D%2Db%2D%2D-c%3Cd%3Ee%0D%0Af -->\n<p>Page</p>"
+        );
+    }
+
+    /// Linked HTML pages archived only as 301/302 redirects should resolve their related-host
+    /// 200 OK target, emit a static HTML redirect stub with provenance, and pass validation.
+    #[tokio::test]
+    async fn download_site_follows_archived_301_redirect_for_linked_html_page() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let index_url = "http://example.com/index.html";
+        let old_url = "http://example.com/old-game.html";
+        let new_url = "http://example.com/games/new-game.html";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 IDX 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", old_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {old_url} text/html 301 REDIR 0\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", new_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {new_url} text/html 200 NEW 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/old-game.html">Play</a>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{old_url}")))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("X-Archive-Orig-Location", "/games/new-game.html")
+                    .insert_header(
+                        "Location",
+                        format!("{}/web/{timestamp}id_/{new_url}", server.uri()),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{new_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body><h1>New Game</h1></body></html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("redirect-html-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 2);
+        assert_eq!(report.extra_downloads, 1);
+        assert_eq!(report.aliases_created, 1);
+        assert_eq!(report.missing_local_links, 0);
+        assert_eq!(report.unusable_html_files, 0);
+
+        let saved_new =
+            std::fs::read_to_string(output.path().join("games/new-game.html")).unwrap();
+        assert!(saved_new.contains("<h1>New Game</h1>"), "{saved_new}");
+        let saved_stub = std::fs::read_to_string(output.path().join("old-game.html")).unwrap();
+        assert!(saved_stub.contains("data-webarchive-redirect=\"301\""), "{saved_stub}");
+        assert!(
+            saved_stub.contains("content=\"0; url=games/new-game.html\""),
+            "{saved_stub}"
+        );
+        assert!(
+            saved_stub.contains(&format!(
+                "<!-- Archived HTTP 301 redirect from Wayback Machine: {}/web/{timestamp}/{old_url} -->",
+                server.uri()
+            )),
+            "{saved_stub}"
+        );
+
+        let aliases_log =
+            std::fs::read_to_string(output.path().join(".wayback-state/aliases.jsonl")).unwrap();
+        let events: Vec<AliasEvent> = aliases_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            vec![AliasEvent {
+                target_path: PathBuf::from("old-game.html"),
+                source_path: PathBuf::from("games/new-game.html"),
+                reason: "archived_http_301_redirect".to_owned(),
+                replaced_unusable: false,
+                referred_from: None,
+            }]
+        );
+    }
+
+    /// A 200 OK capture must always win over a newer 301/302 redirect (such as a post-shutdown
+    /// domain redirect), and cross-domain 3xx redirects must never be followed.
+    #[tokio::test]
+    async fn download_site_prefers_200_over_later_301_and_skips_external_301_and_resolves_binary_302() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let index_url = "http://example.com/index.html";
+        let page_url = "http://example.com/page.html";
+        let external_url = "http://example.com/parked.html";
+        let old_img = "http://example.com/images/old.gif";
+        let new_img = "http://example.com/images/new.gif";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20060101000000 {index_url} text/html 200 IDX 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", page_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20130101000000 {page_url} text/html 301 LATER_REDIRECT 0\n20060101000000 {page_url} text/html 200 AUTHENTIC_200 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", external_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20130101000000 {external_url} text/html 301 EXT_REDIR 0\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", old_img))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20060101000000 {old_img} image/gif 302 IMG_REDIR 0\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", new_img))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "20060101000000 {new_img} image/gif 200 NEW_GIF 6\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(path(format!("/web/20060101000000id_/{index_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/page.html">Page</a><a href="/parked.html">Parked</a><img src="/images/old.gif">"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/20060101000000id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>Authentic 200</p>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/20130101000000id_/{page_url}")))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("X-Archive-Orig-Location", "http://unrelated.invalid/"),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/20130101000000id_/{external_url}")))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("X-Archive-Orig-Location", "https://unrelated.invalid/parked"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/20060101000000id_/{old_img}")))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("X-Archive-Orig-Location", "/images/new.gif"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/20060101000000id_/{new_img}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GIF89a".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("redirect-rules-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 3);
+        assert_eq!(report.extra_downloads, 2);
+        assert_eq!(report.aliases_created, 1);
+        assert_eq!(report.linked_files_unavailable, 1);
+        assert_eq!(report.missing_local_links, 1);
+        assert!(
+            std::fs::read_to_string(output.path().join("page.html"))
+                .unwrap()
+                .contains("Authentic 200")
+        );
+        assert!(!output.path().join("parked.html").exists());
+        assert_eq!(
+            std::fs::read(output.path().join("images/new.gif")).unwrap(),
+            b"GIF89a"
+        );
+        assert_eq!(
+            std::fs::read(output.path().join("images/old.gif")).unwrap(),
+            b"GIF89a"
         );
     }
 }

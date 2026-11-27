@@ -10,8 +10,14 @@ pub fn is_unusable_html_capture(input: &str) -> bool {
 	forum_error || is_soft_redirect_html(input) || is_access_denied_placeholder_html(input)
 }
 
+/// Marker placed on static HTML redirect stubs generated from verified archived 3xx captures.
+pub(crate) const GENERATED_REDIRECT_STUB_MARKER: &str = "data-webarchive-redirect=\"";
+
 /// Recognizes short redirect-only documents rather than ordinary timed refreshes.
 pub fn is_soft_redirect_html(input: &str) -> bool {
+    if input.contains(GENERATED_REDIRECT_STUB_MARKER) {
+        return false;
+    }
     has_soft_redirect_marker(input) && visible_text_len(input) <= 256
 }
 
@@ -168,6 +174,14 @@ mod tests {
         assert!(is_unusable_html_capture(
             r#"<html><body><form method="post" id="login"><h2>The board requires you to be registered and logged in to view this forum.</h2></form></body></html>"#
         ));
+    }
+
+    #[test]
+    fn does_not_treat_generated_archived_redirect_stub_as_unusable() {
+        let stub = r#"<!DOCTYPE html>
+<html data-webarchive-redirect="301"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=games/new.html"><title>Redirecting</title></head><body><p><a href="games/new.html">games/new.html</a></p></body></html>"#;
+        assert!(!is_soft_redirect_html(stub));
+        assert!(!is_unusable_html_capture(stub));
     }
 
     #[test]
