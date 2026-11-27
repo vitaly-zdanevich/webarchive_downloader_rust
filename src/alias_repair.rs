@@ -76,13 +76,16 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 
 /// Creates missing topic copies (or replaces retained-unusable topic error placeholders)
 /// only beside their usable source, preserving relative URLs.
-/// Post IDs and titles are scoped to the destination forum, not the referring page.
+/// Matching requires structural topic/post identity within the destination forum
+/// (numeric post anchors, topic/post query hashes, self print-view links, or same-row
+/// post-anchor corroboration); bare titles never establish topic identity.
 /// Existing usable files and symlinks are never replaced, and no cross-forum equivalence is inferred.
 pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 	let root = fs::canonicalize(root).context("failed to open topic alias directory")?;
 	let root = root.as_path();
     let html_files = collect_html_files(root)?;
-    let scopes = build_forum_topic_scopes(root, &html_files)?;
+    let journal = load_journal_topic_metadata(root);
+    let scopes = build_forum_topic_scopes(root, &html_files, &journal)?;
     let mut report = AliasRepairReport::default();
 	let empty_scope = ForumTopicScope::default();
 	let empty_anchors = HashSet::new();
@@ -114,12 +117,14 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
             let source = match alias_source_for_link(
                 root,
                 file,
+                &target,
                 &input,
                 relative_target,
 				if same_forum { &current_anchors } else { &empty_anchors },
 				if same_forum { current_topic_title.as_deref() } else { None },
                 &link,
 				scope,
+                &journal,
             ) {
                 AliasSource::Resolved(source) => source,
                 AliasSource::Unresolved => {
@@ -161,6 +166,9 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
         let Some(hash) = extract_target_query_hash(relative) else {
             continue;
         };
+        if journal.adjacent_nav_hashes.contains(hash) {
+            continue;
+        }
         let scope_path = relative.parent().unwrap_or(Path::new(""));
         let Some(scope) = scopes.get(scope_path) else {
             continue;
@@ -171,7 +179,14 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
         let Some(source_relative) = resolve_same_topic_candidates(candidates, scope) else {
             continue;
         };
-        if source_relative == relative || source_relative.parent() != Some(scope_path) {
+        if source_relative == relative
+            || source_relative.parent() != Some(scope_path)
+            || candidate_conflicts_with_target(
+                &source_relative,
+                journal.queries_by_hash.get(hash),
+                scope,
+            )
+        {
             continue;
         }
         let source = root.join(source_relative);
@@ -283,6 +298,7 @@ fn collect_html_files_into(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> 
 struct JournalTopicMetadata {
     originals_by_path: HashMap<PathBuf, String>,
     queries_by_hash: HashMap<String, (Option<String>, Option<String>)>,
+    adjacent_nav_hashes: HashSet<String>,
     forum_ids: HashSet<String>,
 }
 
@@ -309,13 +325,17 @@ fn load_journal_topic_metadata(root: &Path) -> JournalTopicMetadata {
             if let Some(forum_id) = extract_numeric_query_param(&url, &["f", "forum"]) {
                 metadata.forum_ids.insert(forum_id);
             }
-            if !path.ends_with("/viewtopic.php") || is_adjacent_topic_navigation_url(&url) {
+            if !path.ends_with("/viewtopic.php") {
                 continue;
             }
             let Some(canonical_query) = canonical_query_without_volatile_params(&url) else {
                 continue;
             };
             let hash = query_hash_hex(&canonical_query);
+            if is_adjacent_topic_navigation_url(&url) {
+                metadata.adjacent_nav_hashes.insert(hash);
+                continue;
+            }
             let topic_id = extract_numeric_query_param(&url, &["t", "topic"]);
             let post_id = extract_numeric_query_param(&url, &["p", "post"]);
             if topic_id.is_some() || post_id.is_some() {
@@ -329,8 +349,8 @@ fn load_journal_topic_metadata(root: &Path) -> JournalTopicMetadata {
 fn build_forum_topic_scopes(
     root: &Path,
     html_files: &[PathBuf],
+    journal: &JournalTopicMetadata,
 ) -> Result<HashMap<PathBuf, ForumTopicScope>> {
-    let journal = load_journal_topic_metadata(root);
     let mut scopes: HashMap<PathBuf, ForumTopicScope> = HashMap::new();
 
     for file in html_files {
@@ -688,75 +708,107 @@ enum AliasSource {
 fn alias_source_for_link(
     root: &Path,
     file: &Path,
+    target: &Path,
     input: &str,
     relative_target: &Path,
     current_anchors: &HashSet<String>,
     current_topic_title: Option<&str>,
     link: &AnchorLink,
     scope: &ForumTopicScope,
+    journal: &JournalTopicMetadata,
 ) -> AliasSource {
     let current_relative = file.strip_prefix(root).unwrap_or(file).to_path_buf();
+    let target_hash = extract_target_query_hash(relative_target);
+    if target_hash.is_some_and(|hash| journal.adjacent_nav_hashes.contains(hash)) {
+        return AliasSource::Unresolved;
+    }
+    let target_identity = target_hash.and_then(|hash| journal.queries_by_hash.get(hash));
 
     if let Some(fragment) = reference_fragment(&link.href) {
         for anchor in anchor_variants(fragment) {
-            if current_anchors.contains(&anchor) {
+            if current_anchors.contains(&anchor)
+                && !candidate_conflicts_with_target(&current_relative, target_identity, scope)
+            {
                 return AliasSource::Resolved(current_relative);
             }
-            if let Some(candidates) = scope.post_index.get(&anchor)
-                && let Some(candidate) = resolve_same_topic_candidates(candidates, scope)
-                    .or_else(|| candidates.first().cloned())
-            {
-                return AliasSource::Resolved(candidate);
+            if let Some(candidates) = scope.post_index.get(&anchor) {
+                return match resolve_same_topic_candidates(candidates, scope) {
+                    Some(candidate)
+                        if !candidate_conflicts_with_target(&candidate, target_identity, scope) =>
+                    {
+                        AliasSource::Resolved(candidate)
+                    }
+                    Some(_) => AliasSource::Unresolved,
+                    None => AliasSource::Ambiguous,
+                };
             }
         }
     }
 
-    if let Some(hash) = extract_target_query_hash(relative_target)
+    if let Some(hash) = target_hash
         && let Some(candidates) = scope.hash_index.get(hash)
-        && let Some(resolved) = resolve_same_topic_candidates(candidates, scope)
     {
-        return AliasSource::Resolved(resolved);
+        return match resolve_same_topic_candidates(candidates, scope) {
+            Some(resolved)
+                if !candidate_conflicts_with_target(&resolved, target_identity, scope) =>
+            {
+                AliasSource::Resolved(resolved)
+            }
+            Some(_) => AliasSource::Unresolved,
+            None => AliasSource::Ambiguous,
+        };
     }
 
     let text = normalize_text(&link.text);
-    if current_topic_title.is_some() && text == "print view" {
-        return AliasSource::Resolved(current_relative);
-    }
-    if current_topic_title.is_some_and(|title| title == text) {
+    if current_topic_title.is_some()
+        && text == "print view"
+        && !candidate_conflicts_with_target(&current_relative, target_identity, scope)
+    {
         return AliasSource::Resolved(current_relative);
     }
 
-    let Some(candidates) = scope.title_index.get(&text) else {
-        if let Some(source) = container_alias_source(
+    if !text.is_empty()
+        && let Some(source) = container_alias_source(
             root,
             file,
+            target,
             input,
             link,
             &text,
-            &scope.title_index,
-            &scope.post_index,
-        ) {
-            return AliasSource::Resolved(source);
-        }
-        return AliasSource::Unresolved;
-    };
-    if candidates.len() == 1 {
-        AliasSource::Resolved(candidates[0].clone())
-    } else if let Some(source) = container_alias_source(
-        root,
-        file,
-        input,
-        link,
-        &text,
-        &scope.title_index,
-        &scope.post_index,
-    ) {
-        AliasSource::Resolved(source)
-    } else if let Some(source) = resolve_same_topic_candidates(candidates, scope) {
-        AliasSource::Resolved(source)
-    } else {
-        AliasSource::Ambiguous
+            target_identity,
+            scope,
+        )
+    {
+        return AliasSource::Resolved(source);
     }
+
+    AliasSource::Unresolved
+}
+
+fn candidate_conflicts_with_target(
+    candidate: &Path,
+    target_identity: Option<&(Option<String>, Option<String>)>,
+    scope: &ForumTopicScope,
+) -> bool {
+    let Some((target_topic_id, target_post_id)) = target_identity else {
+        return false;
+    };
+    if let Some(target_topic_id) = target_topic_id
+        && let Some(candidate_topic_id) = scope.file_topic_ids.get(candidate)
+        && candidate_topic_id != target_topic_id
+    {
+        return true;
+    }
+    if let Some(target_post_id) = target_post_id {
+        let has_post = scope.file_anchors.get(candidate).is_some_and(|anchors| {
+            anchors.contains(target_post_id)
+                || anchors.contains(&format!("p{target_post_id}"))
+        });
+        if !has_post {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_same_topic_candidates(
@@ -909,68 +961,76 @@ fn min_post_number(candidate: &Path, scope: &ForumTopicScope) -> u64 {
 fn container_alias_source(
     root: &Path,
     file: &Path,
+    target: &Path,
     input: &str,
     link: &AnchorLink,
     title: &str,
-    title_index: &HashMap<String, Vec<PathBuf>>,
-    post_index: &HashMap<String, Vec<PathBuf>>,
+    target_identity: Option<&(Option<String>, Option<String>)>,
+    scope: &ForumTopicScope,
 ) -> Option<PathBuf> {
     let container = containing_topic_container(input, link.start, link.end)?;
-    for sibling in extract_anchor_links(container) {
-        if sibling.href == link.href {
+    let siblings = extract_anchor_links(container);
+
+    // Reject containers listing more than one distinct topic link with the same title.
+    let same_title_hrefs: HashSet<&str> = siblings
+        .iter()
+        .filter(|sibling| normalize_text(&sibling.text) == title)
+        .map(|sibling| sibling.href.as_str())
+        .collect();
+    if same_title_hrefs.len() > 1 {
+        return None;
+    }
+
+    let mut matched_sources = HashSet::new();
+    for sibling in siblings {
+        if sibling.href == link.href || normalize_text(&sibling.text) == title {
             continue;
         }
-
-        if let Some(source) =
-            existing_topic_source_from_href(root, file, &sibling.href, title, title_index)
+        if should_skip_reference(&sibling.href) {
+            continue;
+        }
+        let Ok(sibling_target) = resolve_local_reference(root, file, &sibling.href) else {
+            continue;
+        };
+        if sibling_target.parent() != target.parent() {
+            continue;
+        }
+        if !sibling_target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("viewtopic.php"))
         {
-            return Some(source);
+            continue;
         }
 
         let Some(fragment) = reference_fragment(&sibling.href) else {
             continue;
         };
         for anchor in anchor_variants(fragment) {
-            let Some(candidates) = post_index.get(&anchor) else {
+            let Some(candidates) = scope.post_index.get(&anchor) else {
                 continue;
             };
-            if let Some(candidate) = candidates
-                .iter()
-                .find(|candidate| topic_candidate_matches_title(candidate, title, title_index))
-            {
-                return Some(candidate.clone());
+            let Some(candidate) = resolve_same_topic_candidates(candidates, scope) else {
+                continue;
+            };
+            if !topic_candidate_matches_title(&candidate, title, &scope.title_index) {
+                continue;
+            }
+            let canonical = scope
+                .file_topic_ids
+                .get(&candidate)
+                .and_then(|topic_id| scope.topic_id_index.get(topic_id))
+                .and_then(|topic_files| resolve_same_topic_candidates(topic_files, scope))
+                .unwrap_or(candidate);
+            if !candidate_conflicts_with_target(&canonical, target_identity, scope) {
+                matched_sources.insert(canonical);
             }
         }
     }
 
-    None
-}
-
-fn existing_topic_source_from_href(
-    root: &Path,
-    file: &Path,
-    href: &str,
-    title: &str,
-    title_index: &HashMap<String, Vec<PathBuf>>,
-) -> Option<PathBuf> {
-    if should_skip_reference(href) {
-        return None;
-    }
-
-    let target = resolve_local_reference(root, file, href).ok()?;
-    if !target.exists() {
-        return None;
-    }
-    if !target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("viewtopic.php"))
-    {
-        return None;
-    }
-
-    let relative = target.strip_prefix(root).ok()?.to_path_buf();
-    topic_candidate_matches_title(&relative, title, title_index).then_some(relative)
+    (matched_sources.len() == 1)
+        .then(|| matched_sources.into_iter().next())
+        .flatten()
 }
 
 fn topic_candidate_matches_title(
@@ -1279,66 +1339,139 @@ mod tests {
 	}
 
     #[test]
-    fn creates_missing_topic_alias_from_matching_title() {
+    fn does_not_create_topic_alias_from_title_alone() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir(root.join("forums")).unwrap();
         fs::write(
             root.join("forums/source.html"),
-            r#"<a href="viewtopic.php__q_missing.html" class="topictitle">[RAS2] Diary Entry #32</a>"#,
+            r#"<a href="viewtopic.php__q_missing.html" class="topictitle">Welcome</a>"#,
         )
         .unwrap();
         fs::write(
             root.join("forums/viewtopic.php__q_existing.html"),
-            r#"<title>Small Rockets Forum &bull; View topic - [RAS2] Diary Entry #32</title><p>topic</p>"#,
+            r#"<title>Forum &bull; View topic - Welcome</title><p>Topic 1 text</p>"#,
         )
         .unwrap();
 
         let report = create_missing_topic_aliases(root).unwrap();
 
-        assert_eq!(report.created, 1);
-        assert!(root.join("forums/viewtopic.php__q_missing.html").exists());
+        assert_eq!(report.created, 0);
+        assert_eq!(report.unresolved, 1);
+        assert!(!root.join("forums/viewtopic.php__q_missing.html").exists());
     }
 
     #[test]
-    fn leaves_ambiguous_titles_unresolved() {
+    fn leaves_ambiguous_post_anchors_unresolved() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir(root.join("forums")).unwrap();
         fs::write(
             root.join("forums/source.html"),
-            r#"<a href="viewtopic.php__q_missing.html">Duplicate</a>"#,
+            r#"<a href="viewtopic.php__q_missing.html#p42">Post</a>"#,
         )
         .unwrap();
-        for name in ["one", "two"] {
-            fs::write(
-                root.join(format!("forums/viewtopic.php__q_{name}.html")),
-                r#"<title>Small Rockets Forum &bull; View topic - Duplicate</title>"#,
-            )
-            .unwrap();
-        }
+        fs::write(
+            root.join("forums/viewtopic.php__q_one.html"),
+            r#"<title>Forum :: View topic - First</title><div id="p42"></div><a href="posting.php?mode=reply&amp;t=1">Reply</a>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_two.html"),
+            r#"<title>Forum :: View topic - Second</title><div id="p42"></div><a href="posting.php?mode=reply&amp;t=2">Reply</a>"#,
+        )
+        .unwrap();
 
         let report = create_missing_topic_aliases(root).unwrap();
 
         assert_eq!(report.created, 0);
         assert_eq!(report.ambiguous, 1);
+        assert!(!root.join("forums/viewtopic.php__q_missing.html").exists());
     }
 
     #[test]
-    fn creates_self_alias_for_matching_topic_title() {
+    fn does_not_create_self_alias_from_title_alone_without_topic_identity() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir(root.join("forums")).unwrap();
         fs::write(
             root.join("forums/viewtopic.php__q_existing.html"),
-            r#"<title>SmallRockets Forum :: View topic - Mission 16</title><a href="viewtopic.php__q_missing.html">Mission 16</a>"#,
+            r#"<title>Forum :: View topic - Mission 16</title><a href="viewtopic.php__q_missing.html">Mission 16</a>"#,
         )
         .unwrap();
 
         let report = create_missing_topic_aliases(root).unwrap();
 
-        assert_eq!(report.created, 1);
-        assert!(root.join("forums/viewtopic.php__q_missing.html").exists());
+        assert_eq!(report.created, 0);
+        assert!(!root.join("forums/viewtopic.php__q_missing.html").exists());
+    }
+
+    #[test]
+    fn does_not_alias_two_same_title_topics_in_same_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("forums")).unwrap();
+        fs::write(
+            root.join("forums/index.html"),
+            r#"<li><a href="viewtopic.php__q_one.html">Welcome</a><a href="viewtopic.php__q_two.html">Welcome</a></li>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_one.html"),
+            r#"<title>Forum :: View topic - Welcome</title><p>Topic 1</p>"#,
+        )
+        .unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 0);
+        assert!(!root.join("forums/viewtopic.php__q_two.html").exists());
+    }
+
+    #[test]
+    fn journal_topic_id_contradiction_blocks_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("forums")).unwrap();
+        fs::create_dir_all(root.join(".wayback-state")).unwrap();
+
+        let t1_hash = query_hash_hex("t=1");
+        let t2_hash = query_hash_hex("t=2");
+        let t1_file = format!("viewtopic.php__q_{t1_hash}.html");
+        let t2_file = format!("viewtopic.php__q_{t2_hash}.html");
+
+        fs::write(
+            root.join("forums").join(&t1_file),
+            format!(
+                r#"<title>Forum :: View topic - Welcome</title><div id="p10"></div><a href="posting.php?mode=reply&amp;t=1">Reply</a><a href="{t2_file}">Print view</a>"#
+            ),
+        )
+        .unwrap();
+
+        let event = CaptureEvent {
+            record: crate::cdx::CdxRecord {
+                timestamp: "20061125000000".to_owned(),
+                original: "http://www.example.com/forums/viewtopic.php?t=1".to_owned(),
+                mimetype: "text/html".to_owned(),
+                status_code: 200,
+                digest: "T1".to_owned(),
+                length: Some(300),
+            },
+            local_path: PathBuf::from(format!("forums/{t1_file}")),
+            outcome: "downloaded".to_owned(),
+            references: vec!["http://www.example.com/forums/viewtopic.php?t=2".to_owned()],
+            error: None,
+        };
+        fs::write(
+            root.join(".wayback-state/captures.jsonl"),
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
+
+        let report = create_missing_topic_aliases(root).unwrap();
+
+        assert_eq!(report.created, 0);
+        assert!(!root.join("forums").join(&t2_file).exists());
     }
 
     #[test]
@@ -1410,37 +1543,46 @@ mod tests {
         );
     }
 
-    /// When one topic is downloaded under multiple query variants (e.g. `f=29&t=10150`
-    /// and `t=10150&start=0` or page 1 and page 2), title matching must recognize that
-    /// they belong to the same topic and pick the first page rather than failing as ambiguous.
+    /// When one topic is downloaded under multiple query variants (e.g. page 1 and page 2
+    /// of the same topic ID), structural matching (query hash or same-row latest-post anchor)
+    /// must pick the first page rather than failing as ambiguous or aliasing to page 2.
     #[test]
     fn resolves_multi_capture_same_topic_candidates_to_first_page() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir(root.join("forums")).unwrap();
+        let topic_hash = query_hash_hex("t=10150");
+        let missing_by_hash = format!("viewtopic.php__q_{topic_hash}.html");
         fs::write(
             root.join("forums/viewforum.html"),
-            r#"<a href="viewtopic.php__q_missing.html" class="topictitle">Idioma Castellano</a>"#,
+            format!(
+                r#"<ul><li><a href="viewtopic.php__q_row_missing.html" class="topictitle">Idioma Castellano</a><a href="viewtopic.php__q_page2.html#p24350">latest</a></li><li><a href="{missing_by_hash}">Direct link</a></li></ul>"#
+            ),
         )
         .unwrap();
         fs::write(
             root.join("forums/viewtopic.php__q_page2.html"),
-            r#"<title>Small Rockets Forum &bull; View topic - Idioma Castellano</title><div id="p24350"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
+            r#"<title>Forum &bull; View topic - Idioma Castellano</title><div id="p24350"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
         )
         .unwrap();
         fs::write(
             root.join("forums/viewtopic.php__q_page1.html"),
-            r#"<title>Small Rockets Forum &bull; View topic - Idioma Castellano</title><div id="p24306"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
+            r#"<title>Forum &bull; View topic - Idioma Castellano</title><div id="p24306"></div><a href="posting.php?mode=reply&amp;t=10150">Reply</a>"#,
         )
         .unwrap();
 
         let report = create_missing_topic_aliases(root).unwrap();
 
-        assert_eq!(report.created, 1);
+        assert_eq!(report.created, 2);
         assert_eq!(report.ambiguous, 0);
+        let page1 = fs::read_to_string(root.join("forums/viewtopic.php__q_page1.html")).unwrap();
         assert_eq!(
-            fs::read_to_string(root.join("forums/viewtopic.php__q_missing.html")).unwrap(),
-            fs::read_to_string(root.join("forums/viewtopic.php__q_page1.html")).unwrap()
+            fs::read_to_string(root.join("forums/viewtopic.php__q_row_missing.html")).unwrap(),
+            page1
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("forums").join(&missing_by_hash)).unwrap(),
+            page1
         );
     }
 

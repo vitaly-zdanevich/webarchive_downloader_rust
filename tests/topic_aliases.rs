@@ -17,18 +17,17 @@ fn write(root: &Path, name: &str, bytes: impl AsRef<[u8]>) {
 	fs::write(path, bytes).unwrap();
 }
 
-/// Numeric post IDs and titles must be looked up in the destination forum.
+/// Numeric post IDs must be looked up in the destination forum; bare title matching is never sufficient.
 #[test]
 fn alias_matching_uses_destination_forum() {
-	for fragment in ["#p42", ""] {
-		let root = tempfile::tempdir().unwrap();
-		let primary = "<title>Forum :: View topic - Same title</title><p id='p42'>PRIMARY POST</p>";
-		write(root.path(), PRIMARY, primary);
-		write(root.path(), OTHER, "<title>Forum :: View topic - Same title</title><p id='p42'>UNRELATED POST</p>");
-		write(root.path(), "forums/index.html", format!("<a href='viewtopic.php__q_missing.html{fragment}'>Same title</a>"));
-		assert_eq!(create_missing_topic_aliases(root.path()).unwrap().created, 1);
-		assert_eq!(fs::read_to_string(root.path().join("forums/viewtopic.php__q_missing.html")).unwrap(), primary);
-	}
+	let root = tempfile::tempdir().unwrap();
+	let primary = "<title>Forum :: View topic - Same title</title><p id='p42'>PRIMARY POST</p>";
+	write(root.path(), PRIMARY, primary);
+	write(root.path(), OTHER, "<title>Forum :: View topic - Same title</title><p id='p42'>UNRELATED POST</p>");
+	write(root.path(), "forums/index.html", "<a href='viewtopic.php__q_by_post.html#p42'>Same title</a><a href='viewtopic.php__q_by_title_only.html'>Same title</a>");
+	assert_eq!(create_missing_topic_aliases(root.path()).unwrap().created, 1);
+	assert_eq!(fs::read_to_string(root.path().join("forums/viewtopic.php__q_by_post.html")).unwrap(), primary);
+	assert!(!root.path().join("forums/viewtopic.php__q_by_title_only.html").exists());
 }
 
 /// The referring page's own anchors/title cannot justify an alias in another forum.
@@ -111,7 +110,7 @@ fn aliases_preserve_relative_links_and_existing_files() {
 fn topic_aliases_do_not_follow_directory_symlinks() {
 	let root = tempfile::tempdir().unwrap();
 	let outside = tempfile::tempdir().unwrap();
-	write(outside.path(), "viewtopic.php__q_original.html", "<title>Forum :: View topic - Topic</title><a href='viewtopic.php__q_missing.html'>Topic</a>");
+	write(outside.path(), "viewtopic.php__q_original.html", "<title>Forum :: View topic - Topic</title><p id='p42'>Post</p><a href='viewtopic.php__q_missing.html#p42'>Topic</a>");
 	std::os::unix::fs::symlink(outside.path(), root.path().join("forums")).unwrap();
 	assert_eq!(create_missing_topic_aliases(root.path()).unwrap().created, 0);
 	assert!(!outside.path().join("viewtopic.php__q_missing.html").exists());
@@ -123,7 +122,7 @@ fn topic_aliases_do_not_follow_directory_symlinks() {
 fn topic_aliases_preserve_dangling_symlinks() {
 	let root = tempfile::tempdir().unwrap();
 	let outside = tempfile::tempdir().unwrap();
-	write(root.path(), PRIMARY, "<title>Forum :: View topic - Topic</title><a href='viewtopic.php__q_missing.html'>Topic</a>");
+	write(root.path(), PRIMARY, "<title>Forum :: View topic - Topic</title><p id='p42'>Post</p><a href='viewtopic.php__q_missing.html#p42'>Topic</a>");
 	let alias = root.path().join("forums/viewtopic.php__q_missing.html");
 	let target = outside.path().join("outside.html");
 	std::os::unix::fs::symlink(&target, &alias).unwrap();
@@ -138,7 +137,7 @@ fn topic_aliases_preserve_dangling_symlinks() {
 fn topic_aliases_preserve_source_permissions() {
 	use std::os::unix::fs::PermissionsExt;
 	let root = tempfile::tempdir().unwrap();
-	write(root.path(), PRIMARY, "<title>Forum :: View topic - Topic</title><a href='viewtopic.php__q_missing.html'>Topic</a>");
+	write(root.path(), PRIMARY, "<title>Forum :: View topic - Topic</title><p id='p42'>Post</p><a href='viewtopic.php__q_missing.html#p42'>Topic</a>");
 	fs::set_permissions(root.path().join(PRIMARY), fs::Permissions::from_mode(0o600)).unwrap();
 	assert_eq!(create_missing_topic_aliases(root.path()).unwrap().created, 1);
 	let metadata = fs::metadata(root.path().join("forums/viewtopic.php__q_missing.html")).unwrap();
