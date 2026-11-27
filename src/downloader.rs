@@ -27,11 +27,15 @@ use crate::cdx::{
     is_cdx_connectivity_error, is_redirect_status_code, sort_records_for_strategy,
 };
 use crate::download_refs::{
-    extract_html_script_references, extract_related_references, is_interactive_forum_extra_reference,
+    extract_html_script_references, extract_related_references,
+    is_eligible_external_subresource_url, is_interactive_forum_extra_reference,
 };
-use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
+use crate::link_validation::{
+    ReferenceOrigin, collect_html_files, extract_typed_document_references,
+    repair_local_navigation_html, resolve_local_reference, validate_local_links,
+};
 use crate::recovery::{AliasEvent, CaptureEvent, RecoveryState, record_alias_event};
-use crate::noise::is_archive_noise_record;
+use crate::noise::{is_archive_noise_record, is_external_tracker_or_ad_host};
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, is_javascript_mimetype, normalize_lookup_url,
     relative_link, strip_volatile_query_params, unwrap_wayback_url,
@@ -54,6 +58,8 @@ pub struct DownloadOptions {
     pub rewrite_links: bool,
     /// Inserts a non-visible Wayback Machine snapshot URL comment at the top of rewritten HTML pages.
     pub add_wayback_comment: bool,
+    /// Recovers embedded subresources (images, stylesheets, scripts, media) on unrelated non-tracker hosts from Wayback.
+    pub include_external_assets: bool,
     pub extra_download_max_bytes: Option<u64>,
     pub validate_links: bool,
     pub cancellation: CancellationFlag,
@@ -148,6 +154,8 @@ struct DownloadJob {
     local_path: PathBuf,
     /// Actual response-byte limit for a linked download; primary captures are uncapped.
     max_bytes: Option<u64>,
+    /// Rejects HTML error/parked responses when recovering external non-HTML subresources.
+    reject_html_response: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +279,7 @@ pub async fn download_site(
                 record: selected,
                 local_path,
                 max_bytes: None,
+                reject_html_response: false,
             });
         } else {
             duplicate_paths += 1;
@@ -356,7 +365,7 @@ pub async fn download_site(
                     js_discovery_files.push(js_file);
                 }
             }
-            Ok(DownloadStatus::SizeLimitExceeded) => report.skipped += 1,
+            Ok(DownloadStatus::SizeLimitExceeded | DownloadStatus::RejectedHtml) => report.skipped += 1,
             Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
             Err(error) if is_unavailable_snapshot_error(&error) => {
                 report.unavailable_snapshots += 1;
@@ -378,6 +387,7 @@ pub async fn download_site(
         if let Some(max_bytes) = options.extra_download_max_bytes {
 			let mut checked_references = HashSet::new();
 			let mut candidate_remappings: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+			let mut candidate_external_remappings: HashMap<String, PathBuf> = HashMap::new();
 			let mut js_discovered_bases: HashSet<(String, String)> = HashSet::new();
 			while !options.cancellation.is_cancelled() {
 				collect_pending_js_referrer_references(
@@ -387,6 +397,7 @@ pub async fn download_site(
 					&script_referrers,
 					&mut js_discovered_bases,
 					&mut extra_download_refs,
+					options.include_external_assets,
 				)
 				.await?;
 				extra_download_refs.retain(|reference| {
@@ -409,6 +420,7 @@ pub async fn download_site(
 				.await?;
 				extra_download_refs.clear();
 				merge_candidate_remappings(&mut candidate_remappings, extra_resolution.remappings);
+				let wave_external_remappings = extra_resolution.external_url_remappings;
 				if !extra_resolution.jobs.is_empty() {
 					if is_unlimited_extra_download_size(max_bytes) {
 						println!("selected {} linked files without size cap", extra_resolution.jobs.len());
@@ -486,6 +498,9 @@ pub async fn download_site(
 							report.skipped += 1;
 							report.linked_files_unavailable += 1;
 						}
+						Ok(DownloadStatus::RejectedHtml) => {
+							report.linked_files_unavailable += 1;
+						}
 						Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
 						Err(error) if is_unavailable_snapshot_error(&error) => {
 							report.unavailable_snapshots += 1;
@@ -514,19 +529,33 @@ pub async fn download_site(
 						report.aliases_created += redirect_aliases;
 					}
 				}
+
+				for (external_key, local_path) in wave_external_remappings {
+					if has_non_empty_file(&options.output_dir.join(&local_path)).await? {
+						candidate_external_remappings.insert(external_key, local_path);
+					} else {
+						known_paths.remove(&external_key);
+					}
+				}
 			}
 
-			if !candidate_remappings.is_empty()
+			if (!candidate_remappings.is_empty() || !candidate_external_remappings.is_empty())
 				&& !rewritten_files.is_empty()
 				&& !options.cancellation.is_cancelled()
 			{
 				let confirmed =
 					confirm_late_path_remappings(&options.output_dir, candidate_remappings).await?;
-				if !confirmed.is_empty() {
+				let confirmed_external = confirm_external_url_remappings(
+					&options.output_dir,
+					candidate_external_remappings,
+				)
+				.await?;
+				if !confirmed.is_empty() || !confirmed_external.is_empty() {
 					let updated = apply_late_path_remappings(
 						&options.output_dir,
 						&rewritten_files,
 						&confirmed,
+						&confirmed_external,
 					)
 					.await?;
 					if updated > 0 {
@@ -1083,6 +1112,7 @@ enum DownloadStatus {
         js_file: Option<TrackedJsFile>,
     },
     SizeLimitExceeded,
+    RejectedHtml,
     Cancelled,
 }
 
@@ -1121,16 +1151,39 @@ fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: 
 	}
 	let root = std::fs::canonicalize(&options.output_dir)?;
 	let file = root.join(&job.local_path);
+	let base_is_related = Url::parse(&job.record.original)
+		.ok()
+		.and_then(|url| url.host_str().map(|host| mapper.is_related_host(host)))
+		.unwrap_or(false);
 	let mut references = fallback.recovery.references(&job.local_path);
-	for reference in extract_document_references(&String::from_utf8_lossy(bytes), doc_kind)? {
-		let value = reference.trim();
-		if let Ok(url) = Url::parse(value) {
-			references.push(url.to_string());
+	let mut external_subresources = Vec::new();
+	for extracted in extract_typed_document_references(&String::from_utf8_lossy(bytes), doc_kind)? {
+		let value = extracted.value.trim();
+		if let Ok(mut url) = Url::parse(value) {
+			url.set_fragment(None);
+			if url.host_str().is_some_and(|host| mapper.is_related_host(host)) {
+				references.push(url.to_string());
+			} else if options.include_external_assets
+				&& extracted.origin == ReferenceOrigin::EmbeddedSubresource
+				&& (base_is_related || doc_kind == TextDocumentKind::Css)
+				&& is_eligible_external_subresource_url(&url)
+			{
+				external_subresources.push(url.to_string());
+			}
 			continue;
 		}
 		if value.starts_with("//") {
-			if let Ok(url) = Url::parse(&job.record.original)?.join(value) {
-				references.push(url.to_string());
+			if let Ok(mut url) = Url::parse(&job.record.original)?.join(value) {
+				url.set_fragment(None);
+				if url.host_str().is_some_and(|host| mapper.is_related_host(host)) {
+					references.push(url.to_string());
+				} else if options.include_external_assets
+					&& extracted.origin == ReferenceOrigin::EmbeddedSubresource
+					&& (base_is_related || doc_kind == TextDocumentKind::Css)
+					&& is_eligible_external_subresource_url(&url)
+				{
+					external_subresources.push(url.to_string());
+				}
 			}
 			continue;
 		}
@@ -1158,6 +1211,7 @@ fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: 
 		matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|host| mapper.is_related_host(host))
 		&& !crate::noise::is_archive_noise_reference(reference)
 		&& !is_interactive_forum_extra_reference(&url)));
+	references.extend(external_subresources);
 	references.sort();
 	references.dedup();
 	Ok(references)
@@ -1196,12 +1250,6 @@ async fn download_one_inner(
 		)?);
 	}
 
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
     println!("capture {}: {} -> {}", job.record.timestamp, job.record.original, job.local_path.display());
 
     let mut retained_unusable = false;
@@ -1230,6 +1278,17 @@ async fn download_one_inner(
             return Ok(DownloadStatus::Cancelled);
         }
 
+        if job.reject_html_response
+            && (is_html_content_type_header(body.content_type.as_deref())
+                || looks_like_html_document_prefix(&body.bytes))
+        {
+            eprintln!(
+                "skipping external asset that returned HTML instead of a resource: {}",
+                record.original
+            );
+            return Ok(DownloadStatus::RejectedHtml);
+        }
+
         let doc_kind = text_document_kind(&record, &job.local_path);
         retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
             && is_unusable_html_capture(&body.html_for_inspection());
@@ -1246,7 +1305,13 @@ async fn download_one_inner(
 		let original_url = Url::parse(&record.original)?;
 		let extra_download_refs = match text.as_ref() {
 			Some((TextDocumentKind::JavaScript, _)) | None => Vec::new(),
-			Some((kind, text)) => extract_related_references(text, &original_url, mapper, *kind)?,
+			Some((kind, text)) => extract_related_references(
+				text,
+				&original_url,
+				mapper,
+				*kind,
+				options.include_external_assets,
+			)?,
 		};
 		let page_script_referrers = match text.as_ref() {
 			Some((TextDocumentKind::Html, text)) => {
@@ -1290,6 +1355,7 @@ async fn download_one_inner(
 						&original_url,
 						mapper,
 						TextDocumentKind::JavaScript,
+						options.include_external_assets,
 					)?;
 					write_bytes_atomic(&destination, &body.bytes).await?;
 					let canonical_key = canonical_extra_reference_key(mapper, &record.original);
@@ -1362,22 +1428,33 @@ async fn download_one_inner(
 			})?;
         }
     } else if let Some(max_bytes) = job.max_bytes {
-        if !download_record_to_file_limited(
+        match download_record_to_file_limited(
             client,
             archive_root,
             &job.record,
             &destination,
             max_bytes,
+            job.reject_html_response,
             Some(fallback_options),
             &options.cancellation,
         )
         .await?
         {
-            eprintln!(
-                "linked file exceeds configured size limit: {}",
-                job.record.original
-            );
-            return Ok(DownloadStatus::SizeLimitExceeded);
+            LimitedDownloadOutcome::Downloaded => {}
+            LimitedDownloadOutcome::SizeLimitExceeded => {
+                eprintln!(
+                    "linked file exceeds configured size limit: {}",
+                    job.record.original
+                );
+                return Ok(DownloadStatus::SizeLimitExceeded);
+            }
+            LimitedDownloadOutcome::RejectedHtml => {
+                eprintln!(
+                    "skipping external asset that returned HTML instead of a resource: {}",
+                    job.record.original
+                );
+                return Ok(DownloadStatus::RejectedHtml);
+            }
         }
     } else {
         download_record_to_file(
@@ -1407,6 +1484,7 @@ struct ExtraDownloadResolution {
     jobs: Vec<DownloadJob>,
     redirects: Vec<PendingArchivedRedirect>,
     remappings: Vec<(PathBuf, PathBuf)>,
+    external_url_remappings: Vec<(String, PathBuf)>,
     unavailable: usize,
 }
 
@@ -1462,6 +1540,19 @@ async fn confirm_late_path_remappings(
             continue;
         }
         confirmed.insert(stale, actual);
+    }
+    Ok(confirmed)
+}
+
+async fn confirm_external_url_remappings(
+    output_dir: &Path,
+    candidates: HashMap<String, PathBuf>,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut confirmed = HashMap::new();
+    for (url_key, actual) in candidates {
+        if has_non_empty_file(&output_dir.join(&actual)).await? {
+            confirmed.insert(url_key, actual);
+        }
     }
     Ok(confirmed)
 }
@@ -1531,6 +1622,7 @@ async fn collect_pending_js_referrer_references(
     script_referrers: &HashMap<String, Vec<(PathBuf, Url)>>,
     discovered_bases: &mut HashSet<(String, String)>,
     extra_download_refs: &mut HashSet<String>,
+    include_external_assets: bool,
 ) -> Result<()> {
     for js_file in js_files {
         let bases: Vec<Url> = match script_referrers.get(&js_file.canonical_key) {
@@ -1564,8 +1656,13 @@ async fn collect_pending_js_referrer_references(
             Err(_) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
         };
         for base in pending_bases {
-            let refs =
-                extract_related_references(&text, &base, mapper, TextDocumentKind::JavaScript)?;
+            let refs = extract_related_references(
+                &text,
+                &base,
+                mapper,
+                TextDocumentKind::JavaScript,
+                include_external_assets,
+            )?;
             extra_download_refs.extend(refs);
         }
     }
@@ -1656,6 +1753,7 @@ async fn apply_late_path_remappings(
     output_dir: &Path,
     rewritten_files: &[(PathBuf, TextDocumentKind)],
     remapped_paths: &HashMap<PathBuf, PathBuf>,
+    external_url_remappings: &HashMap<String, PathBuf>,
 ) -> Result<usize> {
     let mut visited = HashSet::new();
     let mut updated_files = 0usize;
@@ -1674,13 +1772,19 @@ async fn apply_late_path_remappings(
             continue;
         };
         let updated = match kind {
-            TextDocumentKind::Html => {
-                remap_local_html_paths(&input, local_path, remapped_paths)
-                    .with_context(|| format!("failed to remap HTML links in {}", full_path.display()))?
-            }
-            TextDocumentKind::Css => {
-                remap_local_css_paths(&input, local_path, remapped_paths)
-            }
+            TextDocumentKind::Html => remap_local_html_paths(
+                &input,
+                local_path,
+                remapped_paths,
+                external_url_remappings,
+            )
+            .with_context(|| format!("failed to remap HTML links in {}", full_path.display()))?,
+            TextDocumentKind::Css => remap_local_css_paths(
+                &input,
+                local_path,
+                remapped_paths,
+                external_url_remappings,
+            ),
             TextDocumentKind::JavaScript => None,
         };
         if let Some(updated) = updated {
@@ -1745,6 +1849,10 @@ async fn resolve_extra_download_jobs(
 
         println!("linked lookup [{}/{}]: {}", index + 1, total, reference);
 
+        let is_external_asset = Url::parse(&reference)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| !mapper.is_related_host(host)))
+            .unwrap_or(false);
         let lookup = find_extra_download_record(
             client,
             archive_root,
@@ -1753,6 +1861,7 @@ async fn resolve_extra_download_jobs(
             known_paths,
             &reference,
             max_bytes,
+            is_external_asset,
             cancellation,
         )
         .await?;
@@ -1771,6 +1880,15 @@ async fn resolve_extra_download_jobs(
                     &local_path,
                     &mut resolution.remappings,
                 );
+                if is_external_asset {
+                    resolution
+                        .external_url_remappings
+                        .push((lookup_key.clone(), local_path.clone()));
+                    resolution.external_url_remappings.push((
+                        normalize_lookup_url(&record.original),
+                        local_path.clone(),
+                    ));
+                }
                 known_paths.insert(lookup_key, local_path.clone());
                 known_paths.insert(normalize_lookup_url(&record.original), local_path.clone());
                 if seen_paths.insert(local_path.clone()) {
@@ -1778,6 +1896,7 @@ async fn resolve_extra_download_jobs(
                         record,
                         local_path,
                         max_bytes: Some(max_bytes),
+                        reject_html_response: is_external_asset,
                     });
                 }
             }
@@ -1801,6 +1920,15 @@ async fn resolve_extra_download_jobs(
                     &target_local_path,
                     &mut resolution.remappings,
                 );
+                if is_external_asset {
+                    resolution
+                        .external_url_remappings
+                        .push((lookup_key.clone(), source_local_path.clone()));
+                    resolution.external_url_remappings.push((
+                        normalize_lookup_url(&final_record.original),
+                        target_local_path.clone(),
+                    ));
+                }
                 known_paths.insert(
                     normalize_lookup_url(&final_record.original),
                     target_local_path.clone(),
@@ -1811,6 +1939,7 @@ async fn resolve_extra_download_jobs(
                         record: final_record,
                         local_path: target_local_path.clone(),
                         max_bytes: Some(max_bytes),
+                        reject_html_response: is_external_asset,
                     });
                 }
                 if source_local_path != target_local_path && seen_paths.insert(source_local_path.clone()) {
@@ -1837,6 +1966,11 @@ async fn resolve_extra_download_jobs(
                     &source_local_path,
                     &mut resolution.remappings,
                 );
+                if is_external_asset {
+                    resolution
+                        .external_url_remappings
+                        .push((lookup_key.clone(), source_local_path.clone()));
+                }
                 known_paths.insert(lookup_key, source_local_path.clone());
                 if source_local_path != target_local_path && seen_paths.insert(source_local_path.clone()) {
                     resolution.redirects.push(PendingArchivedRedirect {
@@ -2021,12 +2155,16 @@ async fn recover_missing_static_assets(
             &record,
             &destination,
             max_bytes,
+            false,
             Some(fallback_options),
             cancellation,
         )
         .await
         {
-            Ok(downloaded) => downloaded,
+            Ok(LimitedDownloadOutcome::Downloaded) => true,
+            Ok(LimitedDownloadOutcome::SizeLimitExceeded | LimitedDownloadOutcome::RejectedHtml) => {
+                false
+            }
 			Err(error) if is_unavailable_snapshot_error(&error) => {
 				eprintln!("static asset snapshot unavailable: {error:#}");
 				false
@@ -2456,12 +2594,16 @@ async fn ensure_static_asset_alias_source(
         record,
         &source,
         max_bytes,
+        false,
         Some(fallback_options),
         cancellation,
     )
     .await
     {
-        Ok(downloaded) => downloaded,
+        Ok(LimitedDownloadOutcome::Downloaded) => true,
+        Ok(LimitedDownloadOutcome::SizeLimitExceeded | LimitedDownloadOutcome::RejectedHtml) => {
+            false
+        }
 		Err(error) if is_unavailable_snapshot_error(&error) => {
 			eprintln!("static asset alias source unavailable: {error:#}");
 			false
@@ -2958,14 +3100,22 @@ async fn find_extra_download_record(
     known_paths: &HashMap<String, PathBuf>,
     reference: &str,
     max_bytes: u64,
+    is_external_asset: bool,
     cancellation: &CancellationFlag,
 ) -> Result<ExtraDownloadOutcome> {
     let mut visited = HashSet::new();
     visited.insert(normalize_lookup_url(reference));
 
-    let (direct, redirects) =
-        query_extra_download_candidates(client, archive_root, fallback_options, reference, max_bytes)
-            .await?;
+    let allow_html = !is_external_asset;
+    let (direct, redirects) = query_extra_download_candidates(
+        client,
+        archive_root,
+        fallback_options,
+        reference,
+        max_bytes,
+        allow_html,
+    )
+    .await?;
     if let Some(record) = direct {
         return Ok(ExtraDownloadOutcome::Direct(record));
     }
@@ -2982,6 +3132,7 @@ async fn find_extra_download_record(
             known_paths,
             first_redirect,
             max_bytes,
+            is_external_asset,
             &mut visited,
             cancellation,
         )
@@ -3000,6 +3151,7 @@ async fn query_extra_download_candidates(
     fallback_options: &FallbackOptions,
     reference: &str,
     max_bytes: u64,
+    allow_html: bool,
 ) -> Result<(Option<CdxRecord>, Vec<CdxRecord>)> {
     let mut redirect_candidates = Vec::new();
     let mut seen_redirects = HashSet::new();
@@ -3025,7 +3177,10 @@ async fn query_extra_download_candidates(
         };
 
         for record in &records {
-            if record.status_code == 200 && extra_download_record_fits_limit(record, max_bytes) {
+            if record.status_code == 200
+                && (allow_html || !is_html_mimetype(&record.mimetype))
+                && extra_download_record_fits_limit(record, max_bytes)
+            {
                 return Ok((Some(record.clone()), Vec::new()));
             }
         }
@@ -3049,10 +3204,12 @@ async fn follow_archived_redirect_chain(
     known_paths: &HashMap<String, PathBuf>,
     first_redirect: CdxRecord,
     max_bytes: u64,
+    is_external_asset: bool,
     visited: &mut HashSet<String>,
     cancellation: &CancellationFlag,
 ) -> Result<Option<ExtraDownloadOutcome>> {
     let mut current_redirect = first_redirect.clone();
+    let allow_html = !is_external_asset;
 
     for _hop in 0..MAX_ARCHIVED_REDIRECT_HOPS {
         if cancellation.is_cancelled() {
@@ -3063,6 +3220,7 @@ async fn follow_archived_redirect_chain(
             archive_root,
             mapper,
             &current_redirect,
+            is_external_asset,
             cancellation,
         )
         .await?
@@ -3071,6 +3229,9 @@ async fn follow_archived_redirect_chain(
         };
 
         if let Some(existing_path) = mapper.known_path_for_url(&target_url, known_paths) {
+            if !allow_html && is_html_path(existing_path) {
+                return Ok(None);
+            }
             return Ok(Some(ExtraDownloadOutcome::RedirectToExisting {
                 redirect_record: first_redirect,
                 target_local_path: existing_path.clone(),
@@ -3088,6 +3249,7 @@ async fn follow_archived_redirect_chain(
             fallback_options,
             target_url.as_str(),
             max_bytes,
+            allow_html,
         )
         .await?;
         if let Some(final_record) = direct {
@@ -3110,6 +3272,7 @@ async fn fetch_archived_redirect_target(
     archive_root: &Url,
     mapper: &SiteMapper,
     record: &CdxRecord,
+    allow_external_target: bool,
     cancellation: &CancellationFlag,
 ) -> Result<Option<Url>> {
     let url = snapshot_url(archive_root, record)?;
@@ -3183,10 +3346,19 @@ async fn fetch_archived_redirect_target(
         else {
             return Ok(None);
         };
-        if !target
-            .host_str()
-            .is_some_and(|host| mapper.is_related_host(host))
-        {
+        let target_allowed = if allow_external_target {
+            target.host_str().is_some_and(|host| {
+                mapper.is_related_host(host)
+                    || (!is_external_tracker_or_ad_host(host)
+                        && !target.path().is_empty()
+                        && target.path() != "/")
+            })
+        } else {
+            target
+                .host_str()
+                .is_some_and(|host| mapper.is_related_host(host))
+        };
+        if !target_allowed {
             return Ok(None);
         }
         if normalize_lookup_url(target.as_str()) == normalize_lookup_url(&record.original) {
@@ -3583,15 +3755,23 @@ async fn download_record_to_file(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LimitedDownloadOutcome {
+    Downloaded,
+    SizeLimitExceeded,
+    RejectedHtml,
+}
+
 async fn download_record_to_file_limited(
     client: &WaybackClient,
     archive_root: &Url,
     record: &CdxRecord,
     destination: &Path,
     max_bytes: u64,
+    reject_html: bool,
     fallback_options: Option<&FallbackOptions>,
     cancellation: &CancellationFlag,
-) -> Result<bool> {
+) -> Result<LimitedDownloadOutcome> {
     let mut current_record = record.clone();
     let mut snapshot_url = snapshot_url(archive_root, &current_record)?;
     let mut attempt = 0usize;
@@ -3605,8 +3785,10 @@ async fn download_record_to_file_limited(
         let route = client.active_route_label();
         match fetch_snapshot_response_once(client, &snapshot_url, &current_record).await {
             Ok(SnapshotResponseAttempt::Ready(response)) => {
-                match stream_response_to_file_limited(response, destination, max_bytes).await {
-                    Ok(downloaded) => return Ok(downloaded),
+                match stream_response_to_file_limited(response, destination, max_bytes, reject_html)
+                    .await
+                {
+                    Ok(outcome) => return Ok(outcome),
                     Err(error) if is_retryable_snapshot_error(&error) => {
                         if try_activate_ssh_for_snapshot_error(client, &current_record, &error) {
                             attempt = 0;
@@ -4435,6 +4617,11 @@ fn should_rewrite_as_text(record: &CdxRecord, local_path: &Path) -> bool {
 }
 
 async fn stream_response_to_file(response: reqwest::Response, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
     let temp_path = temp_path_for(destination);
     let result = async {
         let mut file = fs::File::create(&temp_path)
@@ -4471,41 +4658,106 @@ async fn stream_response_to_file(response: reqwest::Response, destination: &Path
     result
 }
 
+fn is_html_content_type_header(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let base = content_type
+        .split_once(';')
+        .map_or(content_type, |(base, _)| base)
+        .trim();
+    is_html_mimetype(base)
+}
+
+fn looks_like_html_document_prefix(bytes: &[u8]) -> bool {
+    let trimmed = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let prefix = std::str::from_utf8(&trimmed[..trimmed.len().min(64)])
+        .unwrap_or("")
+        .trim_start()
+        .to_ascii_lowercase();
+    prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
+}
+
 async fn stream_response_to_file_limited(
     response: reqwest::Response,
     destination: &Path,
     max_bytes: u64,
-) -> Result<bool> {
+    reject_html: bool,
+) -> Result<LimitedDownloadOutcome> {
     let temp_path = temp_path_for(destination);
     let result = async {
+        if reject_html {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            if is_html_content_type_header(content_type) {
+                return Ok(LimitedDownloadOutcome::RejectedHtml);
+            }
+        }
         if response
             .content_length()
             .is_some_and(|length| length > max_bytes)
         {
-            return Ok(false);
+            return Ok(LimitedDownloadOutcome::SizeLimitExceeded);
         }
 
-        let mut file = fs::File::create(&temp_path)
-            .await
-            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        let mut file: Option<fs::File> = None;
         let mut stream = response.bytes_stream();
         let mut written = 0u64;
+        let mut checked_prefix = !reject_html;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("failed while reading archived bytes")?;
+            if !checked_prefix && !chunk.is_empty() {
+                checked_prefix = true;
+                if looks_like_html_document_prefix(&chunk) {
+                    return Ok(LimitedDownloadOutcome::RejectedHtml);
+                }
+            }
             written = written.saturating_add(chunk.len() as u64);
             if written > max_bytes {
-                return Ok(false);
+                return Ok(LimitedDownloadOutcome::SizeLimitExceeded);
             }
-            file.write_all(&chunk)
+            let handle = match file.as_mut() {
+                Some(handle) => handle,
+                None => {
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent).await.with_context(|| {
+                            format!("failed to create directory {}", parent.display())
+                        })?;
+                    }
+                    file.insert(
+                        fs::File::create(&temp_path)
+                            .await
+                            .with_context(|| format!("failed to create {}", temp_path.display()))?,
+                    )
+                }
+            };
+            handle
+                .write_all(&chunk)
                 .await
                 .with_context(|| format!("failed to write {}", temp_path.display()))?;
         }
 
-        file.flush()
+        let mut handle = match file {
+            Some(handle) => handle,
+            None => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                }
+                fs::File::create(&temp_path)
+                    .await
+                    .with_context(|| format!("failed to create {}", temp_path.display()))?
+            }
+        };
+        handle
+            .flush()
             .await
             .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-        drop(file);
+        drop(handle);
         fs::rename(&temp_path, destination).await.with_context(|| {
             format!(
                 "failed to move {} to {}",
@@ -4513,11 +4765,11 @@ async fn stream_response_to_file_limited(
                 destination.display()
             )
         })?;
-        Ok(true)
+        Ok(LimitedDownloadOutcome::Downloaded)
     }
     .await;
 
-    if !matches!(result, Ok(true)) {
+    if !matches!(result, Ok(LimitedDownloadOutcome::Downloaded)) {
         let _ = fs::remove_file(&temp_path).await;
     }
 
@@ -4556,6 +4808,11 @@ async fn ensure_nojekyll_marker(root: &Path) -> Result<()> {
 }
 
 async fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
     let temp_path = temp_path_for(destination);
     let result = async {
         let mut file = fs::File::create(&temp_path)
@@ -5568,6 +5825,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -5838,6 +6096,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6004,6 +6263,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6091,6 +6351,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6166,6 +6427,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6243,6 +6505,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6353,6 +6616,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6454,6 +6718,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6566,6 +6831,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6673,6 +6939,7 @@ mod tests {
                 recover_existing: false,
                 rewrite_links: true,
                 add_wayback_comment: true,
+                include_external_assets: true,
                 extra_download_max_bytes: Some(u64::MAX),
                 validate_links: true,
                 cancellation: CancellationFlag::new(),
@@ -6690,5 +6957,325 @@ mod tests {
             saved_js,
             r#"var rel = "local.gif"; var abs = "/photo.jpg";"#
         );
+    }
+
+    /// Scoped external subresource recovery fetches embedded assets on unrelated non-tracker
+    /// hosts from Wayback, localizes only those with usable non-HTML captures, rejects HTML
+    /// error pages returned for external assets, and never queries trackers or outbound links.
+    #[tokio::test]
+    async fn download_site_recovers_and_localizes_external_embedded_images_while_skipping_links_and_html_errors() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let page_url = "http://example.com/forums/topic.html";
+        let good_ext_img = "http://img123.imageshack.us/img123/shot.jpg";
+        let html_error_ext_img = "http://home.comcast.net/~user/deleted.gif";
+        let fake_mime_html_ext_img = "http://home.comcast.net/~user/fake.jpg";
+        let missing_ext_img = "http://dead.invalid/missing.png";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {page_url} text/html 200 TOPIC 200\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", good_ext_img))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {good_ext_img} image/jpeg 200 SHOT 4\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", html_error_ext_img))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {html_error_ext_img} text/html 200 ERR 40\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", fake_mime_html_ext_img))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {fake_mime_html_ext_img} image/jpeg 200 FAKE 40\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", missing_ext_img))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(path(format!("/web/{timestamp}id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                r#"<html><body>"#,
+                r#"<img src="http://img123.imageshack.us/img123/shot.jpg">"#,
+                r#"<img src="http://home.comcast.net/~user/deleted.gif">"#,
+                r#"<img src="http://home.comcast.net/~user/fake.jpg">"#,
+                r#"<img src="http://dead.invalid/missing.png">"#,
+                r#"<img src="http://www.google-analytics.com/__utm.gif">"#,
+                r#"<a href="http://other.invalid/article.html">Read</a>"#,
+                r#"</body></html>"#,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{good_ext_img}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(b"\xff\xd8\xff\xd9".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{fake_mime_html_ext_img}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html><body>Image removed</body></html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("external-assets-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                include_external_assets: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 2);
+        assert_eq!(report.extra_downloads, 1);
+        assert_eq!(report.missing_local_links, 0);
+        assert_eq!(
+            std::fs::read(output.path().join("_hosts/img123.imageshack.us/img123/shot.jpg"))
+                .unwrap(),
+            b"\xff\xd8\xff\xd9"
+        );
+        assert!(!output.path().join("_hosts/home.comcast.net").exists());
+        assert!(!output.path().join("_hosts/dead.invalid").exists());
+
+        let saved_page = std::fs::read_to_string(output.path().join("forums/topic.html")).unwrap();
+        assert!(
+            saved_page.contains(r#"src="../_hosts/img123.imageshack.us/img123/shot.jpg""#),
+            "{saved_page}"
+        );
+        assert!(
+            saved_page.contains(r#"src="http://home.comcast.net/~user/deleted.gif""#),
+            "rejected CDX HTML error asset must stay external: {saved_page}"
+        );
+        assert!(
+            saved_page.contains(r#"src="http://home.comcast.net/~user/fake.jpg""#),
+            "rejected HTML response asset must stay external: {saved_page}"
+        );
+        assert!(
+            saved_page.contains(r#"src="http://dead.invalid/missing.png""#),
+            "uncaptured external asset must stay external: {saved_page}"
+        );
+        assert!(
+            saved_page.contains(r#"href="http://other.invalid/article.html""#),
+            "{saved_page}"
+        );
+    }
+
+    /// Disabling external subresource recovery (`--no-external-assets`) must not query
+    /// unrelated external hosts in Wayback.
+    #[tokio::test]
+    async fn download_site_skips_external_subresources_when_disabled() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let page_url = "http://example.com/index.html";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {page_url} text/html 200 PAGE 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><img src="http://img123.imageshack.us/shot.jpg"></body></html>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("no-external-assets-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                include_external_assets: false,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 1);
+        assert_eq!(report.extra_downloads, 0);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(!output.path().join("_hosts").exists());
+        let saved = std::fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert!(
+            saved.contains(r#"src="http://img123.imageshack.us/shot.jpg""#),
+            "{saved}"
+        );
+    }
+
+    /// An external stylesheet recovered from Wayback must also recover its own CSS subresources
+    /// (such as background images or fonts) and localize both the HTML and CSS references.
+    #[tokio::test]
+    async fn download_site_recovers_external_css_and_its_subresource() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let page_url = "http://example.com/index.html";
+        let css_url = "http://cdn.thirdparty.test/theme.css";
+        let bg_url = "http://cdn.thirdparty.test/bg.png";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {page_url} text/html 200 PAGE 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", css_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {css_url} text/css 200 CSS 32\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", bg_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {bg_url} image/png 200 BG 4\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><head><link rel="stylesheet" href="http://cdn.thirdparty.test/theme.css"></head></html>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{css_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/css")
+                    .set_body_string("body { background: url(bg.png); }"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{bg_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("external-css-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                include_external_assets: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 3);
+        assert_eq!(report.extra_downloads, 2);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("_hosts/cdn.thirdparty.test/theme.css").is_file());
+        assert!(output.path().join("_hosts/cdn.thirdparty.test/bg.png").is_file());
+        let saved_page = std::fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert!(
+            saved_page.contains(r#"href="_hosts/cdn.thirdparty.test/theme.css""#),
+            "{saved_page}"
+        );
+        let saved_css =
+            std::fs::read_to_string(output.path().join("_hosts/cdn.thirdparty.test/theme.css"))
+                .unwrap();
+        assert_eq!(saved_css, "body { background: url(bg.png); }");
     }
 }

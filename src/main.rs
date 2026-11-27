@@ -82,6 +82,10 @@ struct Cli {
     #[arg(long)]
     no_wayback_comment: bool,
 
+    /// Skip recovering embedded subresources (images, stylesheets, scripts, media) from unrelated external hosts.
+    #[arg(long)]
+    no_external_assets: bool,
+
     /// Skip post-download validation of generated local links.
     #[arg(long)]
     no_validate_links: bool,
@@ -232,6 +236,7 @@ async fn run(started_at: Instant) -> Result<ExitCode> {
 			recover_existing: cli.recover_existing,
             rewrite_links: !cli.no_rewrite,
             add_wayback_comment: !cli.no_wayback_comment,
+            include_external_assets: !cli.no_external_assets,
             extra_download_max_bytes,
             validate_links: !cli.no_validate_links,
             cancellation: cancellation.clone(),
@@ -655,5 +660,19 @@ mod tests {
         ])
         .unwrap();
         assert!(disabled_cli.no_wayback_comment);
+    }
+
+    #[test]
+    fn external_assets_are_enabled_by_default_and_disabled_by_flag() {
+        let default_cli = Cli::try_parse_from(["webarchive-downloader-rust", "example.com"]).unwrap();
+        assert!(!default_cli.no_external_assets);
+
+        let disabled_cli = Cli::try_parse_from([
+            "webarchive-downloader-rust",
+            "example.com",
+            "--no-external-assets",
+        ])
+        .unwrap();
+        assert!(disabled_cli.no_external_assets);
     }
 }

@@ -49,6 +49,7 @@ fn options(output_dir: &Path, max_bytes: Option<u64>) -> DownloadOptions {
 		recover_existing: false,
 		rewrite_links: true,
 		add_wayback_comment: true,
+		include_external_assets: true,
 		extra_download_max_bytes: max_bytes,
 		validate_links: true,
 		cancellation: CancellationFlag::new(),

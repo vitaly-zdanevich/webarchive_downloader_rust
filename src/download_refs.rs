@@ -6,19 +6,23 @@ use lol_html::{HtmlRewriter, Settings, element};
 use url::Url;
 
 use crate::html_attrs::decoded_attribute;
-use crate::link_validation::extract_document_references;
-use crate::noise::is_archive_noise_reference;
+use crate::link_validation::{ReferenceOrigin, extract_typed_document_references};
+use crate::noise::{is_archive_noise_reference, is_external_tracker_or_ad_host};
 use crate::pathmap::{SiteMapper, unwrap_wayback_url};
 use crate::rewrite::extract_html_base_url;
 use crate::text_encoding::TextDocumentKind;
 
 /// Finds related archived pages and resources without restricting file extensions.
+/// When `include_external_assets` is true, also discovers embedded subresources (such as
+/// images, stylesheets, scripts, and media) on unrelated non-tracker hosts without crawling
+/// outbound navigation links.
 /// Only HTTP(S) URLs are returned; the caller queries Wayback, never the live site.
 pub(crate) fn extract_related_references(
 	input: &str,
 	base_url: &Url,
 	mapper: &SiteMapper,
 	kind: TextDocumentKind,
+	include_external_assets: bool,
 ) -> Result<Vec<String>> {
 	let effective_base = match kind {
 		TextDocumentKind::Html => {
@@ -26,9 +30,12 @@ pub(crate) fn extract_related_references(
 		}
 		TextDocumentKind::Css | TextDocumentKind::JavaScript => base_url.clone(),
 	};
+	let base_is_related = base_url
+		.host_str()
+		.is_some_and(|host| mapper.is_related_host(host));
 	let mut references = Vec::new();
-	for value in extract_document_references(input, kind)? {
-		let value = value.trim();
+	for extracted in extract_typed_document_references(input, kind)? {
+		let value = extracted.value.trim();
 		if value.is_empty() || value.starts_with('#') {
 			continue;
 		}
@@ -36,10 +43,23 @@ pub(crate) fn extract_related_references(
 			continue;
 		};
 		url.set_fragment(None);
-		if matches!(url.scheme(), "http" | "https")
-			&& url.host_str().is_some_and(|host| mapper.is_related_host(host))
-			&& !is_archive_noise_reference(url.as_str())
-			&& !is_interactive_forum_extra_reference(&url)
+		if !matches!(url.scheme(), "http" | "https") {
+			continue;
+		}
+		let Some(host) = url.host_str() else {
+			continue;
+		};
+		if mapper.is_related_host(host) {
+			if (base_is_related || kind == TextDocumentKind::Css)
+				&& !is_archive_noise_reference(url.as_str())
+				&& !is_interactive_forum_extra_reference(&url)
+			{
+				references.push(url.to_string());
+			}
+		} else if include_external_assets
+			&& extracted.origin == ReferenceOrigin::EmbeddedSubresource
+			&& (base_is_related || kind == TextDocumentKind::Css)
+			&& is_eligible_external_subresource_url(&url)
 		{
 			references.push(url.to_string());
 		}
@@ -47,6 +67,18 @@ pub(crate) fn extract_related_references(
 	references.sort();
 	references.dedup();
 	Ok(references)
+}
+
+/// Returns true when an unrelated-host URL is an eligible non-tracker embedded subresource.
+pub(crate) fn is_eligible_external_subresource_url(url: &Url) -> bool {
+	let Some(host) = url.host_str() else {
+		return false;
+	};
+	matches!(url.scheme(), "http" | "https")
+		&& !url.path().is_empty()
+		&& url.path() != "/"
+		&& !is_external_tracker_or_ad_host(host)
+		&& !is_archive_noise_reference(url.as_str())
 }
 
 /// Returns the HTML document's effective base URL (honoring `<base href>`) and all
@@ -270,7 +302,7 @@ mod tests {
 		let references = extract_related_references(r#"<a href="view.php?a=1&amp;b=2">Page</a>
 <img src="img/a&#38;b.gif"><source srcset="img/c&#x26;d.gif 2x">
 <style>i { background:url('img/literal&amp;name.gif'); }</style>
-<script>image.src = 'img/literal&amp;name.gif'; document.write('<img src="img/generated&amp;name.gif">');</script>"#, &base, &mapper, TextDocumentKind::Html).unwrap();
+<script>image.src = 'img/literal&amp;name.gif'; document.write('<img src="img/generated&amp;name.gif">');</script>"#, &base, &mapper, TextDocumentKind::Html, false).unwrap();
 		assert_eq!(references, vec![
 			"http://example.com/img/a&b.gif",
 			"http://example.com/img/c&d.gif",
@@ -287,13 +319,13 @@ mod tests {
 		let base = Url::parse("http://example.com/pages/index.html").unwrap();
 		let refs = extract_related_references(
 			r#"<a href=next>Next</a><img srcset='//assets.example.com/a.gif 1x, /b.gif 2x'><a href='https://web.archive.org/web/20080101000000/http://example.com/viewtopic.php?t=7&amp;p=9'>Topic</a><a href='javascript:alert(1)'>JS</a><a href='https://unrelated.invalid/a.html'>External</a>"#,
-			&base, &mapper, TextDocumentKind::Html).unwrap();
+			&base, &mapper, TextDocumentKind::Html, false).unwrap();
 		assert!(refs.contains(&"http://example.com/pages/next".to_owned()));
 		assert!(refs.contains(&"http://assets.example.com/a.gif".to_owned()));
 		assert!(refs.contains(&"http://example.com/b.gif".to_owned()));
 		assert!(refs.contains(&"http://example.com/viewtopic.php?t=7&p=9".to_owned()));
 		assert_eq!(refs.len(), 4);
-		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, TextDocumentKind::Css).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
+		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, TextDocumentKind::Css, false).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
 	}
 
 	/// Discovers downloads on related hosts without including unrelated sites.
@@ -306,6 +338,7 @@ mod tests {
 			&base,
 			&mapper,
 			TextDocumentKind::Html,
+			true,
 		).unwrap();
 
 		assert_eq!(
@@ -314,7 +347,7 @@ mod tests {
 		);
 	}
 
-	/// Discovers static assets on related hosts without including unrelated sites.
+	/// Discovers static assets on related hosts without including unrelated sites when disabled.
 	#[test]
 	fn extracts_related_static_asset_links() {
 		let mapper = SiteMapper::new("example.com").unwrap();
@@ -324,12 +357,64 @@ mod tests {
 			&base,
 			&mapper,
 			TextDocumentKind::Html,
+			false,
 		).unwrap();
 
 		assert_eq!(
 			references,
 			vec!["http://downloads.example.com/files/preview/shot.jpg".to_owned()]
 		);
+	}
+
+	/// External subresource discovery collects embedded assets on unrelated non-tracker hosts
+	/// while excluding outbound navigation links, iframes, trackers, and root-only URLs.
+	#[test]
+	fn extracts_external_embedded_subresources_only_when_enabled_and_skips_navigation_and_trackers() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://www.example.com/forums/topic.html").unwrap();
+		let html = concat!(
+			r#"<img src="http://img123.imageshack.us/img123/shot.jpg">"#,
+			r#"<img src="http://home.comcast.net/~user/sig.gif">"#,
+			r#"<link rel="stylesheet" href="http://cdn.thirdparty.test/theme.css">"#,
+			r#"<link rel="canonical" href="http://other.test/canonical.html">"#,
+			r#"<a href="http://other.test/article.html">Article</a>"#,
+			r#"<a href="http://other.test/big.zip">Zip</a>"#,
+			r#"<iframe src="http://ads.thirdparty.test/frame.html"></iframe>"#,
+			r#"<img src="http://www.google-analytics.com/__utm.gif">"#,
+			r#"<img src="http://imageshack.us/">"#,
+		);
+		let references =
+			extract_related_references(html, &base, &mapper, TextDocumentKind::Html, true).unwrap();
+		assert_eq!(
+			references,
+			vec![
+				"http://cdn.thirdparty.test/theme.css".to_owned(),
+				"http://home.comcast.net/~user/sig.gif".to_owned(),
+				"http://img123.imageshack.us/img123/shot.jpg".to_owned(),
+			]
+		);
+
+		let external_css_base = Url::parse("http://cdn.thirdparty.test/theme.css").unwrap();
+		let css_refs = extract_related_references(
+			"body { background: url(bg.png); }",
+			&external_css_base,
+			&mapper,
+			TextDocumentKind::Css,
+			true,
+		)
+		.unwrap();
+		assert_eq!(css_refs, vec!["http://cdn.thirdparty.test/bg.png".to_owned()]);
+
+		let external_js_base = Url::parse("http://cdn.thirdparty.test/widget.js").unwrap();
+		let js_refs = extract_related_references(
+			r#"var img = "http://other.thirdparty.test/pic.png";"#,
+			&external_js_base,
+			&mapper,
+			TextDocumentKind::JavaScript,
+			true,
+		)
+		.unwrap();
+		assert!(js_refs.is_empty(), "external JS must not crawl further external hosts: {js_refs:?}");
 	}
 
 	/// Per-post quote, reply, private-message compose, email, and login redirect actions
@@ -356,6 +441,7 @@ mod tests {
 			&base,
 			&mapper,
 			TextDocumentKind::Html,
+			false,
 		)
 		.unwrap();
 
@@ -380,6 +466,7 @@ mod tests {
 			&base,
 			&mapper,
 			TextDocumentKind::Html,
+			false,
 		)
 		.unwrap();
 
@@ -408,7 +495,8 @@ mod tests {
 			document.write('<img src="/img/written.png">');
 		"#;
 		let references =
-			extract_related_references(js, &base, &mapper, TextDocumentKind::JavaScript).unwrap();
+			extract_related_references(js, &base, &mapper, TextDocumentKind::JavaScript, false)
+				.unwrap();
 		assert_eq!(
 			references,
 			vec![

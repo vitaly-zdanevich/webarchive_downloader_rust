@@ -12,6 +12,50 @@ pub fn is_archive_noise_reference(original: &str) -> bool {
     is_archive_noise_url_with_mimetype(original, mimetype)
 }
 
+/// Identifies third-party analytics, advertising, tracking pixel, and hit-counter hosts
+/// that should not be recovered as external embedded subresources.
+pub fn is_external_tracker_or_ad_host(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    const TRACKER_DOMAINS: &[&str] = &[
+        "2mdn.net",
+        "adbrite.com",
+        "addthis.com",
+        "adnxs.com",
+        "adserver.com",
+        "advertising.com",
+        "burstnet.com",
+        "casalemedia.com",
+        "counter.rambler.ru",
+        "counter.yadro.ru",
+        "doubleclick.net",
+        "extreme-dm.com",
+        "facebook.net",
+        "fastclick.net",
+        "google-analytics.com",
+        "googleadservices.com",
+        "googlesyndication.com",
+        "googletagmanager.com",
+        "hit.gemius.pl",
+        "hitbox.com",
+        "hotlog.ru",
+        "mc.yandex.ru",
+        "nedstatbasic.net",
+        "quantserve.com",
+        "scorecardresearch.com",
+        "sharethis.com",
+        "sitemeter.com",
+        "spylog.com",
+        "statcounter.com",
+        "top.mail.ru",
+        "top100.rambler.ru",
+        "tribalfusion.com",
+        "valueclick.com",
+    ];
+    TRACKER_DOMAINS
+        .iter()
+        .any(|domain| normalized == *domain || normalized.ends_with(&format!(".{domain}")))
+}
+
 fn is_archive_noise_record_url_with_mimetype(original: &str, mimetype: &str) -> bool {
     let Ok(url) = Url::parse(original) else {
         return false;
@@ -382,6 +426,28 @@ mod tests {
                 is_archive_noise_record(&html_record(noise_url)),
                 "expected {noise_url} to be rejected as archive noise"
             );
+        }
+    }
+
+    #[test]
+    fn identifies_external_tracker_and_ad_hosts() {
+        for tracker in [
+            "google-analytics.com",
+            "www.google-analytics.com",
+            "pagead2.googlesyndication.com",
+            "ad.doubleclick.net",
+            "c.statcounter.com",
+            "counter.yadro.ru.",
+        ] {
+            assert!(is_external_tracker_or_ad_host(tracker), "{tracker}");
+        }
+        for legitimate in [
+            "img123.imageshack.us",
+            "home.comcast.net",
+            "i42.photobucket.com",
+            "cdn.example.net",
+        ] {
+            assert!(!is_external_tracker_or_ad_host(legitimate), "{legitimate}");
         }
     }
 }

@@ -12,11 +12,14 @@ use crate::html_attrs::decoded_attribute;
 use crate::text_encoding::TextDocumentKind;
 
 macro_rules! collect_attr {
-    ($selector:literal, $attr:literal, $references:ident) => {{
+    ($selector:literal, $attr:literal, $references:ident, $origin:expr) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
             if let Some(value) = decoded_attribute(element, $attr) {
-                references.borrow_mut().push(value);
+                references.borrow_mut().push(ExtractedReference {
+                    value,
+                    origin: $origin,
+                });
             }
             Ok(())
         })
@@ -28,9 +31,14 @@ macro_rules! collect_srcset_attr {
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
             if let Some(value) = decoded_attribute(element, $attr) {
-                references
-                    .borrow_mut()
-                    .extend(parse_srcset_references(&value));
+                references.borrow_mut().extend(
+                    parse_srcset_references(&value)
+                        .into_iter()
+                        .map(|value| ExtractedReference {
+                            value,
+                            origin: ReferenceOrigin::EmbeddedSubresource,
+                        }),
+                );
             }
             Ok(())
         })
@@ -52,13 +60,16 @@ macro_rules! collect_javascript_attr {
 }
 
 macro_rules! collect_guarded_attr {
-    ($selector:literal, $attr:literal, $references:ident) => {{
+    ($selector:literal, $attr:literal, $references:ident, $origin:expr) => {{
         let references = Rc::clone(&$references);
         element!($selector, move |element| {
             if let Some(value) = decoded_attribute(element, $attr)
                 && looks_like_url_reference_or_file(&value)
             {
-                references.borrow_mut().push(value);
+                references.borrow_mut().push(ExtractedReference {
+                    value,
+                    origin: $origin,
+                });
             }
             Ok(())
         })
@@ -105,14 +116,33 @@ impl LinkValidationReport {
 	}
 }
 
-/// Reuses the validation parser to discover archived HTML, CSS, and JavaScript dependencies.
-pub(crate) fn extract_document_references(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReferenceOrigin {
+    Navigation,
+    EmbeddedSubresource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedReference {
+    pub value: String,
+    pub origin: ReferenceOrigin,
+}
+
+/// Reuses the validation parser to discover archived HTML, CSS, and JavaScript dependencies
+/// along with whether each reference is navigational or an embedded page subresource.
+pub(crate) fn extract_typed_document_references(
 	input: &str,
 	kind: TextDocumentKind,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ExtractedReference>> {
 	match kind {
 		TextDocumentKind::Html => Ok(extract_html_references(input)?.references),
-		TextDocumentKind::Css => Ok(extract_css_url_references(input)),
+		TextDocumentKind::Css => Ok(extract_css_url_references(input)
+			.into_iter()
+			.map(|value| ExtractedReference {
+				value,
+				origin: ReferenceOrigin::EmbeddedSubresource,
+			})
+			.collect()),
 		TextDocumentKind::JavaScript => Ok(extract_javascript_string_references(input)),
 	}
 }
@@ -148,7 +178,11 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
                             descriptor,
                         }),
                 );
-                html_report.references
+                html_report
+                    .references
+                    .into_iter()
+                    .map(|reference| reference.value)
+                    .collect()
             } else {
                 extract_css_url_references(&input)
             };
@@ -177,8 +211,29 @@ pub fn validate_local_links(root: &Path) -> Result<LinkValidationReport> {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct HtmlReferenceReport {
-    references: Vec<String>,
+    references: Vec<ExtractedReference>,
     missing_image_sources: Vec<String>,
+}
+
+fn is_embedded_subresource_link(element: &lol_html::html_content::Element<'_, '_>) -> bool {
+    let Some(rel) = element.get_attribute("rel") else {
+        return false;
+    };
+    rel.split_whitespace().any(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "stylesheet"
+                | "icon"
+                | "shortcut"
+                | "apple-touch-icon"
+                | "apple-touch-icon-precomposed"
+                | "mask-icon"
+                | "manifest"
+                | "preload"
+                | "modulepreload"
+                | "prefetch"
+        )
+    })
 }
 
 fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
@@ -203,37 +258,85 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                 element!("*[href]", {
                     let references = Rc::clone(&references);
                     move |element| {
-                        if !element.tag_name().eq_ignore_ascii_case("base")
+                        let tag = element.tag_name();
+                        if !tag.eq_ignore_ascii_case("base")
                             && let Some(value) = decoded_attribute(element, "href")
                         {
-                            references.borrow_mut().push(value);
+                            let origin = if tag.eq_ignore_ascii_case("link")
+                                && is_embedded_subresource_link(element)
+                            {
+                                ReferenceOrigin::EmbeddedSubresource
+                            } else {
+                                ReferenceOrigin::Navigation
+                            };
+                            references
+                                .borrow_mut()
+                                .push(ExtractedReference { value, origin });
                         }
                         Ok(())
                     }
                 }),
-                collect_attr!("*[src]", "src", references),
-                collect_attr!("blockquote[cite]", "cite", references),
-                collect_attr!("q[cite]", "cite", references),
-                collect_attr!("del[cite]", "cite", references),
-                collect_attr!("ins[cite]", "cite", references),
+                element!("*[src]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if let Some(value) = decoded_attribute(element, "src") {
+                            let tag = element.tag_name();
+                            let origin = if tag.eq_ignore_ascii_case("frame")
+                                || tag.eq_ignore_ascii_case("iframe")
+                            {
+                                ReferenceOrigin::Navigation
+                            } else {
+                                ReferenceOrigin::EmbeddedSubresource
+                            };
+                            references
+                                .borrow_mut()
+                                .push(ExtractedReference { value, origin });
+                        }
+                        Ok(())
+                    }
+                }),
+                collect_attr!("blockquote[cite]", "cite", references, ReferenceOrigin::Navigation),
+                collect_attr!("q[cite]", "cite", references, ReferenceOrigin::Navigation),
+                collect_attr!("del[cite]", "cite", references, ReferenceOrigin::Navigation),
+                collect_attr!("ins[cite]", "cite", references, ReferenceOrigin::Navigation),
                 element!("form[action]", {
                     let references = Rc::clone(&references);
                     move |element| {
                         if let Some(value) = decoded_attribute(element, "action")
                             && !is_selectorless_query_required_form_action(&value)
                         {
-                            references.borrow_mut().push(value);
+                            references.borrow_mut().push(ExtractedReference {
+                                value,
+                                origin: ReferenceOrigin::Navigation,
+                            });
                         }
                         Ok(())
                     }
                 }),
-                collect_attr!("object[data]", "data", references),
-                collect_guarded_attr!("object[codebase]", "codebase", references),
-                collect_guarded_attr!("applet[code]", "code", references),
-                collect_guarded_attr!("option[value]", "value", references),
-                collect_guarded_attr!("param[value]", "value", references),
-                collect_attr!("video[poster]", "poster", references),
-                collect_attr!("*[background]", "background", references),
+                collect_attr!("object[data]", "data", references, ReferenceOrigin::EmbeddedSubresource),
+                collect_guarded_attr!("object[codebase]", "codebase", references, ReferenceOrigin::Navigation),
+                collect_guarded_attr!("applet[code]", "code", references, ReferenceOrigin::EmbeddedSubresource),
+                collect_guarded_attr!("option[value]", "value", references, ReferenceOrigin::Navigation),
+                element!("param[value]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if let Some(value) = decoded_attribute(element, "value")
+                            && looks_like_url_reference_or_file(&value)
+                        {
+                            let origin = if looks_like_static_subresource_reference(&value) {
+                                ReferenceOrigin::EmbeddedSubresource
+                            } else {
+                                ReferenceOrigin::Navigation
+                            };
+                            references
+                                .borrow_mut()
+                                .push(ExtractedReference { value, origin });
+                        }
+                        Ok(())
+                    }
+                }),
+                collect_attr!("video[poster]", "poster", references, ReferenceOrigin::EmbeddedSubresource),
+                collect_attr!("*[background]", "background", references, ReferenceOrigin::EmbeddedSubresource),
                 collect_srcset_attr!("*[srcset]", "srcset", references),
                 element!("applet[archive]", {
                     let references = Rc::clone(&references);
@@ -244,7 +347,10 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                                     .split(',')
                                     .map(str::trim)
                                     .filter(|value| looks_like_url_reference_or_file(value))
-                                    .map(str::to_owned),
+                                    .map(|value| ExtractedReference {
+                                        value: value.to_owned(),
+                                        origin: ReferenceOrigin::EmbeddedSubresource,
+                                    }),
                             );
                         }
                         Ok(())
@@ -259,7 +365,10 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                             && let Some(value) = decoded_attribute(element, "content")
                             && let Some(reference) = extract_meta_refresh_reference(&value)
                         {
-                            references.borrow_mut().push(reference);
+                            references.borrow_mut().push(ExtractedReference {
+                                value: reference,
+                                origin: ReferenceOrigin::Navigation,
+                            });
                         }
                         Ok(())
                     }
@@ -289,16 +398,26 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
                 }),
                 element!("*[style]", move |element| {
                     if let Some(value) = decoded_attribute(element, "style") {
-                        style_attr_references
-                            .borrow_mut()
-                            .extend(extract_css_url_references(&value));
+                        style_attr_references.borrow_mut().extend(
+                            extract_css_url_references(&value)
+                                .into_iter()
+                                .map(|value| ExtractedReference {
+                                    value,
+                                    origin: ReferenceOrigin::EmbeddedSubresource,
+                                }),
+                        );
                     }
                     Ok(())
                 }),
                 text!("style", move |chunk| {
-                    style_text_references
-                        .borrow_mut()
-                        .extend(extract_css_url_references(chunk.as_str()));
+                    style_text_references.borrow_mut().extend(
+                        extract_css_url_references(chunk.as_str())
+                            .into_iter()
+                            .map(|value| ExtractedReference {
+                                value,
+                                origin: ReferenceOrigin::EmbeddedSubresource,
+                            }),
+                    );
                     Ok(())
                 }),
                 text!("script", move |chunk| {
@@ -390,11 +509,19 @@ fn parse_srcset_references(input: &str) -> Vec<String> {
 }
 
 /// Discovers decoded URL strings and generated HTML dependencies using the same JS parser as rewriting.
-fn extract_javascript_string_references(input: &str) -> Vec<String> {
+fn extract_javascript_string_references(input: &str) -> Vec<ExtractedReference> {
 	let mut references = Vec::new();
 	for literal in crate::javascript::strings(input) {
 		if !literal.is_concatenated && looks_like_javascript_url_reference(&literal.value) {
-			references.push(literal.value);
+			let origin = if looks_like_static_subresource_reference(&literal.value) {
+				ReferenceOrigin::EmbeddedSubresource
+			} else {
+				ReferenceOrigin::Navigation
+			};
+			references.push(ExtractedReference {
+				value: literal.value,
+				origin,
+			});
 		} else if literal.value.contains('<') && literal.value.contains('>')
 			&& let Ok(fragment) = extract_html_references(&literal.value)
 		{
@@ -403,6 +530,46 @@ fn extract_javascript_string_references(input: &str) -> Vec<String> {
 	}
 
 	references
+}
+
+fn looks_like_static_subresource_reference(value: &str) -> bool {
+	let path = strip_query_and_fragment(value.trim());
+	let Some(file_name) = path.rsplit('/').next() else {
+		return false;
+	};
+	let Some((_, extension)) = file_name.rsplit_once('.') else {
+		return false;
+	};
+	matches!(
+		extension.to_ascii_lowercase().as_str(),
+		"bmp"
+			| "css"
+			| "eot"
+			| "gif"
+			| "ico"
+			| "jpe"
+			| "jpeg"
+			| "jpg"
+			| "js"
+			| "m4a"
+			| "mid"
+			| "midi"
+			| "mjs"
+			| "mov"
+			| "mp3"
+			| "mp4"
+			| "ogg"
+			| "otf"
+			| "png"
+			| "svg"
+			| "swf"
+			| "ttf"
+			| "wav"
+			| "webm"
+			| "webp"
+			| "woff"
+			| "woff2"
+	)
 }
 
 fn looks_like_javascript_url_reference(value: &str) -> bool {

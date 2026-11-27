@@ -75,6 +75,7 @@ trait ReferenceRewriter {
 struct LocalPathRemapper<'a> {
     current_local_path: &'a Path,
     remapped_paths: &'a HashMap<PathBuf, PathBuf>,
+    external_url_remappings: &'a HashMap<String, PathBuf>,
     changed: Cell<bool>,
 }
 
@@ -92,11 +93,45 @@ impl ReferenceRewriter for RewriteContext<'_> {
 impl ReferenceRewriter for LocalPathRemapper<'_> {
     fn rewrite_reference(&self, value: &str, _kind: ReferenceKind) -> Option<UrlRewrite> {
         let trimmed = value.trim();
-        if trimmed.is_empty() || should_skip_reference(trimmed) {
+        if trimmed.is_empty() {
             return None;
         }
         let (without_fragment, fragment) = split_fragment(trimmed);
-        if without_fragment.is_empty()
+        if without_fragment.is_empty() {
+            return None;
+        }
+
+        if !self.external_url_remappings.is_empty() {
+            let unwrapped = unwrap_wayback_url(without_fragment);
+            let lower = unwrapped.to_ascii_lowercase();
+            let external_target = if lower.starts_with("http://") || lower.starts_with("https://") {
+                self.external_url_remappings
+                    .get(&normalize_lookup_url(&unwrapped))
+            } else if unwrapped.starts_with("//") {
+                self.external_url_remappings
+                    .get(&normalize_lookup_url(&format!("http:{unwrapped}")))
+                    .or_else(|| {
+                        self.external_url_remappings
+                            .get(&normalize_lookup_url(&format!("https:{unwrapped}")))
+                    })
+            } else {
+                None
+            };
+            if let Some(actual_target) = external_target {
+                let mut rewritten = relative_link(self.current_local_path, actual_target);
+                if let Some(fragment) = fragment {
+                    rewritten.push('#');
+                    rewritten.push_str(fragment);
+                }
+                if rewritten != value {
+                    self.changed.set(true);
+                    return Some(UrlRewrite::Rewrite(rewritten));
+                }
+                return None;
+            }
+        }
+
+        if should_skip_reference(trimmed)
             || without_fragment.contains('?')
             || without_fragment.ends_with('/')
         {
@@ -124,10 +159,14 @@ impl ReferenceRewriter for LocalPathRemapper<'_> {
     }
 
     fn rewrite_embedded_html(&self, value: &str) -> Option<String> {
-        let rewritten =
-            remap_local_html_paths(value, self.current_local_path, self.remapped_paths)
-                .ok()
-                .flatten()?;
+        let rewritten = remap_local_html_paths(
+            value,
+            self.current_local_path,
+            self.remapped_paths,
+            self.external_url_remappings,
+        )
+        .ok()
+        .flatten()?;
         self.changed.set(true);
         Some(rewritten)
     }
@@ -248,9 +287,9 @@ impl<'a> RewriteContext<'a> {
         } else if kind == ReferenceKind::Document && is_downloadable_file_url(&lookup_url) {
             self.downloadable_fallback_path(&lookup_url)
         } else if is_extra_file_url(&lookup_url) {
-            self.related_resource_fallback_path(&lookup_url, kind)
+            self.related_resource_fallback_path(&lookup_url, kind, &archive_unwrapped)
         } else {
-            self.fallback_same_site_path(&lookup_url, kind)
+            self.fallback_same_site_path(&lookup_url, kind, &archive_unwrapped)
         };
 
         let Some(local_path) = local_path else {
@@ -282,22 +321,36 @@ impl<'a> RewriteContext<'a> {
         Some(UrlRewrite::Rewrite(rewritten))
     }
 
-    fn fallback_same_site_path(&self, url: &Url, kind: ReferenceKind) -> Option<PathBuf> {
+    fn fallback_same_site_path(
+        &self,
+        url: &Url,
+        kind: ReferenceKind,
+        raw_unwrapped: &str,
+    ) -> Option<PathBuf> {
         if kind == ReferenceKind::Resource
             && (url.path().is_empty() || url.path().ends_with('/'))
         {
             return None;
         }
-		if let Some(mapper) = self.mapper
-			&& mapper.is_related_host(url.host_str()?)
-		{
-			let mime = match kind {
-				ReferenceKind::Document => "text/html",
-				ReferenceKind::Resource => "application/octet-stream",
-			};
-			return mapper.local_path_for_url(url.as_str(), mime).ok();
-		}
-        if !hosts_are_same_site(self.current_original.host_str()?, url.host_str()?) {
+        let host = url.host_str()?;
+        if let Some(mapper) = self.mapper {
+            let mime = match kind {
+                ReferenceKind::Document => "text/html",
+                ReferenceKind::Resource => "application/octet-stream",
+            };
+            if mapper.is_related_host(host) {
+                return mapper.local_path_for_url(url.as_str(), mime).ok();
+            }
+            let lower = raw_unwrapped.to_ascii_lowercase();
+            let is_absolute = lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || raw_unwrapped.starts_with("//");
+            if !is_absolute && hosts_are_same_site(self.current_original.host_str()?, host) {
+                return mapper.local_path_for_url(url.as_str(), mime).ok();
+            }
+            return None;
+        }
+        if !hosts_are_same_site(self.current_original.host_str()?, host) {
             return None;
         }
 
@@ -323,7 +376,12 @@ impl<'a> RewriteContext<'a> {
         }
     }
 
-    fn related_resource_fallback_path(&self, url: &Url, kind: ReferenceKind) -> Option<PathBuf> {
+    fn related_resource_fallback_path(
+        &self,
+        url: &Url,
+        kind: ReferenceKind,
+        raw_unwrapped: &str,
+    ) -> Option<PathBuf> {
         if kind == ReferenceKind::Resource
             && (url.path().is_empty() || url.path().ends_with('/'))
         {
@@ -331,7 +389,7 @@ impl<'a> RewriteContext<'a> {
         }
         let host = url.host_str()?;
         if hosts_are_same_site(self.current_original.host_str()?, host) {
-            return self.fallback_same_site_path(url, kind);
+            return self.fallback_same_site_path(url, kind, raw_unwrapped);
         }
         let mapper = self.mapper?;
         if !mapper.is_related_host(host) {
@@ -598,36 +656,40 @@ fn rewrite_css_references<R: ReferenceRewriter>(
 	rewritten
 }
 
-/// Updates already-rewritten local references in one CSS document when late extra-download
-/// discovery resolves a fallback path to a different on-disk filename.
+/// Updates already-rewritten local references and newly recovered external subresource URLs
+/// in one CSS document when late extra-download discovery resolves final on-disk paths.
 ///
 /// Returns `None` when no reference changed so untouched files stay unmodified.
 pub(crate) fn remap_local_css_paths(
 	input: &str,
 	current_local_path: &Path,
 	remapped_paths: &HashMap<PathBuf, PathBuf>,
+	external_url_remappings: &HashMap<String, PathBuf>,
 ) -> Option<String> {
 	let remapper = LocalPathRemapper {
 		current_local_path,
 		remapped_paths,
+		external_url_remappings,
 		changed: Cell::new(false),
 	};
 	let rewritten = rewrite_css_references(input, &remapper, false);
 	remapper.changed.get().then_some(rewritten)
 }
 
-/// Updates already-rewritten local references in one HTML document when late extra-download
-/// discovery resolves a fallback path to a different on-disk filename.
+/// Updates already-rewritten local references and newly recovered external subresource URLs
+/// in one HTML document when late extra-download discovery resolves final on-disk paths.
 ///
 /// Returns `Ok(None)` when no reference changed so untouched files stay unmodified.
 pub(crate) fn remap_local_html_paths(
 	input: &str,
 	current_local_path: &Path,
 	remapped_paths: &HashMap<PathBuf, PathBuf>,
+	external_url_remappings: &HashMap<String, PathBuf>,
 ) -> Result<Option<String>> {
 	let remapper = LocalPathRemapper {
 		current_local_path,
 		remapped_paths,
+		external_url_remappings,
 		changed: Cell::new(false),
 	};
 	let remapper_ref = &remapper;
@@ -1992,9 +2054,15 @@ mod tests {
             r#"<script>var word = 'photo'; var src = '../thumb__q_abc.php'; document.write('<img src="../photo">');</script>"#,
         );
 
-        let updated = remap_local_html_paths(html, Path::new("sub/index.html"), &remapped)
-            .unwrap()
-            .expect("HTML should be updated");
+        let empty_external = HashMap::new();
+        let updated = remap_local_html_paths(
+            html,
+            Path::new("sub/index.html"),
+            &remapped,
+            &empty_external,
+        )
+        .unwrap()
+        .expect("HTML should be updated");
 
         assert!(
             updated.starts_with("<!-- Saved from Wayback Machine:"),
@@ -2034,21 +2102,64 @@ mod tests {
 
         let untouched_html = r#"<img src="../existing.gif">"#;
         assert_eq!(
-            remap_local_html_paths(untouched_html, Path::new("sub/index.html"), &remapped)
-                .unwrap(),
+            remap_local_html_paths(
+                untouched_html,
+                Path::new("sub/index.html"),
+                &remapped,
+                &empty_external,
+            )
+            .unwrap(),
             None
         );
 
         let css = "body { background: url(photo); } .keep { background: url(dir/); }";
         let updated_css =
-            remap_local_css_paths(css, Path::new("style.css"), &remapped).unwrap();
+            remap_local_css_paths(css, Path::new("style.css"), &remapped, &empty_external)
+                .unwrap();
         assert_eq!(
             updated_css,
             "body { background: url(photo.jpg); } .keep { background: url(dir/); }"
         );
         assert_eq!(
-            remap_local_css_paths("body { color: red; }", Path::new("style.css"), &remapped),
+            remap_local_css_paths(
+                "body { color: red; }",
+                Path::new("style.css"),
+                &remapped,
+                &empty_external,
+            ),
             None
+        );
+
+        let mut external_remapped = HashMap::new();
+        external_remapped.insert(
+            "http://img123.imageshack.us/shot.jpg".to_owned(),
+            PathBuf::from("_hosts/img123.imageshack.us/shot.jpg"),
+        );
+        let ext_html = concat!(
+            r#"<img src="http://img123.imageshack.us/shot.jpg">"#,
+            r#"<img src="//img123.imageshack.us/shot.jpg">"#,
+            r#"<img src="http://dead.invalid/missing.jpg">"#,
+        );
+        let ext_updated = remap_local_html_paths(
+            ext_html,
+            Path::new("forums/topic.html"),
+            &HashMap::new(),
+            &external_remapped,
+        )
+        .unwrap()
+        .expect("recovered external URLs should be localized");
+        assert!(
+            ext_updated.contains(r#"src="../_hosts/img123.imageshack.us/shot.jpg""#),
+            "{ext_updated}"
+        );
+        assert_eq!(
+            ext_updated.matches(r#"../_hosts/img123.imageshack.us/shot.jpg"#).count(),
+            2,
+            "{ext_updated}"
+        );
+        assert!(
+            ext_updated.contains(r#"src="http://dead.invalid/missing.jpg""#),
+            "uncaptured external URLs must stay intact: {ext_updated}"
         );
     }
 
