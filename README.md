@@ -384,9 +384,11 @@ Repeated body-read or decoding failures also trigger alternate-capture lookup.
 Alternate body recovery and static-asset evidence searches have no twenty-capture
 limit; all eligible indexed candidates can be considered.
 
-The downloader canonicalizes volatile query parameters such as `sid=...`,
-`PHPSESSID=...`, `ticket=...`, and forum sort/highlight/mark parameters so
-session-only variants map to one local file. Forum profile, member-list, search,
+The downloader canonicalizes only genuine session query parameters such as
+`PHPSESSID=...`, `JSESSIONID=...`, `session_id=...`, and token-valued `sid=...`
+so session-only variants map to one local file while keeping content-selecting
+parameters (including pagination, sort, ticket, and short numeric `sid` IDs)
+as distinct pages. Forum profile, member-list, search,
 login, and posting pages are retained when Wayback captured them because they
 can contain historical content. Common cPanel/hosting placeholder paths such as
 `cgi-sys/`, `img-sys/`, `sys_cpanel/`, `cgi-bin/`, and root `welcome.png` IIS

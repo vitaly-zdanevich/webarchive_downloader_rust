@@ -554,9 +554,10 @@ fn existing_html_navigation_target(root: &Path, file: &Path, href: &str) -> Opti
 		return None;
 	}
 	let url = Url::parse("https://local-repair.invalid/").ok()?.join(href).ok()?;
-	if url.query_pairs().any(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(),
-		"sid" | "sessionid" | "session_id" | "phpsessid" | "jsessionid" | "aspsessionid" | "cfid" | "cftoken"
-	)) {
+	if url
+		.query_pairs()
+		.any(|(key, value)| !crate::pathmap::is_volatile_query_param(&key, &value))
+	{
 		return None;
 	}
 	let candidate = target.with_file_name(format!("{}.html", target.file_name()?.to_str()?));

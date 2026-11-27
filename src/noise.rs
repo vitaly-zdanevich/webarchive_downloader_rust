@@ -84,6 +84,14 @@ pub fn is_archive_noise_url_with_mimetype(original: &str, mimetype: &str) -> boo
         return true;
     }
 
+    if is_background_noise_script_path(&path)
+        && url
+            .query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("cron_type"))
+    {
+        return true;
+    }
+
     if has_interactive_action_query(&url) {
         return true;
     }
@@ -324,6 +332,10 @@ mod tests {
         assert!(!is_archive_noise_url(
             "http://smallrockets.com/bimages/ic_logo.gif"
         ));
+        assert!(!is_archive_noise_url("http://example.com/list.php?st=0"));
+        assert!(!is_archive_noise_url("http://example.com/list.php?st=20"));
+        assert!(!is_archive_noise_url("http://example.com/view.php?ticket=42"));
+        assert!(!is_archive_noise_url("http://example.com/article.php?sid=42"));
     }
 
     /// Valid pages captured in Wayback only with an empty `?` or volatile `?sid=...`

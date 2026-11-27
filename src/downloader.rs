@@ -4705,7 +4705,7 @@ mod tests {
             },
             CdxRecord {
                 timestamp: "20050309024319".to_owned(),
-                original: "http://www.example.com/forums/viewforum.php?f=21&sid=0001".to_owned(),
+                original: "http://www.example.com/forums/viewforum.php?f=21&sid=000a".to_owned(),
                 mimetype: "application/octet-stream".to_owned(),
                 status_code: 200,
                 digest: "OLD_SID".to_owned(),
@@ -5512,6 +5512,89 @@ mod tests {
         assert_eq!(
             std::fs::read(output.path().join("images/old.gif")).unwrap(),
             b"GIF89a"
+        );
+    }
+
+    /// Distinct pages parameterized by generic keys such as `st=0` vs `st=20` must download
+    /// into separate local files and preserve both pages' authentic content.
+    #[tokio::test]
+    async fn download_site_preserves_distinct_st_paginated_pages() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let index_url = "http://example.com/index.html";
+        let page0_url = "http://example.com/list.php?st=0";
+        let page20_url = "http://example.com/list.php?st=20";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 IDX 100\n{timestamp} {page0_url} text/html 200 P0 100\n{timestamp} {page20_url} text/html 200 P20 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="list.php?st=0">Page 1</a><a href="list.php?st=20">Page 2</a>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/http://example.com/list.php")))
+            .and(query_param("st", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>Items 1-20</p>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/http://example.com/list.php")))
+            .and(query_param("st", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>Items 21-40</p>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("st-pagination-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            mapper.clone(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 3);
+        assert_eq!(report.missing_local_links, 0);
+        let path0 = mapper.local_path_for_url(page0_url, "text/html").unwrap();
+        let path20 = mapper.local_path_for_url(page20_url, "text/html").unwrap();
+        assert_ne!(path0, path20);
+        assert!(
+            std::fs::read_to_string(output.path().join(path0))
+                .unwrap()
+                .contains("Items 1-20")
+        );
+        assert!(
+            std::fs::read_to_string(output.path().join(path20))
+                .unwrap()
+                .contains("Items 21-40")
         );
     }
 }

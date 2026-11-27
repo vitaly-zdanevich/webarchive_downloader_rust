@@ -326,7 +326,7 @@ pub fn strip_volatile_query_params(input: &str) -> String {
         .query_pairs()
         .filter_map(|(key, value)| {
             let key = normalized_query_key(&key).to_owned();
-            if is_volatile_query_key(&key) {
+            if is_volatile_query_param(&key, &value) {
                 None
             } else {
                 Some((key, value.into_owned()))
@@ -378,7 +378,7 @@ pub fn canonical_query_without_volatile_params(url: &Url) -> Option<String> {
         .query_pairs()
         .filter_map(|(key, value)| {
             let key = normalized_query_key(&key).to_owned();
-            if is_volatile_query_key(&key) {
+            if is_volatile_query_param(&key, &value) {
                 None
             } else {
                 Some((key, value.into_owned()))
@@ -411,17 +411,33 @@ pub fn is_volatile_query_key(key: &str) -> bool {
             | "aspsessionid"
             | "cfid"
             | "cftoken"
-            | "cron_type"
-            | "amp"
-            | "highlight"
-            | "mark"
-            | "postdays"
-            | "postorder"
-            | "sd"
-            | "sk"
-            | "ticket"
-            | "st"
     )
+}
+
+/// Returns true only for session parameters that do not select distinct content.
+///
+/// Explicit server session keys (`PHPSESSID`, `JSESSIONID`, `session_id`, etc.) are always
+/// volatile. Short numeric `sid` values (such as `article.php?sid=42` on story/article CMSs)
+/// are preserved as content selectors, while non-numeric or token-length `sid` values are
+/// treated as session IDs.
+pub fn is_volatile_query_param(key: &str, value: &str) -> bool {
+    let key = normalized_query_key(key).to_ascii_lowercase();
+    match key.as_str() {
+        "sessionid"
+        | "session_id"
+        | "phpsessid"
+        | "jsessionid"
+        | "aspsessionid"
+        | "cfid"
+        | "cftoken" => true,
+        "sid" => {
+            let trimmed = value.trim();
+            trimmed.is_empty()
+                || trimmed.len() >= 16
+                || !trimmed.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        _ => false,
+    }
 }
 
 fn normalized_query_key(key: &str) -> &str {
@@ -885,5 +901,80 @@ mod tests {
         // Subdomains remain strictly isolated.
         let other_sub = Url::parse("http://other.example.com/forums/index.php?sid=abc").unwrap();
         assert_eq!(mapper.known_path_for_url(&other_sub, &known), None);
+    }
+
+    /// Non-session parameters such as `st`, `sk`, `sd`, `ticket`, `mark`, and short numeric
+    /// `sid` values select distinct pages across arbitrary websites and must map to distinct
+    /// local paths rather than collapsing onto one file.
+    #[test]
+    fn preserves_non_session_query_parameters_and_numeric_sid_as_distinct_pages() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+
+        let list_page_1 = mapper
+            .local_path_for_url("http://example.com/list.php?st=0", "text/html")
+            .unwrap();
+        let list_page_2 = mapper
+            .local_path_for_url("http://example.com/list.php?st=20", "text/html")
+            .unwrap();
+        let list_bare = mapper
+            .local_path_for_url("http://example.com/list.php", "text/html")
+            .unwrap();
+        assert_ne!(list_page_1, list_page_2);
+        assert_ne!(list_page_1, list_bare);
+        assert_ne!(list_page_2, list_bare);
+
+        let ticket_1 = mapper
+            .local_path_for_url("http://example.com/view.php?ticket=1", "text/html")
+            .unwrap();
+        let ticket_2 = mapper
+            .local_path_for_url("http://example.com/view.php?ticket=2", "text/html")
+            .unwrap();
+        assert_ne!(ticket_1, ticket_2);
+
+        let sort_a = mapper
+            .local_path_for_url("http://example.com/browse.php?sk=a&sd=1", "text/html")
+            .unwrap();
+        let sort_b = mapper
+            .local_path_for_url("http://example.com/browse.php?sk=b&sd=2", "text/html")
+            .unwrap();
+        assert_ne!(sort_a, sort_b);
+
+        let story_42 = mapper
+            .local_path_for_url("http://example.com/article.php?sid=42", "text/html")
+            .unwrap();
+        let story_43 = mapper
+            .local_path_for_url("http://example.com/article.php?sid=43", "text/html")
+            .unwrap();
+        let story_bare = mapper
+            .local_path_for_url("http://example.com/article.php", "text/html")
+            .unwrap();
+        assert_ne!(story_42, story_43);
+        assert_ne!(story_42, story_bare);
+
+        // Session tokens (non-numeric or 16+ digit tokens, and explicit session keys) still collapse.
+        let session_hex = mapper
+            .local_path_for_url(
+                "http://example.com/forums/index.php?sid=901279ef577c8c5e3a42029699bbda02",
+                "text/html",
+            )
+            .unwrap();
+        let session_long_digits = mapper
+            .local_path_for_url(
+                "http://example.com/forums/index.php?sid=1234567890123456",
+                "text/html",
+            )
+            .unwrap();
+        let session_php = mapper
+            .local_path_for_url(
+                "http://example.com/forums/index.php?PHPSESSID=12345",
+                "text/html",
+            )
+            .unwrap();
+        let forum_index = mapper
+            .local_path_for_url("http://example.com/forums/index.php", "text/html")
+            .unwrap();
+        assert_eq!(session_hex, forum_index);
+        assert_eq!(session_long_digits, forum_index);
+        assert_eq!(session_php, forum_index);
     }
 }
