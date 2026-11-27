@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -79,7 +80,7 @@ impl SiteMapper {
         let mut sanitized_segments = path_segments
             .into_iter()
             .filter(|segment| !segment.is_empty())
-            .map(sanitize_segment)
+            .map(sanitize_url_path_segment)
             .filter(|segment| !segment.is_empty())
             .collect::<Vec<_>>();
 
@@ -473,7 +474,8 @@ pub fn relative_link(from_file: &Path, to_file: &Path) -> String {
         parts.push("..".to_owned());
     }
     for component in &to_components[common..] {
-        parts.push(component.as_os_str().to_string_lossy().replace('\\', "/"));
+        let segment = component.as_os_str().to_string_lossy();
+        parts.push(encode_relative_link_segment(&segment));
     }
 
     if parts.is_empty() {
@@ -481,6 +483,26 @@ pub fn relative_link(from_file: &Path, to_file: &Path) -> String {
     } else {
         parts.join("/")
     }
+}
+
+fn encode_relative_link_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.' | b'_' | b'~' | b'@' | b'!' | b'$' | b'&' | b'*' | b'+' | b';' | b'='
+            )
+        {
+            encoded.push(*byte as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 pub fn is_html_mimetype(mimetype: &str) -> bool {
@@ -579,6 +601,54 @@ fn extension_matches_mimetype(extension: &str, mimetype_extension: &str) -> bool
         "js" => extension.eq_ignore_ascii_case("mjs"),
         "xml" => extension.eq_ignore_ascii_case("rss") || extension.eq_ignore_ascii_case("atom"),
         _ => false,
+    }
+}
+
+/// Decodes valid UTF-8 percent-escapes in a URL path segment before filesystem sanitization
+/// so URLs like `my%20photo.jpg` write `my photo.jpg` on disk rather than a literal `%20`.
+/// Invalid UTF-8 byte escapes stay ASCII percent-encoded so distinct byte sequences do not collide.
+pub(crate) fn sanitize_url_path_segment(segment: &str) -> String {
+    let decoded = decode_utf8_percent_escapes(segment);
+    sanitize_segment(&decoded)
+}
+
+fn decode_utf8_percent_escapes(segment: &str) -> Cow<'_, str> {
+    let bytes = segment.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Cow::Borrowed(segment);
+    }
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut changed = false;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            changed = true;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(segment);
+    }
+    match String::from_utf8(decoded) {
+        Ok(text) => Cow::Owned(text),
+        Err(_) => Cow::Borrowed(segment),
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -976,5 +1046,55 @@ mod tests {
         assert_eq!(session_hex, forum_index);
         assert_eq!(session_long_digits, forum_index);
         assert_eq!(session_php, forum_index);
+    }
+
+    /// Percent-encoded URL segments such as `%20` must map to decoded filenames on disk
+    /// and percent-encoded relative links in HTML/CSS so standard HTTP servers resolve them.
+    #[test]
+    fn decodes_percent_encoded_segments_on_disk_and_encodes_relative_links() {
+        let mapper = SiteMapper::new("example.com").unwrap();
+
+        let photo = mapper
+            .local_path_for_url("http://example.com/my%20docs/my%20photo.jpg", "image/jpeg")
+            .unwrap();
+        assert_eq!(photo, PathBuf::from("my docs/my photo.jpg"));
+        assert_eq!(
+            relative_link(Path::new("index.html"), &photo),
+            "my%20docs/my%20photo.jpg"
+        );
+
+        let percent_page = mapper
+            .local_path_for_url("http://example.com/100%25.html", "text/html")
+            .unwrap();
+        assert_eq!(percent_page, PathBuf::from("100%.html"));
+        assert_eq!(
+            relative_link(Path::new("index.html"), &percent_page),
+            "100%25.html"
+        );
+
+        // Encoded slashes and parent-directory escapes must never create directory traversal.
+        let escaped_slash = mapper
+            .local_path_for_url("http://example.com/a%2Fb.html", "text/html")
+            .unwrap();
+        assert_eq!(escaped_slash, PathBuf::from("a_b.html"));
+
+        let utf8_page = mapper
+            .local_path_for_url("http://example.com/caf%C3%A9.html", "text/html")
+            .unwrap();
+        assert_eq!(utf8_page, PathBuf::from("café.html"));
+        assert_eq!(
+            relative_link(Path::new("index.html"), &utf8_page),
+            "caf%C3%A9.html"
+        );
+
+        // Non-UTF-8 byte escapes stay ASCII on disk and encode `%` once in relative links.
+        let legacy_latin1 = mapper
+            .local_path_for_url("http://example.com/caf%E9.html", "text/html")
+            .unwrap();
+        assert_eq!(legacy_latin1, PathBuf::from("caf%E9.html"));
+        assert_eq!(
+            relative_link(Path::new("index.html"), &legacy_latin1),
+            "caf%25E9.html"
+        );
     }
 }

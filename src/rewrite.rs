@@ -13,7 +13,7 @@ use crate::html_attrs::{decoded_attribute, set_decoded_attribute};
 use crate::noise::is_archive_noise_reference;
 use crate::pathmap::{
     SiteMapper, canonical_query_without_volatile_params, normalize_lookup_url, relative_link,
-    unwrap_wayback_url,
+    sanitize_url_path_segment, unwrap_wayback_url,
 };
 
 macro_rules! attr_rewriter {
@@ -938,7 +938,7 @@ fn path_from_url_without_mimetype(url: &Url) -> PathBuf {
             if segment.is_empty() {
                 continue;
             }
-            path.push(sanitize_path_segment(segment));
+            path.push(sanitize_url_path_segment(segment));
             has_segments = true;
         }
     }
@@ -957,7 +957,7 @@ fn document_path_from_url(url: &Url) -> PathBuf {
         .map(|segments| {
             segments
                 .filter(|segment| !segment.is_empty())
-                .map(sanitize_path_segment)
+                .map(sanitize_url_path_segment)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -987,24 +987,6 @@ fn is_html_extension(extension: &str) -> bool {
         extension.to_ascii_lowercase().as_str(),
         "html" | "htm" | "xhtml"
     )
-}
-
-fn sanitize_path_segment(segment: &str) -> String {
-    let mut cleaned = String::with_capacity(segment.len());
-    for character in segment.chars() {
-        match character {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => cleaned.push('_'),
-            character if character.is_control() => cleaned.push('_'),
-            character => cleaned.push(character),
-        }
-    }
-
-    let cleaned = cleaned.trim_matches('.');
-    if cleaned.is_empty() || cleaned == ".." {
-        "_".to_owned()
-    } else {
-        cleaned.to_owned()
-    }
 }
 
 fn append_query_hash(path: &mut PathBuf, query: &str) {

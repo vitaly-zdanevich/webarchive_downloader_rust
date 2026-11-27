@@ -5597,4 +5597,73 @@ mod tests {
                 .contains("Items 21-40")
         );
     }
+
+    /// URLs containing `%20` must write decoded filenames with spaces on disk and emit
+    /// `%20` relative URLs in rewritten HTML so HTTP servers and link validation resolve them.
+    #[tokio::test]
+    async fn download_site_decodes_percent_20_filenames_and_validates_cleanly() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let index_url = "http://example.com/index.html";
+        let image_url = "http://example.com/my%20images/my%20photo.gif";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 IDX 100\n{timestamp} {image_url} image/gif 200 IMG 6\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<img src="/my%20images/my%20photo.gif">"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{image_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GIF89a".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("percent20-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 2);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("my images/my photo.gif").is_file());
+        assert!(!output.path().join("my%20images/my%20photo.gif").exists());
+        let saved_index = std::fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert!(
+            saved_index.contains(r#"src="my%20images/my%20photo.gif""#),
+            "{saved_index}"
+        );
+    }
 }
