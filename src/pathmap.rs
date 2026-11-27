@@ -514,6 +514,22 @@ pub fn is_css_mimetype(mimetype: &str) -> bool {
     mimetype.eq_ignore_ascii_case("text/css")
 }
 
+pub fn is_javascript_mimetype(mimetype: &str) -> bool {
+    matches!(
+        mimetype
+            .split_once(';')
+            .map_or(mimetype, |(base, _)| base)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "application/javascript"
+            | "application/x-javascript"
+            | "text/javascript"
+            | "text/ecmascript"
+            | "application/ecmascript"
+    )
+}
+
 fn append_query_hash(path: &mut PathBuf, query: &str) {
     let hash = fnv1a64(query.as_bytes());
     let Some(file_name) = path

@@ -51,6 +51,7 @@ pub struct RewriteContext<'a> {
     current_local_path: PathBuf,
     known_paths: &'a HashMap<String, PathBuf>,
     mapper: Option<&'a SiteMapper>,
+    root_relative_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +158,7 @@ impl<'a> RewriteContext<'a> {
             current_local_path,
             known_paths,
             mapper: None,
+            root_relative_only: false,
         })
     }
 
@@ -178,6 +180,7 @@ impl<'a> RewriteContext<'a> {
             current_local_path,
             known_paths,
             mapper: Some(mapper),
+            root_relative_only: false,
         })
     }
 
@@ -188,6 +191,20 @@ impl<'a> RewriteContext<'a> {
             current_local_path: self.current_local_path.clone(),
             known_paths: self.known_paths,
             mapper: self.mapper,
+            root_relative_only: self.root_relative_only,
+        }
+    }
+
+    /// Restricts rewriting to root-relative and absolute URLs, emitting site-root-relative
+    /// paths (`/...`) for standalone scripts shared across HTML pages at different depths.
+    pub(crate) fn with_root_relative_only(&self) -> Self {
+        Self {
+            current_original: self.current_original.clone(),
+            resolution_base: self.resolution_base.clone(),
+            current_local_path: self.current_local_path.clone(),
+            known_paths: self.known_paths,
+            mapper: self.mapper,
+            root_relative_only: true,
         }
     }
 
@@ -208,6 +225,15 @@ impl<'a> RewriteContext<'a> {
 
         let (without_fragment, fragment) = split_fragment(trimmed);
         let archive_unwrapped = unwrap_wayback_url(without_fragment);
+        if self.root_relative_only {
+            let lower = archive_unwrapped.to_ascii_lowercase();
+            if !archive_unwrapped.starts_with('/')
+                && !lower.starts_with("http://")
+                && !lower.starts_with("https://")
+            {
+                return None;
+            }
+        }
         let resolved = self.resolution_base.join(&archive_unwrapped).ok()?;
         let mut lookup_url = resolved.clone();
         lookup_url.set_fragment(None);
@@ -244,7 +270,11 @@ impl<'a> RewriteContext<'a> {
             return None;
         };
 
-        let mut rewritten = relative_link(&self.current_local_path, &local_path);
+        let mut rewritten = if self.root_relative_only {
+            format!("/{}", relative_link(Path::new("index.html"), &local_path))
+        } else {
+            relative_link(&self.current_local_path, &local_path)
+        };
         if let Some(fragment) = fragment {
             rewritten.push('#');
             rewritten.push_str(fragment);
@@ -535,6 +565,13 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
 /// CSS tokens preserve quoting and correctly distinguish escaped URLs from comments or strings.
 pub fn rewrite_css(input: &str, context: &RewriteContext<'_>) -> String {
 	rewrite_css_references(input, context, true)
+}
+
+/// Rewrites URL string literals and embedded HTML fragments in one standalone JavaScript file.
+///
+/// Invalid or unparseable scripts are left byte-for-byte intact.
+pub fn rewrite_javascript(input: &str, context: &RewriteContext<'_>) -> String {
+	rewrite_javascript_string_urls(input, context)
 }
 
 fn rewrite_css_references<R: ReferenceRewriter>(
@@ -1163,7 +1200,18 @@ fn rewrite_html_fragment_in_javascript_string<R: ReferenceRewriter>(
 }
 
 fn looks_like_javascript_url_reference(value: &str) -> bool {
-    looks_like_url_reference_or_file(value)
+    if !looks_like_url_reference_or_file(value) {
+        return false;
+    }
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://")
+        && !lower.starts_with("https://")
+        && strip_query_and_fragment(trimmed).ends_with('/')
+    {
+        return false;
+    }
+    true
 }
 
 fn looks_like_url_reference_or_file(value: &str) -> bool {
@@ -2001,6 +2049,74 @@ mod tests {
         assert_eq!(
             remap_local_css_paths("body { color: red; }", Path::new("style.css"), &remapped),
             None
+        );
+    }
+
+    /// Standalone JavaScript rewriting must localize static URL literals and embedded HTML
+    /// fragments without corrupting bare path delimiters (`"/"`, `"./"`, `"/img/"`), and
+    /// multi-depth shared scripts must rewrite only root-relative/absolute URLs to `/...`.
+    #[test]
+    fn rewrites_standalone_javascript_relative_and_root_relative_safely() {
+        let mut known_paths = HashMap::new();
+        known_paths.insert("http://example.com/".to_owned(), PathBuf::from("index.html"));
+        known_paths.insert(
+            "http://example.com/photo".to_owned(),
+            PathBuf::from("photo.jpg"),
+        );
+        known_paths.insert(
+            "http://example.com/img/logo.gif".to_owned(),
+            PathBuf::from("img/logo.gif"),
+        );
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let js = concat!(
+            r#"var parts = p.split("/"); var cur = "./"; var prefix = "/img/";"#,
+            "\n",
+            r#"var rel = "img/logo.gif"; var abs = "http://example.com/photo";"#,
+            "\n",
+            r#"document.write('<img src="/photo">');"#,
+        );
+
+        let single_dir_ctx = RewriteContext::new_with_mapper(
+            "http://example.com/sub/page.html",
+            PathBuf::from("sub/page.html"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap();
+        let single_dir_out = rewrite_javascript(js, &single_dir_ctx);
+        assert!(single_dir_out.contains(r#"p.split("/")"#), "{single_dir_out}");
+        assert!(single_dir_out.contains(r#"var cur = "./";"#), "{single_dir_out}");
+        assert!(single_dir_out.contains(r#"var prefix = "/img/";"#), "{single_dir_out}");
+        assert!(
+            single_dir_out.contains(r#"var abs = "../photo.jpg";"#),
+            "{single_dir_out}"
+        );
+        assert!(
+            single_dir_out.contains(r#"document.write('<img src="../photo.jpg">');"#),
+            "{single_dir_out}"
+        );
+
+        let shared_ctx = RewriteContext::new_with_mapper(
+            "http://example.com/js/shared.js",
+            PathBuf::from("js/shared.js"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap()
+        .with_root_relative_only();
+        let shared_out = rewrite_javascript(js, &shared_ctx);
+        assert!(shared_out.contains(r#"p.split("/")"#), "{shared_out}");
+        assert!(
+            shared_out.contains(r#"var rel = "img/logo.gif";"#),
+            "multi-depth shared scripts must leave bare relative paths untouched: {shared_out}"
+        );
+        assert!(
+            shared_out.contains(r#"var abs = "/photo.jpg";"#),
+            "multi-depth shared scripts must rewrite absolute URLs to site-root-relative: {shared_out}"
+        );
+        assert!(
+            shared_out.contains(r#"document.write('<img src="/photo.jpg">');"#),
+            "{shared_out}"
         );
     }
 }

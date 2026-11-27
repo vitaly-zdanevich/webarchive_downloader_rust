@@ -1,10 +1,16 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use anyhow::Result;
+use lol_html::{HtmlRewriter, Settings, element};
 use url::Url;
 
+use crate::html_attrs::decoded_attribute;
 use crate::link_validation::extract_document_references;
 use crate::noise::is_archive_noise_reference;
 use crate::pathmap::{SiteMapper, unwrap_wayback_url};
 use crate::rewrite::extract_html_base_url;
+use crate::text_encoding::TextDocumentKind;
 
 /// Finds related archived pages and resources without restricting file extensions.
 /// Only HTTP(S) URLs are returned; the caller queries Wayback, never the live site.
@@ -12,15 +18,16 @@ pub(crate) fn extract_related_references(
 	input: &str,
 	base_url: &Url,
 	mapper: &SiteMapper,
-	is_css: bool,
+	kind: TextDocumentKind,
 ) -> Result<Vec<String>> {
-	let effective_base = if is_css {
-		base_url.clone()
-	} else {
-		extract_html_base_url(input, base_url).unwrap_or_else(|| base_url.clone())
+	let effective_base = match kind {
+		TextDocumentKind::Html => {
+			extract_html_base_url(input, base_url).unwrap_or_else(|| base_url.clone())
+		}
+		TextDocumentKind::Css | TextDocumentKind::JavaScript => base_url.clone(),
 	};
 	let mut references = Vec::new();
-	for value in extract_document_references(input, is_css)? {
+	for value in extract_document_references(input, kind)? {
 		let value = value.trim();
 		if value.is_empty() || value.starts_with('#') {
 			continue;
@@ -40,6 +47,43 @@ pub(crate) fn extract_related_references(
 	references.sort();
 	references.dedup();
 	Ok(references)
+}
+
+/// Returns the HTML document's effective base URL (honoring `<base href>`) and all
+/// resolved HTTP(S) `<script src="...">` URLs it references.
+pub(crate) fn extract_html_script_references(input: &str, base_url: &Url) -> (Url, Vec<String>) {
+	let effective_base =
+		extract_html_base_url(input, base_url).unwrap_or_else(|| base_url.clone());
+	let scripts = Rc::new(RefCell::new(Vec::<String>::new()));
+	let mut parser = HtmlRewriter::new(
+		Settings {
+			element_content_handlers: vec![element!("script[src]", {
+				let scripts = Rc::clone(&scripts);
+				let effective_base = effective_base.clone();
+				move |element| {
+					if let Some(src) = decoded_attribute(element, "src") {
+						let trimmed = src.trim();
+						if !trimmed.is_empty()
+							&& !trimmed.starts_with('#')
+							&& let Ok(mut url) = effective_base.join(&unwrap_wayback_url(trimmed))
+							&& matches!(url.scheme(), "http" | "https")
+						{
+							url.set_fragment(None);
+							scripts.borrow_mut().push(url.to_string());
+						}
+					}
+					Ok(())
+				}
+			})],
+			..Settings::default()
+		},
+		|_: &[u8]| {},
+	);
+	let _ = parser.write(input.as_bytes()).and_then(|_| parser.end());
+	let mut urls = scripts.borrow().clone();
+	urls.sort();
+	urls.dedup();
+	(effective_base, urls)
 }
 
 /// Identifies interactive forum compose, quote, private-message, login, and moderation
@@ -226,7 +270,7 @@ mod tests {
 		let references = extract_related_references(r#"<a href="view.php?a=1&amp;b=2">Page</a>
 <img src="img/a&#38;b.gif"><source srcset="img/c&#x26;d.gif 2x">
 <style>i { background:url('img/literal&amp;name.gif'); }</style>
-<script>image.src = 'img/literal&amp;name.gif'; document.write('<img src="img/generated&amp;name.gif">');</script>"#, &base, &mapper, false).unwrap();
+<script>image.src = 'img/literal&amp;name.gif'; document.write('<img src="img/generated&amp;name.gif">');</script>"#, &base, &mapper, TextDocumentKind::Html).unwrap();
 		assert_eq!(references, vec![
 			"http://example.com/img/a&b.gif",
 			"http://example.com/img/c&d.gif",
@@ -243,13 +287,13 @@ mod tests {
 		let base = Url::parse("http://example.com/pages/index.html").unwrap();
 		let refs = extract_related_references(
 			r#"<a href=next>Next</a><img srcset='//assets.example.com/a.gif 1x, /b.gif 2x'><a href='https://web.archive.org/web/20080101000000/http://example.com/viewtopic.php?t=7&amp;p=9'>Topic</a><a href='javascript:alert(1)'>JS</a><a href='https://unrelated.invalid/a.html'>External</a>"#,
-			&base, &mapper, false).unwrap();
+			&base, &mapper, TextDocumentKind::Html).unwrap();
 		assert!(refs.contains(&"http://example.com/pages/next".to_owned()));
 		assert!(refs.contains(&"http://assets.example.com/a.gif".to_owned()));
 		assert!(refs.contains(&"http://example.com/b.gif".to_owned()));
 		assert!(refs.contains(&"http://example.com/viewtopic.php?t=7&p=9".to_owned()));
 		assert_eq!(refs.len(), 4);
-		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, true).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
+		assert_eq!(extract_related_references("@import 'theme.css'; body { background: url(../image.gif); }", &base, &mapper, TextDocumentKind::Css).unwrap(), vec!["http://example.com/image.gif", "http://example.com/pages/theme.css"]);
 	}
 
 	/// Discovers downloads on related hosts without including unrelated sites.
@@ -261,7 +305,7 @@ mod tests {
 			r#"<a href="http://downloads.example.com/file.exe">Download</a><a href="http://other.test/file.exe">Other</a>"#,
 			&base,
 			&mapper,
-			false,
+			TextDocumentKind::Html,
 		).unwrap();
 
 		assert_eq!(
@@ -279,7 +323,7 @@ mod tests {
 			r#"<img src="http://downloads.example.com/files/preview/shot.jpg"><img src="http://other.test/shot.jpg">"#,
 			&base,
 			&mapper,
-			false,
+			TextDocumentKind::Html,
 		).unwrap();
 
 		assert_eq!(
@@ -311,7 +355,7 @@ mod tests {
 			   <a href="viewtopic.php?t=2">Next Topic</a>"#,
 			&base,
 			&mapper,
-			false,
+			TextDocumentKind::Html,
 		)
 		.unwrap();
 
@@ -335,7 +379,7 @@ mod tests {
 			r#"<html><head><base href="http://example.com/sub/dir/"></head><body><img src="logo.gif"><a href="next.html">Next</a></body></html>"#,
 			&base,
 			&mapper,
-			false,
+			TextDocumentKind::Html,
 		)
 		.unwrap();
 
@@ -344,6 +388,46 @@ mod tests {
 			vec![
 				"http://example.com/sub/dir/logo.gif".to_owned(),
 				"http://example.com/sub/dir/next.html".to_owned(),
+			]
+		);
+	}
+
+	/// Standalone JavaScript files must yield static URL literals and embedded HTML fragments
+	/// while ignoring comments, string concatenations, and bare path delimiters like `"/"`.
+	#[test]
+	fn extracts_dependencies_from_standalone_javascript() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://example.com/index.html").unwrap();
+		let js = r#"
+			// '/img/comment.gif'
+			var sep = "/";
+			var dir = "/img/";
+			var dyn = "/img/" + name + ".gif";
+			var hero = "images/hero.gif";
+			var photo = "/photo";
+			document.write('<img src="/img/written.png">');
+		"#;
+		let references =
+			extract_related_references(js, &base, &mapper, TextDocumentKind::JavaScript).unwrap();
+		assert_eq!(
+			references,
+			vec![
+				"http://example.com/images/hero.gif".to_owned(),
+				"http://example.com/img/written.png".to_owned(),
+				"http://example.com/photo".to_owned(),
+			]
+		);
+
+		let (effective_base, scripts) = extract_html_script_references(
+			r#"<head><base href="http://example.com/app/"><script src="js/menu.js"></script><script src="/web/20060101/http://example.com/shared.js#v1"></script></head>"#,
+			&Url::parse("http://example.com/old/page.html").unwrap(),
+		);
+		assert_eq!(effective_base.as_str(), "http://example.com/app/");
+		assert_eq!(
+			scripts,
+			vec![
+				"http://example.com/app/js/menu.js".to_owned(),
+				"http://example.com/shared.js".to_owned(),
 			]
 		);
 	}

@@ -9,6 +9,7 @@ use lol_html::{HtmlRewriter, Settings, element, text};
 use url::Url;
 
 use crate::html_attrs::decoded_attribute;
+use crate::text_encoding::TextDocumentKind;
 
 macro_rules! collect_attr {
     ($selector:literal, $attr:literal, $references:ident) => {{
@@ -104,12 +105,15 @@ impl LinkValidationReport {
 	}
 }
 
-/// Reuses the validation parser to discover archived HTML and CSS dependencies.
-pub(crate) fn extract_document_references(input: &str, is_css: bool) -> Result<Vec<String>> {
-	if is_css {
-		Ok(extract_css_url_references(input))
-	} else {
-		Ok(extract_html_references(input)?.references)
+/// Reuses the validation parser to discover archived HTML, CSS, and JavaScript dependencies.
+pub(crate) fn extract_document_references(
+	input: &str,
+	kind: TextDocumentKind,
+) -> Result<Vec<String>> {
+	match kind {
+		TextDocumentKind::Html => Ok(extract_html_references(input)?.references),
+		TextDocumentKind::Css => Ok(extract_css_url_references(input)),
+		TextDocumentKind::JavaScript => Ok(extract_javascript_string_references(input)),
 	}
 }
 
@@ -389,7 +393,7 @@ fn parse_srcset_references(input: &str) -> Vec<String> {
 fn extract_javascript_string_references(input: &str) -> Vec<String> {
 	let mut references = Vec::new();
 	for literal in crate::javascript::strings(input) {
-		if !literal.is_concatenated && looks_like_url_reference_or_file(&literal.value) {
+		if !literal.is_concatenated && looks_like_javascript_url_reference(&literal.value) {
 			references.push(literal.value);
 		} else if literal.value.contains('<') && literal.value.contains('>')
 			&& let Ok(fragment) = extract_html_references(&literal.value)
@@ -399,6 +403,23 @@ fn extract_javascript_string_references(input: &str) -> Vec<String> {
 	}
 
 	references
+}
+
+fn looks_like_javascript_url_reference(value: &str) -> bool {
+	if !looks_like_url_reference_or_file(value) {
+		return false;
+	}
+	let trimmed = value.trim();
+	let lower = trimmed.to_ascii_lowercase();
+	// Exclude bare path delimiters and directory prefixes (`"/"`, `"./"`, `"../"`, `"/img/"`)
+	// common in JS string splitting/prefix code; full `http(s)://.../` URLs remain allowed.
+	if !lower.starts_with("http://")
+		&& !lower.starts_with("https://")
+		&& strip_query_and_fragment(trimmed).ends_with('/')
+	{
+		return false;
+	}
+	true
 }
 
 fn looks_like_url_reference_or_file(value: &str) -> bool {

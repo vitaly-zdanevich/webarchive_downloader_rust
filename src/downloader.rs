@@ -26,20 +26,23 @@ use crate::cdx::{
     SnapshotStrategy, fetch_all_records_with_policy, fetch_latest_records,
     is_cdx_connectivity_error, is_redirect_status_code, sort_records_for_strategy,
 };
-use crate::download_refs::{extract_related_references, is_interactive_forum_extra_reference};
+use crate::download_refs::{
+    extract_html_script_references, extract_related_references, is_interactive_forum_extra_reference,
+};
 use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
 use crate::recovery::{AliasEvent, CaptureEvent, RecoveryState, record_alias_event};
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
-    SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
-    strip_volatile_query_params, unwrap_wayback_url,
+    SiteMapper, is_css_mimetype, is_html_mimetype, is_javascript_mimetype, normalize_lookup_url,
+    relative_link, strip_volatile_query_params, unwrap_wayback_url,
 };
 use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::rewrite::{
     RewriteContext, remap_local_css_paths, remap_local_html_paths, rewrite_css, rewrite_html,
+    rewrite_javascript,
 };
 use crate::soft_redirect::is_unusable_html_capture;
-use crate::text_encoding::{decode_text, utf8_bytes};
+use crate::text_encoding::{TextDocumentKind, decode_text, utf8_bytes};
 use crate::wayback_client::WaybackClient;
 
 #[derive(Clone, Debug)]
@@ -301,7 +304,10 @@ pub async fn download_site(
         ..DownloadReport::default()
     };
     let mut extra_download_refs = HashSet::new();
-    let mut rewritten_files: Vec<(PathBuf, RewrittenDocumentKind)> = Vec::new();
+    let mut rewritten_files: Vec<(PathBuf, TextDocumentKind)> = Vec::new();
+    let mut script_referrers: HashMap<String, Vec<(PathBuf, Url)>> = HashMap::new();
+    let mut js_discovery_files: Vec<TrackedJsFile> = Vec::new();
+    let mut written_js_files: Vec<TrackedJsFile> = Vec::new();
 
     let primary_total = jobs.len();
     for (index, job) in jobs.into_iter().enumerate() {
@@ -321,17 +327,34 @@ pub async fn download_site(
                 extra_download_refs: refs,
                 retained_unusable,
                 rewritten,
+                script_referrers: page_scripts,
+                js_file,
             }) => {
                 report.downloaded += 1;
                 report.retained_unusable_captures += usize::from(retained_unusable);
                 extra_download_refs.extend(refs);
                 if let Some(kind) = rewritten {
-                    rewritten_files.push((local_path, kind));
+                    rewritten_files.push((local_path.clone(), kind));
+                }
+                record_script_referrers(&mapper, &local_path, page_scripts, &mut script_referrers);
+                if let Some(js_file) = js_file {
+                    if js_file.written_in_this_run {
+                        written_js_files.push(js_file.clone());
+                    }
+                    js_discovery_files.push(js_file);
                 }
             }
-            Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
+            Ok(DownloadStatus::Skipped {
+                extra_download_refs: refs,
+                script_referrers: page_scripts,
+                js_file,
+            }) => {
                 report.skipped += 1;
                 extra_download_refs.extend(refs);
+                record_script_referrers(&mapper, &local_path, page_scripts, &mut script_referrers);
+                if let Some(js_file) = js_file {
+                    js_discovery_files.push(js_file);
+                }
             }
             Ok(DownloadStatus::SizeLimitExceeded) => report.skipped += 1,
             Ok(DownloadStatus::Cancelled) => report.cancelled += 1,
@@ -355,7 +378,17 @@ pub async fn download_site(
         if let Some(max_bytes) = options.extra_download_max_bytes {
 			let mut checked_references = HashSet::new();
 			let mut candidate_remappings: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-			while !extra_download_refs.is_empty() && !options.cancellation.is_cancelled() {
+			let mut js_discovered_bases: HashSet<(String, String)> = HashSet::new();
+			while !options.cancellation.is_cancelled() {
+				collect_pending_js_referrer_references(
+					&options.output_dir,
+					&mapper,
+					&js_discovery_files,
+					&script_referrers,
+					&mut js_discovered_bases,
+					&mut extra_download_refs,
+				)
+				.await?;
 				extra_download_refs.retain(|reference| {
 					checked_references.insert(canonical_extra_reference_key(&mapper, reference))
 				});
@@ -409,18 +442,45 @@ pub async fn download_site(
 							retained_unusable,
 							extra_download_refs: refs,
 							rewritten,
+							script_referrers: page_scripts,
+							js_file,
 						}) => {
 							report.downloaded += 1;
 							report.retained_unusable_captures += usize::from(retained_unusable);
 							report.extra_downloads += 1;
 							extra_download_refs.extend(refs);
 							if let Some(kind) = rewritten {
-								rewritten_files.push((local_path, kind));
+								rewritten_files.push((local_path.clone(), kind));
+							}
+							record_script_referrers(
+								&mapper,
+								&local_path,
+								page_scripts,
+								&mut script_referrers,
+							);
+							if let Some(js_file) = js_file {
+								if js_file.written_in_this_run {
+									written_js_files.push(js_file.clone());
+								}
+								js_discovery_files.push(js_file);
 							}
 						}
-						Ok(DownloadStatus::Skipped { extra_download_refs: refs }) => {
+						Ok(DownloadStatus::Skipped {
+							extra_download_refs: refs,
+							script_referrers: page_scripts,
+							js_file,
+						}) => {
 							report.skipped += 1;
 							extra_download_refs.extend(refs);
+							record_script_referrers(
+								&mapper,
+								&local_path,
+								page_scripts,
+								&mut script_referrers,
+							);
+							if let Some(js_file) = js_file {
+								js_discovery_files.push(js_file);
+							}
 						}
 						Ok(DownloadStatus::SizeLimitExceeded) => {
 							report.skipped += 1;
@@ -476,6 +536,20 @@ pub async fn download_site(
 					}
 				}
 			}
+        }
+
+        if !written_js_files.is_empty() && !options.cancellation.is_cancelled() {
+            let rewritten_js = rewrite_standalone_js_files(
+                &options.output_dir,
+                &mapper,
+                &known_paths,
+                &written_js_files,
+                &script_referrers,
+            )
+            .await?;
+            if rewritten_js > 0 {
+                println!("rewrote {rewritten_js} standalone JavaScript files");
+            }
         }
 
         if !options.cancellation.is_cancelled() {
@@ -985,10 +1059,13 @@ fn filter_archive_noise(records: &mut Vec<CdxRecord>) -> usize {
     before - records.len()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RewrittenDocumentKind {
-    Html,
-    Css,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrackedJsFile {
+    local_path: PathBuf,
+    original_url: Url,
+    canonical_key: String,
+    content_type: Option<String>,
+    written_in_this_run: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -996,9 +1073,15 @@ enum DownloadStatus {
     Downloaded {
         extra_download_refs: Vec<String>,
         retained_unusable: bool,
-        rewritten: Option<RewrittenDocumentKind>,
+        rewritten: Option<TextDocumentKind>,
+        script_referrers: Option<(Url, Vec<String>)>,
+        js_file: Option<TrackedJsFile>,
     },
-    Skipped { extra_download_refs: Vec<String> },
+    Skipped {
+        extra_download_refs: Vec<String>,
+        script_referrers: Option<(Url, Vec<String>)>,
+        js_file: Option<TrackedJsFile>,
+    },
     SizeLimitExceeded,
     Cancelled,
 }
@@ -1027,14 +1110,19 @@ async fn download_one(
 
 /// Reads preserved local references without replaying healthy pages or guessing query hashes.
 fn resumed_references(mapper: &SiteMapper, options: &DownloadOptions, fallback: &FallbackOptions, job: &DownloadJob, bytes: &[u8]) -> Result<Vec<String>> {
-	if !options.rewrite_links || options.extra_download_max_bytes.is_none()
-		|| !should_rewrite_as_text(&job.record, &job.local_path) {
+	let Some(doc_kind) = text_document_kind(&job.record, &job.local_path) else {
 		return Ok(Vec::new());
+	};
+	if !options.rewrite_links || options.extra_download_max_bytes.is_none() {
+		return Ok(Vec::new());
+	}
+	if doc_kind == TextDocumentKind::JavaScript {
+		return Ok(fallback.recovery.references(&job.local_path));
 	}
 	let root = std::fs::canonicalize(&options.output_dir)?;
 	let file = root.join(&job.local_path);
 	let mut references = fallback.recovery.references(&job.local_path);
-	for reference in extract_document_references(&String::from_utf8_lossy(bytes), is_css_mimetype(&job.record.mimetype))? {
+	for reference in extract_document_references(&String::from_utf8_lossy(bytes), doc_kind)? {
 		let value = reference.trim();
 		if let Ok(url) = Url::parse(value) {
 			references.push(url.to_string());
@@ -1091,15 +1179,21 @@ async fn download_one_inner(
 
     let destination = options.output_dir.join(&job.local_path);
 	let existing = has_non_empty_file(&destination).await?;
-	let local_bytes = if existing && should_rewrite_as_text(&job.record, &job.local_path) {
+	let existing_doc_kind = text_document_kind(&job.record, &job.local_path);
+	let local_bytes = if existing && existing_doc_kind.is_some() {
 		fs::read(&destination).await?
 	} else { Vec::new() };
 	let local_unusable = existing && should_detect_soft_redirect(&job.record, &job.local_path)
 		&& is_unusable_html_capture(&String::from_utf8_lossy(&local_bytes));
 	if existing && options.no_clobber && !(options.recover_existing && local_unusable) {
-		return Ok(DownloadStatus::Skipped {
-			extra_download_refs: resumed_references(mapper, options, fallback_options, &job, &local_bytes)?,
-		});
+		return Ok(skipped_download_status(
+			mapper,
+			options,
+			fallback_options,
+			&job,
+			existing_doc_kind,
+			&local_bytes,
+		)?);
 	}
 
     if let Some(parent) = destination.parent() {
@@ -1136,36 +1230,45 @@ async fn download_one_inner(
             return Ok(DownloadStatus::Cancelled);
         }
 
-        let is_css = is_css_document(&record, &job.local_path);
+        let doc_kind = text_document_kind(&record, &job.local_path);
         retained_unusable = should_detect_soft_redirect(&record, &job.local_path)
             && is_unusable_html_capture(&body.html_for_inspection());
-		let text = if options.rewrite_links && should_rewrite_as_text(&record, &job.local_path) {
-			Some(
-				decode_text(
-					&body.bytes,
-					body.content_type.as_deref(),
-					is_css,
-				)
-				.with_context(|| format!("failed to decode {}", record.original))?,
-			)
+		let text = if options.rewrite_links && let Some(kind) = doc_kind {
+			Some((
+				kind,
+				decode_text(&body.bytes, body.content_type.as_deref(), kind)
+					.with_context(|| format!("failed to decode {}", record.original))?,
+			))
 		} else {
 			None
 		};
 
-		let extra_download_refs = if let Some(text) = text.as_deref() {
-            extract_related_references(text, &Url::parse(&record.original)?, mapper, is_css)?
-        } else {
-            Vec::new()
-        };
+		let original_url = Url::parse(&record.original)?;
+		let extra_download_refs = match text.as_ref() {
+			Some((TextDocumentKind::JavaScript, _)) | None => Vec::new(),
+			Some((kind, text)) => extract_related_references(text, &original_url, mapper, *kind)?,
+		};
+		let page_script_referrers = match text.as_ref() {
+			Some((TextDocumentKind::Html, text)) => {
+				let (effective_base, scripts) = extract_html_script_references(text, &original_url);
+				(!scripts.is_empty()).then_some((effective_base, scripts))
+			}
+			_ => None,
+		};
 		if existing && retained_unusable {
 			eprintln!("keeping existing {}: no usable replacement capture found", job.local_path.display());
 			fallback_options.recovery.record(CaptureEvent {
 				record, local_path: job.local_path.clone(), outcome: "replacement_unusable".into(),
 				references: extra_download_refs, error: Some("Existing file retained; replacement is an HTML error/redirect".into()),
 			})?;
-			return Ok(DownloadStatus::Skipped {
-				extra_download_refs: resumed_references(mapper, options, fallback_options, &job, &local_bytes)?,
-			});
+			return Ok(skipped_download_status(
+				mapper,
+				options,
+				fallback_options,
+				&job,
+				existing_doc_kind,
+				&local_bytes,
+			)?);
 		}
 
         if job
@@ -1179,37 +1282,77 @@ async fn download_one_inner(
             return Ok(DownloadStatus::SizeLimitExceeded);
         }
 
-		if let Some(text) = text.as_deref() {
-            let context = RewriteContext::new_with_mapper(
-                &record.original,
-                job.local_path.clone(),
-                known_paths,
-                mapper,
-            )?;
-            let mut rewritten = if is_css {
-                rewrite_css(text, &context)
-            } else {
-                rewrite_html(text, &context)?
-            };
-            if !is_css && options.add_wayback_comment {
-                let replay_url = wayback_replay_url(archive_root, &record)?;
-                rewritten = insert_wayback_source_comment(&rewritten, replay_url.as_str());
-            }
-			write_bytes_atomic(&destination, &utf8_bytes(rewritten)).await?;
-			fallback_options.recovery.record(CaptureEvent {
-				record, local_path: job.local_path.clone(),
-				outcome: if retained_unusable { "unusable" } else { "downloaded" }.into(),
-				references: extra_download_refs.clone(), error: None,
-			})?;
-            return Ok(DownloadStatus::Downloaded {
-                extra_download_refs,
-                retained_unusable,
-                rewritten: Some(if is_css {
-                    RewrittenDocumentKind::Css
-                } else {
-                    RewrittenDocumentKind::Html
-                }),
-            });
+		if let Some((kind, text)) = text.as_ref() {
+			match kind {
+				TextDocumentKind::JavaScript => {
+					let js_refs = extract_related_references(
+						text,
+						&original_url,
+						mapper,
+						TextDocumentKind::JavaScript,
+					)?;
+					write_bytes_atomic(&destination, &body.bytes).await?;
+					let canonical_key = canonical_extra_reference_key(mapper, &record.original);
+					fallback_options.recovery.record(CaptureEvent {
+						record,
+						local_path: job.local_path.clone(),
+						outcome: "downloaded".into(),
+						references: js_refs,
+						error: None,
+					})?;
+					return Ok(DownloadStatus::Downloaded {
+						extra_download_refs: Vec::new(),
+						retained_unusable: false,
+						rewritten: None,
+						script_referrers: None,
+						js_file: Some(TrackedJsFile {
+							local_path: job.local_path,
+							original_url,
+							canonical_key,
+							content_type: body.content_type,
+							written_in_this_run: true,
+						}),
+					});
+				}
+				TextDocumentKind::Html | TextDocumentKind::Css => {
+					let context = RewriteContext::new_with_mapper(
+						&record.original,
+						job.local_path.clone(),
+						known_paths,
+						mapper,
+					)?;
+					let mut rewritten = if *kind == TextDocumentKind::Css {
+						rewrite_css(text, &context)
+					} else {
+						rewrite_html(text, &context)?
+					};
+					if *kind == TextDocumentKind::Html && options.add_wayback_comment {
+						let replay_url = wayback_replay_url(archive_root, &record)?;
+						rewritten =
+							insert_wayback_source_comment(&rewritten, replay_url.as_str());
+					}
+					write_bytes_atomic(&destination, &utf8_bytes(rewritten)).await?;
+					fallback_options.recovery.record(CaptureEvent {
+						record,
+						local_path: job.local_path.clone(),
+						outcome: if retained_unusable {
+							"unusable"
+						} else {
+							"downloaded"
+						}
+						.into(),
+						references: extra_download_refs.clone(),
+						error: None,
+					})?;
+					return Ok(DownloadStatus::Downloaded {
+						extra_download_refs,
+						retained_unusable,
+						rewritten: Some(*kind),
+						script_referrers: page_script_referrers,
+						js_file: None,
+					});
+				}
+			}
         } else {
             write_bytes_atomic(&destination, &body.bytes).await?;
 			fallback_options.recovery.record(CaptureEvent {
@@ -1252,6 +1395,8 @@ async fn download_one_inner(
         extra_download_refs: Vec::new(),
         retained_unusable,
         rewritten: None,
+        script_referrers: None,
+        js_file: None,
     })
 }
 
@@ -1321,9 +1466,195 @@ async fn confirm_late_path_remappings(
     Ok(confirmed)
 }
 
+fn skipped_download_status(
+    mapper: &SiteMapper,
+    options: &DownloadOptions,
+    fallback_options: &FallbackOptions,
+    job: &DownloadJob,
+    doc_kind: Option<TextDocumentKind>,
+    local_bytes: &[u8],
+) -> Result<DownloadStatus> {
+    let extra_download_refs =
+        resumed_references(mapper, options, fallback_options, job, local_bytes)?;
+    let script_referrers = if options.rewrite_links && doc_kind == Some(TextDocumentKind::Html) {
+        Url::parse(&job.record.original).ok().and_then(|original_url| {
+            let (effective_base, scripts) =
+                extract_html_script_references(&String::from_utf8_lossy(local_bytes), &original_url);
+            (!scripts.is_empty()).then_some((effective_base, scripts))
+        })
+    } else {
+        None
+    };
+    let js_file = if options.rewrite_links && doc_kind == Some(TextDocumentKind::JavaScript) {
+        Url::parse(&job.record.original).ok().map(|original_url| TrackedJsFile {
+            local_path: job.local_path.clone(),
+            canonical_key: canonical_extra_reference_key(mapper, &job.record.original),
+            original_url,
+            content_type: None,
+            written_in_this_run: false,
+        })
+    } else {
+        None
+    };
+    Ok(DownloadStatus::Skipped {
+        extra_download_refs,
+        script_referrers,
+        js_file,
+    })
+}
+
+fn record_script_referrers(
+    mapper: &SiteMapper,
+    page_local_path: &Path,
+    page_scripts: Option<(Url, Vec<String>)>,
+    script_referrers: &mut HashMap<String, Vec<(PathBuf, Url)>>,
+) {
+    let Some((effective_base, scripts)) = page_scripts else {
+        return;
+    };
+    for script_url in scripts {
+        let key = canonical_extra_reference_key(mapper, &script_url);
+        let entry = script_referrers.entry(key).or_default();
+        if !entry
+            .iter()
+            .any(|(path, base)| path == page_local_path && base == &effective_base)
+        {
+            entry.push((page_local_path.to_path_buf(), effective_base.clone()));
+        }
+    }
+}
+
+async fn collect_pending_js_referrer_references(
+    output_dir: &Path,
+    mapper: &SiteMapper,
+    js_files: &[TrackedJsFile],
+    script_referrers: &HashMap<String, Vec<(PathBuf, Url)>>,
+    discovered_bases: &mut HashSet<(String, String)>,
+    extra_download_refs: &mut HashSet<String>,
+) -> Result<()> {
+    for js_file in js_files {
+        let bases: Vec<Url> = match script_referrers.get(&js_file.canonical_key) {
+            Some(referrers) if !referrers.is_empty() => {
+                referrers.iter().map(|(_, base)| base.clone()).collect()
+            }
+            _ => vec![js_file.original_url.clone()],
+        };
+        let mut pending_bases = Vec::new();
+        for base in bases {
+            if discovered_bases.insert((js_file.canonical_key.clone(), base.to_string())) {
+                pending_bases.push(base);
+            }
+        }
+        if pending_bases.is_empty() {
+            continue;
+        }
+        let full_path = output_dir.join(&js_file.local_path);
+        if !full_path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&full_path)
+            .await
+            .with_context(|| format!("failed to read {}", full_path.display()))?;
+        let text = match decode_text(
+            &bytes,
+            js_file.content_type.as_deref(),
+            TextDocumentKind::JavaScript,
+        ) {
+            Ok(text) => text,
+            Err(_) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        };
+        for base in pending_bases {
+            let refs =
+                extract_related_references(&text, &base, mapper, TextDocumentKind::JavaScript)?;
+            extra_download_refs.extend(refs);
+        }
+    }
+    Ok(())
+}
+
+async fn rewrite_standalone_js_files(
+    output_dir: &Path,
+    mapper: &SiteMapper,
+    known_paths: &HashMap<String, PathBuf>,
+    written_js_files: &[TrackedJsFile],
+    script_referrers: &HashMap<String, Vec<(PathBuf, Url)>>,
+) -> Result<usize> {
+    let mut visited = HashSet::new();
+    let mut updated_files = 0usize;
+    for js_file in written_js_files {
+        if !visited.insert(&js_file.local_path) {
+            continue;
+        }
+        let full_path = output_dir.join(&js_file.local_path);
+        if !full_path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&full_path)
+            .await
+            .with_context(|| format!("failed to read {}", full_path.display()))?;
+        let text = decode_text(
+            &bytes,
+            js_file.content_type.as_deref(),
+            TextDocumentKind::JavaScript,
+        )
+        .with_context(|| format!("failed to decode {}", full_path.display()))?;
+
+        let context = build_standalone_js_rewrite_context(
+            js_file,
+            script_referrers.get(&js_file.canonical_key),
+            known_paths,
+            mapper,
+        )?;
+        let rewritten = rewrite_javascript(&text, &context);
+        if rewritten != text {
+            write_bytes_atomic(&full_path, &utf8_bytes(rewritten)).await?;
+            updated_files += 1;
+        }
+    }
+    Ok(updated_files)
+}
+
+fn build_standalone_js_rewrite_context<'a>(
+    js_file: &TrackedJsFile,
+    referrers: Option<&Vec<(PathBuf, Url)>>,
+    known_paths: &'a HashMap<String, PathBuf>,
+    mapper: &'a SiteMapper,
+) -> Result<RewriteContext<'a>> {
+    let Some(referrers) = referrers.filter(|referrers| !referrers.is_empty()) else {
+        return RewriteContext::new_with_mapper(
+            js_file.original_url.as_str(),
+            js_file.local_path.clone(),
+            known_paths,
+            mapper,
+        );
+    };
+    let unique_dirs: HashSet<&Path> = referrers
+        .iter()
+        .map(|(path, _)| path.parent().unwrap_or_else(|| Path::new("")))
+        .collect();
+    if unique_dirs.len() == 1 {
+        let mut sorted = referrers.clone();
+        sorted.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        let (ref_path, ref_base) = sorted.into_iter().next().unwrap();
+        RewriteContext::new_with_mapper(ref_base.as_str(), ref_path, known_paths, mapper)
+    } else {
+        Ok(RewriteContext::new_with_mapper(
+            js_file.original_url.as_str(),
+            js_file.local_path.clone(),
+            known_paths,
+            mapper,
+        )?
+        .with_root_relative_only())
+    }
+}
+
 async fn apply_late_path_remappings(
     output_dir: &Path,
-    rewritten_files: &[(PathBuf, RewrittenDocumentKind)],
+    rewritten_files: &[(PathBuf, TextDocumentKind)],
     remapped_paths: &HashMap<PathBuf, PathBuf>,
 ) -> Result<usize> {
     let mut visited = HashSet::new();
@@ -1343,13 +1674,14 @@ async fn apply_late_path_remappings(
             continue;
         };
         let updated = match kind {
-            RewrittenDocumentKind::Html => {
+            TextDocumentKind::Html => {
                 remap_local_html_paths(&input, local_path, remapped_paths)
                     .with_context(|| format!("failed to remap HTML links in {}", full_path.display()))?
             }
-            RewrittenDocumentKind::Css => {
+            TextDocumentKind::Css => {
                 remap_local_css_paths(&input, local_path, remapped_paths)
             }
+            TextDocumentKind::JavaScript => None,
         };
         if let Some(updated) = updated {
             write_bytes_atomic(&full_path, &utf8_bytes(updated)).await?;
@@ -2930,7 +3262,7 @@ struct SnapshotBody {
 impl SnapshotBody {
 	/// Error-page inspection must not prevent `--no-rewrite` from preserving original bytes.
 	fn html_for_inspection(&self) -> Cow<'_, str> {
-		decode_text(&self.bytes, self.content_type.as_deref(), false)
+		decode_text(&self.bytes, self.content_type.as_deref(), TextDocumentKind::Html)
 			.unwrap_or_else(|_| String::from_utf8_lossy(&self.bytes))
 	}
 }
@@ -4076,24 +4408,30 @@ fn compact_identity_text(input: &str) -> String {
         .collect()
 }
 
-fn is_css_document(record: &CdxRecord, local_path: &Path) -> bool {
-    is_css_mimetype(&record.mimetype)
-        || (!is_html_mimetype(&record.mimetype)
-            && local_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("css")))
+fn text_document_kind(record: &CdxRecord, local_path: &Path) -> Option<TextDocumentKind> {
+    if is_html_mimetype(&record.mimetype) {
+        return Some(TextDocumentKind::Html);
+    }
+    if is_css_mimetype(&record.mimetype) {
+        return Some(TextDocumentKind::Css);
+    }
+    if is_javascript_mimetype(&record.mimetype) {
+        return Some(TextDocumentKind::JavaScript);
+    }
+    let extension = local_path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "html" => Some(TextDocumentKind::Html),
+        "css" => Some(TextDocumentKind::Css),
+        "js" | "mjs" => Some(TextDocumentKind::JavaScript),
+        _ => None,
+    }
 }
 
 fn should_rewrite_as_text(record: &CdxRecord, local_path: &Path) -> bool {
-    is_html_mimetype(&record.mimetype)
-        || is_css_mimetype(&record.mimetype)
-        || local_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("css")
-            })
+    text_document_kind(record, local_path).is_some()
 }
 
 async fn stream_response_to_file(response: reqwest::Response, destination: &Path) -> Result<()> {
@@ -6136,6 +6474,221 @@ mod tests {
         assert!(
             saved_index.contains(r#"src="photo.jpg""#),
             "extensionless image link must be remapped to photo.jpg: {saved_index}"
+        );
+    }
+
+    /// Standalone `.js` files must have their static URL references discovered against the
+    /// referring HTML page's URL (regardless of CDX order) and safely rewritten once final
+    /// local paths are known, without corrupting JS delimiters like `"/"`.
+    #[tokio::test]
+    async fn download_site_discovers_and_rewrites_standalone_js_dependencies() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let js_url = "http://example.com/js/app.js";
+        let index_url = "http://example.com/index.html";
+        let hero_url = "http://example.com/images/hero.gif";
+        let photo_url = "http://example.com/photo";
+        let icon_url = "http://example.com/icon.gif";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {js_url} application/javascript 200 JS 120\n\
+                 {timestamp} {index_url} text/html 200 INDEX 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (url, mime, digest) in [
+            (hero_url, "image/gif", "HERO"),
+            (photo_url, "image/jpeg", "PHOTO"),
+            (icon_url, "image/gif", "ICON"),
+        ] {
+            Mock::given(path("/cdx/search/cdx"))
+                .and(query_param("matchType", "exact"))
+                .and(query_param("url", url))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "{timestamp} {url} {mime} 200 {digest} 6\n"
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path(format!("/web/{timestamp}id_/{js_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                r#"var parts = loc.split("/");"#,
+                "\n",
+                r#"var hero = "images/hero.gif";"#,
+                "\n",
+                r#"var photo = "/photo";"#,
+                "\n",
+                r#"var icon = "http://example.com/icon.gif";"#,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<html><head><script src="js/app.js"></script></head></html>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (url, bytes) in [
+            (hero_url, b"GIF89a".as_slice()),
+            (photo_url, b"\xff\xd8\xff\xd9".as_slice()),
+            (icon_url, b"GIF89a".as_slice()),
+        ] {
+            Mock::given(path(format!("/web/{timestamp}id_/{url}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let report = download_site(
+            build_client("standalone-js-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 5);
+        assert_eq!(report.extra_downloads, 3);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("images/hero.gif").is_file());
+        assert!(output.path().join("photo.jpg").is_file());
+        assert!(output.path().join("icon.gif").is_file());
+
+        let saved_js = std::fs::read_to_string(output.path().join("js/app.js")).unwrap();
+        assert!(saved_js.contains(r#"loc.split("/")"#), "{saved_js}");
+        assert!(saved_js.contains(r#"var hero = "images/hero.gif";"#), "{saved_js}");
+        assert!(saved_js.contains(r#"var photo = "photo.jpg";"#), "{saved_js}");
+        assert!(saved_js.contains(r#"var icon = "icon.gif";"#), "{saved_js}");
+    }
+
+    /// A standalone `.js` file shared across HTML pages at multiple directory depths must
+    /// rewrite absolute/root-relative URLs to site-root-relative `/...` paths and keep bare
+    /// relative strings untouched rather than emitting a broken depth-specific `../` prefix.
+    #[tokio::test]
+    async fn download_site_rewrites_multi_depth_shared_js_as_root_relative() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let index_url = "http://example.com/index.html";
+        let sub_url = "http://example.com/sub/page.html";
+        let js_url = "http://example.com/js/shared.js";
+        let photo_url = "http://example.com/photo";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {index_url} text/html 200 INDEX 100\n\
+                 {timestamp} {sub_url} text/html 200 SUB 100\n\
+                 {timestamp} {js_url} application/javascript 200 JS 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", photo_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {photo_url} image/jpeg 200 PHOTO 4\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{index_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<html><head><script src="/js/shared.js"></script></head></html>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{sub_url}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<html><head><script src="/js/shared.js"></script></head></html>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{js_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"var rel = "local.gif"; var abs = "http://example.com/photo";"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{photo_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xd9".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("shared-js-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 4);
+        assert_eq!(report.missing_local_links, 0);
+        assert!(output.path().join("photo.jpg").is_file());
+
+        let saved_js = std::fs::read_to_string(output.path().join("js/shared.js")).unwrap();
+        assert_eq!(
+            saved_js,
+            r#"var rel = "local.gif"; var abs = "/photo.jpg";"#
         );
     }
 }

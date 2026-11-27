@@ -62,6 +62,13 @@ fn html_encoding(bytes: &[u8]) -> Result<Option<&'static Encoding>> {
 	Ok(encoding.get())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextDocumentKind {
+	Html,
+	Css,
+	JavaScript,
+}
+
 /// Chooses BOM, transport charset, document declaration, then a deterministic fallback.
 ///
 /// Undeclared valid UTF-8 stays UTF-8; other undeclared bytes use Windows-1252,
@@ -70,7 +77,7 @@ fn html_encoding(bytes: &[u8]) -> Result<Option<&'static Encoding>> {
 pub(crate) fn decode_text<'a>(
 	bytes: &'a [u8],
 	content_type: Option<&str>,
-	css: bool,
+	kind: TextDocumentKind,
 ) -> Result<Cow<'a, str>> {
 	let (encoding, skip) = if let Some(bom) = Encoding::for_bom(bytes) {
 		bom
@@ -78,21 +85,25 @@ pub(crate) fn decode_text<'a>(
 		let transport = content_type.and_then(transport_encoding);
 		let declared = if transport.is_some() {
 			None
-		} else if css {
-			let prefix = &bytes[..bytes.len().min(1024)];
-			// Charset labels are ASCII even when the stylesheet body is not.
-			let (prefix, _) = WINDOWS_1252.decode_without_bom_handling(prefix);
-			css_charset(&prefix)
-				.and_then(|(label, _)| Encoding::for_label_no_replacement(label.as_bytes()))
-				.map(|encoding| {
-					if encoding == UTF_16LE || encoding == UTF_16BE {
-						UTF_8
-					} else {
-						encoding
-					}
-				})
 		} else {
-			html_encoding(bytes)?
+			match kind {
+				TextDocumentKind::Css => {
+					let prefix = &bytes[..bytes.len().min(1024)];
+					// Charset labels are ASCII even when the stylesheet body is not.
+					let (prefix, _) = WINDOWS_1252.decode_without_bom_handling(prefix);
+					css_charset(&prefix)
+						.and_then(|(label, _)| Encoding::for_label_no_replacement(label.as_bytes()))
+						.map(|encoding| {
+							if encoding == UTF_16LE || encoding == UTF_16BE {
+								UTF_8
+							} else {
+								encoding
+							}
+						})
+				}
+				TextDocumentKind::Html => html_encoding(bytes)?,
+				TextDocumentKind::JavaScript => None,
+			}
 		};
 		let fallback = if std::str::from_utf8(bytes).is_ok() {
 			UTF_8
@@ -126,7 +137,7 @@ mod tests {
 	#[test]
 	fn ignores_false_metadata_and_uses_http_equiv() {
 		let bytes = b"<!-- <meta charset='utf-8'> --><script>const fake = '<meta charset=utf-8>';</script><meta content='text/html; charset=windows-1252' HTTP-EQUIV='Content-Type'><p>\x93quoted\x94</p>";
-		let text = decode_text(bytes, None, false).unwrap();
+		let text = decode_text(bytes, None, TextDocumentKind::Html).unwrap();
 		assert!(text.contains("\u{201c}quoted\u{201d}"));
 	}
 
@@ -137,7 +148,7 @@ mod tests {
 			decode_text(
 				b"\x93\xfa\x96\x7b",
 				Some("text/html; Charset=\"Shift_JIS\""),
-				false
+				TextDocumentKind::Html
 			)
 			.unwrap(),
 			"\u{65e5}\u{672c}"
@@ -152,7 +163,7 @@ mod tests {
 			decode_text(
 				text.as_bytes(),
 				Some("text/html; charset=windows-1251"),
-				false
+				TextDocumentKind::Html
 			)
 			.unwrap(),
 			"<p>\u{e9}</p>"
@@ -164,14 +175,22 @@ mod tests {
 	#[test]
 	fn utf16_meta_uses_utf8_and_unknown_labels_do_not_mask_later_metadata() {
 		let bytes = "<meta charset=unknown><meta charset=utf-16><p>\u{65e5}</p>";
-		assert_eq!(decode_text(bytes.as_bytes(), None, false).unwrap(), bytes);
+		assert_eq!(
+			decode_text(bytes.as_bytes(), None, TextDocumentKind::Html).unwrap(),
+			bytes
+		);
 	}
 
 	/// Unsupported labels fall back without erasing legacy punctuation.
 	#[test]
 	fn unknown_charset_falls_back_without_replacement() {
 		assert_eq!(
-			decode_text(b"\x91x\x92", Some("text/html; charset=unknown"), false).unwrap(),
+			decode_text(
+				b"\x91x\x92",
+				Some("text/html; charset=unknown"),
+				TextDocumentKind::Html
+			)
+			.unwrap(),
 			"\u{2018}x\u{2019}"
 		);
 	}
@@ -179,8 +198,15 @@ mod tests {
 	/// A declared encoding mismatch must never silently generate a lossy saved page.
 	#[test]
 	fn malformed_declared_encoding_is_an_error() {
-		assert!(decode_text(b"<p>\xff</p>", Some("text/html; charset=utf-8"), false).is_err());
-		assert!(decode_text(&[0xff, 0xfe, 0x00], None, false).is_err());
+		assert!(
+			decode_text(
+				b"<p>\xff</p>",
+				Some("text/html; charset=utf-8"),
+				TextDocumentKind::Html
+			)
+			.is_err()
+		);
+		assert!(decode_text(&[0xff, 0xfe, 0x00], None, TextDocumentKind::Html).is_err());
 	}
 
 	/// Metadata outside the HTML prescan window is not used as an encoding guess.
@@ -189,7 +215,7 @@ mod tests {
 		let mut bytes = vec![b' '; 1024];
 		bytes.extend_from_slice(b"<meta charset='utf-8'><p>\x93x\x94</p>");
 		assert!(
-			decode_text(&bytes, None, false)
+			decode_text(&bytes, None, TextDocumentKind::Html)
 				.unwrap()
 				.contains("\u{201c}x\u{201d}")
 		);
@@ -200,17 +226,30 @@ mod tests {
 	fn css_honors_transport_and_bom() {
 		let css = "\u{feff}@charset \"windows-1252\"; p::before { content: '\u{65e5}'; }";
 		assert_eq!(
-			decode_text(css.as_bytes(), Some("text/css; charset=windows-1251"), true).unwrap(),
+			decode_text(
+				css.as_bytes(),
+				Some("text/css; charset=windows-1251"),
+				TextDocumentKind::Css
+			)
+			.unwrap(),
 			css.trim_start_matches('\u{feff}')
 		);
 		assert_eq!(
 			decode_text(
 				b"@charset \"windows-1252\"; /* \xcf */",
 				Some("text/css; charset=windows-1251"),
-				true
+				TextDocumentKind::Css
 			)
 			.unwrap(),
 			"@charset \"windows-1252\"; /* \u{41f} */"
 		);
+	}
+
+	/// Standalone JavaScript ignores HTML `<meta>` strings when choosing its encoding.
+	#[test]
+	fn javascript_ignores_embedded_meta_charset_strings() {
+		let bytes = b"var tpl = '<meta charset=\"windows-1251\">'; var s = '\x93hi\x94';";
+		let decoded = decode_text(bytes, None, TextDocumentKind::JavaScript).unwrap();
+		assert!(decoded.contains("\u{201c}hi\u{201d}"), "{decoded}");
 	}
 }
