@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use crate::pathmap::{canonical_query_without_volatile_params, unwrap_wayback_url};
-use crate::recovery::CaptureEvent;
+use crate::recovery::{AliasEvent, CaptureEvent, record_alias_event};
 
 /// Topic identities are local to one forum directory, including its host prefix.
 #[derive(Clone, Debug, Default)]
@@ -41,14 +41,14 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 	let candidates = report
 		.missing
 		.into_iter()
-		.map(|missing| (missing.target, false))
+		.map(|missing| (missing.target, Some(missing.source), false))
 		.chain(
 			report
 				.unusable_html
 				.into_iter()
-				.map(|target| (target, true)),
+				.map(|target| (target, None, true)),
 		);
-	for (target, replace_unusable) in candidates {
+	for (target, referred_from, replace_unusable) in candidates {
 		if target.file_name().is_none_or(|name| name != "index.html")
 			|| !seen.insert(target.clone())
 		{
@@ -69,6 +69,17 @@ pub fn create_missing_directory_aliases(root: &Path) -> Result<usize> {
 			continue;
 		}
 		write_alias_file(&target, &canonical, &bytes, replace_unusable)?;
+		record_alias_event(
+			&root,
+			&AliasEvent {
+				target_path: target.strip_prefix(&root).unwrap_or(&target).to_path_buf(),
+				source_path: canonical.strip_prefix(&root).unwrap_or(&canonical).to_path_buf(),
+				reason: "directory_index".to_owned(),
+				replaced_unusable: replace_unusable,
+				referred_from: referred_from
+					.map(|path| path.strip_prefix(&root).unwrap_or(&path).to_path_buf()),
+			},
+		)?;
 		created += 1;
 	}
 	Ok(created)
@@ -114,7 +125,7 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 			let scope_path = relative_target.parent().unwrap_or(Path::new(""));
 			let same_forum = file.parent() == target.parent();
             let scope = scopes.get(scope_path).unwrap_or(&empty_scope);
-            let source = match alias_source_for_link(
+            let (source_relative, reason) = match alias_source_for_link(
                 root,
                 file,
                 &target,
@@ -126,7 +137,7 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
 				scope,
                 &journal,
             ) {
-                AliasSource::Resolved(source) => source,
+                AliasSource::Resolved(source, reason) => (source, reason),
                 AliasSource::Unresolved => {
                     if !replace_unusable {
                         report.unresolved += 1;
@@ -141,14 +152,24 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
                 }
             };
 
-			anyhow::ensure!(source.parent() == Some(scope_path), "topic alias source must share its destination directory");
-            let source = root.join(source);
+			anyhow::ensure!(source_relative.parent() == Some(scope_path), "topic alias source must share its destination directory");
+            let source = root.join(&source_relative);
             if source == target {
                 continue;
             }
 			let bytes = fs::read(&source)
 				.with_context(|| format!("failed to read topic source {}", source.display()))?;
             write_alias_file(&target, &source, &bytes, replace_unusable)?;
+            record_alias_event(
+                root,
+                &AliasEvent {
+                    target_path: relative_target.to_path_buf(),
+                    source_path: source_relative,
+                    reason: reason.to_owned(),
+                    replaced_unusable: replace_unusable,
+                    referred_from: Some(file.strip_prefix(root).unwrap_or(file).to_path_buf()),
+                },
+            )?;
             written_targets.insert(target);
             report.created += 1;
         }
@@ -189,10 +210,20 @@ pub fn create_missing_topic_aliases(root: &Path) -> Result<AliasRepairReport> {
         {
             continue;
         }
-        let source = root.join(source_relative);
+        let source = root.join(&source_relative);
         let bytes = fs::read(&source)
             .with_context(|| format!("failed to read topic source {}", source.display()))?;
         write_alias_file(file, &source, &bytes, true)?;
+        record_alias_event(
+            root,
+            &AliasEvent {
+                target_path: relative.to_path_buf(),
+                source_path: source_relative,
+                reason: "topic_query_hash".to_owned(),
+                replaced_unusable: true,
+                referred_from: None,
+            },
+        )?;
         written_targets.insert(file.clone());
         report.created += 1;
     }
@@ -700,7 +731,7 @@ fn alias_topic_target(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AliasSource {
-    Resolved(PathBuf),
+    Resolved(PathBuf, &'static str),
     Unresolved,
     Ambiguous,
 }
@@ -729,14 +760,14 @@ fn alias_source_for_link(
             if current_anchors.contains(&anchor)
                 && !candidate_conflicts_with_target(&current_relative, target_identity, scope)
             {
-                return AliasSource::Resolved(current_relative);
+                return AliasSource::Resolved(current_relative, "topic_post_anchor");
             }
             if let Some(candidates) = scope.post_index.get(&anchor) {
                 return match resolve_same_topic_candidates(candidates, scope) {
                     Some(candidate)
                         if !candidate_conflicts_with_target(&candidate, target_identity, scope) =>
                     {
-                        AliasSource::Resolved(candidate)
+                        AliasSource::Resolved(candidate, "topic_post_anchor")
                     }
                     Some(_) => AliasSource::Unresolved,
                     None => AliasSource::Ambiguous,
@@ -752,7 +783,7 @@ fn alias_source_for_link(
             Some(resolved)
                 if !candidate_conflicts_with_target(&resolved, target_identity, scope) =>
             {
-                AliasSource::Resolved(resolved)
+                AliasSource::Resolved(resolved, "topic_query_hash")
             }
             Some(_) => AliasSource::Unresolved,
             None => AliasSource::Ambiguous,
@@ -764,7 +795,7 @@ fn alias_source_for_link(
         && text == "print view"
         && !candidate_conflicts_with_target(&current_relative, target_identity, scope)
     {
-        return AliasSource::Resolved(current_relative);
+        return AliasSource::Resolved(current_relative, "topic_self_print_view");
     }
 
     if !text.is_empty()
@@ -779,7 +810,7 @@ fn alias_source_for_link(
             scope,
         )
     {
-        return AliasSource::Resolved(source);
+        return AliasSource::Resolved(source, "topic_row_post_anchor");
     }
 
     AliasSource::Unresolved
@@ -1754,5 +1785,52 @@ mod tests {
             no_newer_html
         );
         assert!(!root.join("forums").join(&prev_file).exists());
+    }
+
+    #[test]
+    fn topic_and_directory_aliases_record_provenance_in_aliases_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("forums")).unwrap();
+        fs::create_dir_all(root.join("press")).unwrap();
+        fs::write(
+            root.join("forums/source.html"),
+            r#"<a href="viewtopic.php__q_alias.html#p42">Post</a><a href="../press/index.html">Press</a>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("forums/viewtopic.php__q_origin.html"),
+            r#"<title>Forum :: View topic - Origin</title><div id="p42">Body</div>"#,
+        )
+        .unwrap();
+        fs::write(root.join("press/index.htm"), "<p>Press</p>").unwrap();
+
+        assert_eq!(create_missing_topic_aliases(root).unwrap().created, 1);
+        assert_eq!(create_missing_directory_aliases(root).unwrap(), 1);
+
+        let log = fs::read_to_string(root.join(".wayback-state/aliases.jsonl")).unwrap();
+        let events: Vec<AliasEvent> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                AliasEvent {
+                    target_path: PathBuf::from("forums/viewtopic.php__q_alias.html"),
+                    source_path: PathBuf::from("forums/viewtopic.php__q_origin.html"),
+                    reason: "topic_post_anchor".to_owned(),
+                    replaced_unusable: false,
+                    referred_from: Some(PathBuf::from("forums/source.html")),
+                },
+                AliasEvent {
+                    target_path: PathBuf::from("press/index.html"),
+                    source_path: PathBuf::from("press/index.htm"),
+                    reason: "directory_index".to_owned(),
+                    replaced_unusable: false,
+                    referred_from: Some(PathBuf::from("forums/source.html")),
+                },
+            ]
+        );
     }
 }

@@ -21,6 +21,43 @@ pub(crate) struct CaptureEvent {
 	pub error: Option<String>,
 }
 
+/// One local file substitution created because an exact capture was missing or unusable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AliasEvent {
+	pub target_path: PathBuf,
+	pub source_path: PathBuf,
+	pub reason: String,
+	pub replaced_unusable: bool,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub referred_from: Option<PathBuf>,
+}
+
+/// Appends one substitution provenance record to `.wayback-state/aliases.jsonl`.
+pub(crate) fn record_alias_event(root: &Path, event: &AliasEvent) -> Result<()> {
+	let directory = root.join(".wayback-state");
+	fs::create_dir_all(&directory).context("failed to create recovery state directory")?;
+	let path = directory.join("aliases.jsonl");
+	let needs_leading_newline = match fs::read(&path) {
+		Ok(bytes) => !bytes.is_empty() && !bytes.ends_with(b"\n"),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+		Err(error) => return Err(error).context("failed to inspect alias provenance journal"),
+	};
+	let mut file = OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(&path)
+		.context("failed to open alias provenance journal")?;
+	if needs_leading_newline {
+		file.write_all(b"\n")?;
+	}
+	let mut bytes = serde_json::to_vec(event)?;
+	bytes.push(b'\n');
+	file.write_all(&bytes)
+		.context("failed to append alias provenance journal")?;
+	file.flush()?;
+	Ok(())
+}
+
 /// Keeps successful capture evidence separate from later unsuccessful attempts.
 #[derive(Debug, Default)]
 struct State {
@@ -139,5 +176,40 @@ mod tests {
 		state.remember_lookup("query".into(), Vec::new());
 		assert_eq!(state.lookup("query"), Some(Vec::new()));
 		assert_eq!(RecoveryState::open(root.path()).unwrap().lookup("query"), None);
+	}
+
+	/// Alias provenance appends valid JSONL entries even after a truncated prior line.
+	#[test]
+	fn record_alias_event_appends_jsonl_entries() {
+		let root = tempfile::tempdir().unwrap();
+		let first = AliasEvent {
+			target_path: PathBuf::from("forums/viewtopic.php__q_a.html"),
+			source_path: PathBuf::from("forums/viewtopic.php__q_b.html"),
+			reason: "topic_post_anchor".into(),
+			replaced_unusable: false,
+			referred_from: Some(PathBuf::from("forums/index.html")),
+		};
+		record_alias_event(root.path(), &first).unwrap();
+		OpenOptions::new()
+			.append(true)
+			.open(root.path().join(".wayback-state/aliases.jsonl"))
+			.unwrap()
+			.write_all(b"{\"partial\":")
+			.unwrap();
+		let second = AliasEvent {
+			target_path: PathBuf::from("press/index.html"),
+			source_path: PathBuf::from("press/index.htm"),
+			reason: "directory_index".into(),
+			replaced_unusable: true,
+			referred_from: None,
+		};
+		record_alias_event(root.path(), &second).unwrap();
+
+		let content = fs::read_to_string(root.path().join(".wayback-state/aliases.jsonl")).unwrap();
+		let parsed: Vec<AliasEvent> = content
+			.lines()
+			.filter_map(|line| serde_json::from_str::<AliasEvent>(line).ok())
+			.collect();
+		assert_eq!(parsed, vec![first, second]);
 	}
 }

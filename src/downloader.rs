@@ -28,7 +28,7 @@ use crate::cdx::{
 };
 use crate::download_refs::{extract_related_references, is_interactive_forum_extra_reference};
 use crate::link_validation::{collect_html_files, extract_document_references, repair_local_navigation_html, resolve_local_reference, validate_local_links};
-use crate::recovery::{CaptureEvent, RecoveryState};
+use crate::recovery::{AliasEvent, CaptureEvent, RecoveryState, record_alias_event};
 use crate::noise::is_archive_noise_record;
 use crate::pathmap::{
     SiteMapper, is_css_mimetype, is_html_mimetype, normalize_lookup_url, relative_link,
@@ -1383,7 +1383,7 @@ async fn create_missing_static_asset_aliases(
             continue;
         }
 
-        let Some(source) =
+        let Some((source, reason)) =
             existing_static_asset_alias_source(output_dir, &link.source, &link.target).await?
         else {
             continue;
@@ -1400,6 +1400,16 @@ async fn create_missing_static_asset_aliases(
                 source.display()
             )
         })?;
+        record_alias_event(
+            output_dir,
+            &AliasEvent {
+                target_path: link.target.clone(),
+                source_path: source.strip_prefix(output_dir).unwrap_or(&source).to_path_buf(),
+                reason: reason.to_owned(),
+                replaced_unusable: false,
+                referred_from: Some(link.source.clone()),
+            },
+        )?;
         created += 1;
     }
 
@@ -1526,6 +1536,7 @@ async fn create_missing_static_asset_aliases_from_alternate_pages(
                     fallback_options,
                     recovery_records_by_path,
                     &output_dir,
+                    &source,
                     &request.target,
                     &request.candidate,
                     max_bytes,
@@ -1676,6 +1687,7 @@ async fn create_static_asset_alias_from_candidate(
     fallback_options: &FallbackOptions,
     recovery_records_by_path: &HashMap<PathBuf, CdxRecord>,
     output_dir: &Path,
+    referred_from: &Path,
     target: &Path,
     candidate: &Path,
     max_bytes: u64,
@@ -1717,6 +1729,16 @@ async fn create_static_asset_alias_from_candidate(
             source.display()
         )
     })?;
+    record_alias_event(
+        output_dir,
+        &AliasEvent {
+            target_path: target.to_path_buf(),
+            source_path: candidate.to_path_buf(),
+            reason: "static_asset_alternate_page".to_owned(),
+            replaced_unusable: false,
+            referred_from: Some(referred_from.to_path_buf()),
+        },
+    )?;
 
     Ok(true)
 }
@@ -1780,7 +1802,7 @@ async fn existing_static_asset_alias_source(
     output_dir: &Path,
     source: &Path,
     target: &Path,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(PathBuf, &'static str)>> {
     let mut matches = Vec::new();
     for candidate in static_asset_alias_candidates(target) {
         if !local_candidate_reference_exists(output_dir, source, &candidate).await? {
@@ -1793,21 +1815,26 @@ async fn existing_static_asset_alias_source(
         }
     }
     if matches.len() == 1 {
-        return Ok(matches.into_iter().next());
+        return Ok(matches
+            .into_iter()
+            .next()
+            .map(|path| (path, "static_asset_filename_variant")));
     }
 
     if let Some(smiley) = same_host_smiley_alias_candidate(target) {
         let candidate = output_dir.join(smiley);
         if has_non_empty_file(&candidate).await? {
-            return Ok(Some(candidate));
+            return Ok(Some((candidate, "static_asset_smiley_dir")));
         }
     }
 
     if let Some(template_source) = same_host_template_image_alias_source(output_dir, target).await? {
-        return Ok(Some(template_source));
+        return Ok(Some((template_source, "static_asset_theme_icon")));
     }
 
-    cross_host_static_asset_alias_source(output_dir, target).await
+    Ok(cross_host_static_asset_alias_source(output_dir, target)
+        .await?
+        .map(|path| (path, "static_asset_cross_host")))
 }
 
 fn same_host_smiley_alias_candidate(target: &Path) -> Option<PathBuf> {
@@ -4453,6 +4480,28 @@ mod tests {
                 .unwrap(),
             b"home"
         );
+
+        let log = std::fs::read_to_string(root.join(".wayback-state/aliases.jsonl")).unwrap();
+        let events: Vec<AliasEvent> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().any(|event| {
+            event.target_path == Path::new("forums/images/smiles/icon_smile.gif")
+                && event.source_path == Path::new("forums/images/smilies/icon_smile.gif")
+                && event.reason == "static_asset_smiley_dir"
+        }));
+        assert!(events.iter().any(|event| {
+            event.target_path == Path::new("forums/templates/SmallRockets/images/icon_latest_reply.gif")
+                && event.source_path == Path::new("forums/templates/subSilver/images/icon_latest_reply.gif")
+                && event.reason == "static_asset_theme_icon"
+        }));
+        assert!(events.iter().any(|event| {
+            event.target_path == Path::new("_hosts/corporate.example.com/bimages/ic_logo.gif")
+                && event.source_path == Path::new("bimages/ic_logo.gif")
+                && event.reason == "static_asset_cross_host"
+        }));
     }
 
     /// Extra download CDX lookups must strip the referring page's volatile session ID

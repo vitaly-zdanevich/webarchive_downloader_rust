@@ -172,9 +172,13 @@ recovers static assets.
 
 Captures and replay failures are recorded in `.wayback-state/captures.jsonl`
 inside the output directory. The append-only journal preserves original URLs,
-capture timestamps, raw outgoing references, and failure reasons. Keep it with
-the archive: local query hashes cannot reconstruct their original URLs. It is
-recovery metadata, not a backup of file contents or a complete capture inventory.
+capture timestamps, raw outgoing references, and failure reasons. Local alias
+substitutions (topic, directory-index, and static-asset aliases) are recorded
+separately in `.wayback-state/aliases.jsonl` with target path, source path,
+matching rule, and referring page so every non-exact file remains auditable.
+Keep `.wayback-state/` with the archive: local query hashes cannot reconstruct
+their original URLs. It is recovery metadata, not a backup of file contents or
+a complete capture inventory.
 Original references are retained even when linked downloads are disabled.
 Binary transfers are still validated by the
 download stream; the journal records their terminal failures, not successful
