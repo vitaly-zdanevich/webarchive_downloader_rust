@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use crate::retry::{format_retry_delay, should_try_ssh_after_status};
 use crate::wayback_client::WaybackClient;
 
 pub const MAX_WAYBACK_RETRY_DELAY_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_CDX_PAGE_LIMIT: usize = 50_000;
 const FIRST_VERBOSE_RETRY_ATTEMPTS: usize = 5;
 const RETRY_LOG_EVERY_ATTEMPTS: usize = 10;
 const FIRST_CONNECTIVITY_NOTICE_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -142,6 +143,16 @@ impl CdxQuery {
     }
 
     pub fn search_url(&self) -> Result<Url> {
+        self.search_url_with_resume(None, self.limit)
+    }
+
+    /// Builds a CDX query URL with `urlkey` included (required by Wayback CDX for reliable
+    /// `resumeKey` pagination) and optional per-page `limit` / `resumeKey` continuation.
+    pub fn search_url_with_resume(
+        &self,
+        resume_key: Option<&str>,
+        batch_limit: Option<usize>,
+    ) -> Result<Url> {
         let mut url = self
             .archive_root
             .join("/cdx/search/cdx")
@@ -153,8 +164,9 @@ impl CdxQuery {
                 .append_pair("url", &self.target)
                 .append_pair("matchType", self.match_type.as_cdx())
                 .append_pair("output", "txt")
-                .append_pair("fl", "timestamp,original,mimetype,statuscode,digest,length")
-                .append_pair("filter", "statuscode:200");
+                .append_pair("fl", "urlkey,timestamp,original,mimetype,statuscode,digest,length")
+                .append_pair("filter", "statuscode:200")
+                .append_pair("showResumeKey", "true");
 
             if let Some(from) = &self.from {
                 pairs.append_pair("from", from);
@@ -162,8 +174,12 @@ impl CdxQuery {
             if let Some(to) = &self.to {
                 pairs.append_pair("to", to);
             }
-            if let Some(limit) = self.limit {
+            if let Some(limit) = batch_limit {
                 pairs.append_pair("limit", &limit.to_string());
+            }
+            if let Some(resume_key) = resume_key {
+                let decoded = decode_resume_key(resume_key);
+                pairs.append_pair("resumeKey", &decoded);
             }
         }
 
@@ -175,25 +191,65 @@ pub async fn fetch_latest_records(
     client: &WaybackClient,
     query: &CdxQuery,
 ) -> Result<Vec<CdxRecord>> {
-    let search_url = query.search_url()?;
-    let response = send_cdx_request(client, search_url, CdxRetryPolicy::primary()).await?;
-
     let mut records_by_url: HashMap<String, CdxRecord> = HashMap::new();
-    let mut stream = response.bytes_stream();
-    let mut pending = Vec::new();
+    let mut remaining = query.limit;
+    let mut resume_key: Option<String> = None;
+    let mut seen_resume_keys: HashSet<String> = HashSet::new();
+    let mut page_number = 0usize;
+    let mut total_read = 0usize;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("failed while reading CDX response")?;
-        pending.extend_from_slice(&chunk);
-
-        while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=line_end).collect::<Vec<_>>();
-            ingest_cdx_line(&line, query.strategy, &mut records_by_url)?;
+    loop {
+        if remaining == Some(0) {
+            break;
         }
-    }
+        let batch_limit = remaining
+            .map_or(DEFAULT_CDX_PAGE_LIMIT, |left| left.min(DEFAULT_CDX_PAGE_LIMIT));
+        let search_url = query.search_url_with_resume(resume_key.as_deref(), Some(batch_limit))?;
+        let page = fetch_cdx_page_with_retry(client, search_url, CdxRetryPolicy::primary()).await?;
+        page_number += 1;
 
-    if !pending.is_empty() {
-        ingest_cdx_line(&pending, query.strategy, &mut records_by_url)?;
+        let mut ingested = 0usize;
+        for record in page.records {
+            if remaining == Some(0) {
+                break;
+            }
+            if let Some(left) = &mut remaining {
+                *left = left.saturating_sub(1);
+            }
+            ingested += 1;
+            total_read += 1;
+            let key = canonical_original_key(&record.original);
+            match records_by_url.get(&key) {
+                Some(existing) if keep_existing(existing, &record, query.strategy) => {}
+                _ => {
+                    records_by_url.insert(key, record);
+                }
+            }
+        }
+
+        if remaining == Some(0) {
+            break;
+        }
+        let Some(next_key) = page.resume_key else {
+            if page_number > 1 {
+                println!(
+                    "CDX page {page_number}: read {ingested} records ({total_read} total, {} unique URLs); complete",
+                    records_by_url.len()
+                );
+            }
+            break;
+        };
+        if !seen_resume_keys.insert(next_key.clone()) {
+            eprintln!(
+                "Wayback CDX pagination returned a repeated resumeKey on page {page_number}; stopping pagination"
+            );
+            break;
+        }
+        println!(
+            "CDX page {page_number}: read {ingested} records ({total_read} total, {} unique URLs); continuing...",
+            records_by_url.len()
+        );
+        resume_key = Some(next_key);
     }
 
     let mut records = records_by_url.into_values().collect::<Vec<_>>();
@@ -214,7 +270,62 @@ pub async fn fetch_all_records_with_policy(
     query: &CdxQuery,
     retry_policy: CdxRetryPolicy,
 ) -> Result<Vec<CdxRecord>> {
-    let search_url = query.search_url()?;
+    let mut records = Vec::new();
+    let mut remaining = query.limit;
+    let mut resume_key: Option<String> = None;
+    let mut seen_resume_keys: HashSet<String> = HashSet::new();
+    let mut page_number = 0usize;
+
+    loop {
+        if remaining == Some(0) {
+            break;
+        }
+        let batch_limit = remaining
+            .map_or(DEFAULT_CDX_PAGE_LIMIT, |left| left.min(DEFAULT_CDX_PAGE_LIMIT));
+        let search_url = query.search_url_with_resume(resume_key.as_deref(), Some(batch_limit))?;
+        let page = fetch_cdx_page_with_retry(client, search_url, retry_policy).await?;
+        page_number += 1;
+
+        for record in page.records {
+            if remaining == Some(0) {
+                break;
+            }
+            if let Some(left) = &mut remaining {
+                *left = left.saturating_sub(1);
+            }
+            records.push(record);
+        }
+
+        if remaining == Some(0) {
+            break;
+        }
+        let Some(next_key) = page.resume_key else {
+            break;
+        };
+        if !seen_resume_keys.insert(next_key.clone()) {
+            eprintln!(
+                "Wayback CDX pagination returned a repeated resumeKey on page {page_number}; stopping pagination"
+            );
+            break;
+        }
+        resume_key = Some(next_key);
+    }
+
+    sort_records_for_strategy(&mut records, query.strategy);
+    Ok(records)
+}
+
+#[derive(Debug, Default)]
+struct CdxPage {
+    records: Vec<CdxRecord>,
+    resume_key: Option<String>,
+}
+
+async fn fetch_cdx_page_with_retry(
+    client: &WaybackClient,
+    search_url: Url,
+    retry_policy: CdxRetryPolicy,
+) -> Result<CdxPage> {
     let mut attempt = 0usize;
     let started_at = Instant::now();
     let mut suppressed_retry_messages = 0usize;
@@ -222,8 +333,8 @@ pub async fn fetch_all_records_with_policy(
     loop {
         let response = send_cdx_request(client, search_url.clone(), retry_policy).await?;
         let route = client.active_route_label();
-        match read_all_cdx_records(response, query.strategy).await {
-            Ok(records) => return Ok(records),
+        match read_cdx_page(response).await {
+            Ok(page) => return Ok(page),
             Err(error)
                 if retry_policy.should_retry_after_attempt(attempt)
                     && is_cdx_connectivity_error(&error) =>
@@ -261,11 +372,8 @@ pub async fn fetch_all_records_with_policy(
     }
 }
 
-async fn read_all_cdx_records(
-    response: Response,
-    strategy: SnapshotStrategy,
-) -> Result<Vec<CdxRecord>> {
-    let mut records = Vec::new();
+async fn read_cdx_page(response: Response) -> Result<CdxPage> {
+    let mut parser = CdxPageParser::default();
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
 
@@ -275,16 +383,15 @@ async fn read_all_cdx_records(
 
         while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=line_end).collect::<Vec<_>>();
-            ingest_all_cdx_line(&line, &mut records)?;
+            parser.push_line(&line)?;
         }
     }
 
     if !pending.is_empty() {
-        ingest_all_cdx_line(&pending, &mut records)?;
+        parser.push_line(&pending)?;
     }
 
-    sort_records_for_strategy(&mut records, strategy);
-    Ok(records)
+    Ok(parser.finish())
 }
 
 pub fn is_cdx_connectivity_error(error: &anyhow::Error) -> bool {
@@ -292,6 +399,7 @@ pub fn is_cdx_connectivity_error(error: &anyhow::Error) -> bool {
         cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
             error.is_connect()
                 || error.is_timeout()
+                || error.is_body()
                 || error.status().is_some_and(|status| {
                     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
                 })
@@ -645,37 +753,91 @@ pub(crate) fn sort_records_for_strategy(records: &mut [CdxRecord], strategy: Sna
     });
 }
 
-fn ingest_cdx_line(
-    line: &[u8],
-    strategy: SnapshotStrategy,
-    records_by_url: &mut HashMap<String, CdxRecord>,
-) -> Result<()> {
-    let line = String::from_utf8_lossy(line);
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(());
-    }
-
-    let record = parse_cdx_line(line)?;
-    let key = canonical_original_key(&record.original);
-    match records_by_url.get(&key) {
-        Some(existing) if keep_existing(existing, &record, strategy) => {}
-        _ => {
-            records_by_url.insert(key, record);
-        }
-    }
-    Ok(())
+#[derive(Default)]
+struct CdxPageParser {
+    records: Vec<CdxRecord>,
+    after_blank_line: bool,
+    resume_key: Option<String>,
 }
 
-fn ingest_all_cdx_line(line: &[u8], records: &mut Vec<CdxRecord>) -> Result<()> {
-    let line = String::from_utf8_lossy(line);
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(());
+impl CdxPageParser {
+    fn push_line(&mut self, line: &[u8]) -> Result<()> {
+        let line = String::from_utf8_lossy(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if self.resume_key.is_none() {
+                self.after_blank_line = true;
+            }
+            return Ok(());
+        }
+
+        if let Some(previous_key) = &self.resume_key {
+            bail!("unexpected CDX content after resumeKey {previous_key:?}: {trimmed}");
+        }
+
+        if self.after_blank_line {
+            match parse_cdx_line(trimmed) {
+                Ok(record) => {
+                    self.after_blank_line = false;
+                    self.records.push(record);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.resume_key = Some(trimmed.to_owned());
+                    return Ok(());
+                }
+            }
+        }
+
+        self.records.push(parse_cdx_line(trimmed)?);
+        Ok(())
     }
 
-    records.push(parse_cdx_line(line)?);
-    Ok(())
+    fn finish(self) -> CdxPage {
+        CdxPage {
+            records: self.records,
+            resume_key: self.resume_key,
+        }
+    }
+}
+
+/// Decodes an already `application/x-www-form-urlencoded` CDX resumeKey once so
+/// `Url::query_pairs_mut().append_pair` does not double-encode `%XX` or `+`.
+fn decode_resume_key(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'+' {
+            out.push(b' ');
+            index += 1;
+        } else if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+        {
+            out.push((high << 4) | low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out)
+        .unwrap_or_else(|error| String::from_utf8_lossy(&error.into_bytes()).into_owned())
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_cdx_timestamp(token: &str) -> bool {
+    token.len() >= 4 && token.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn keep_existing(existing: &CdxRecord, incoming: &CdxRecord, strategy: SnapshotStrategy) -> bool {
@@ -687,8 +849,19 @@ fn keep_existing(existing: &CdxRecord, incoming: &CdxRecord, strategy: SnapshotS
 
 pub fn parse_cdx_line(line: &str) -> Result<CdxRecord> {
     let mut parts = line.split_whitespace();
-    let Some(timestamp) = parts.next() else {
+    let Some(first) = parts.next() else {
         bail!("CDX line is missing timestamp: {line}");
+    };
+    let timestamp = if is_cdx_timestamp(first) {
+        first
+    } else {
+        let Some(ts) = parts.next() else {
+            bail!("CDX line is missing timestamp: {line}");
+        };
+        if !is_cdx_timestamp(ts) {
+            bail!("CDX line has invalid timestamp: {line}");
+        }
+        ts
     };
     let Some(original) = parts.next() else {
         bail!("CDX line is missing original URL: {line}");
@@ -733,16 +906,18 @@ mod tests {
 
     #[test]
     fn parses_text_cdx_line() {
-        let record =
-            parse_cdx_line("20200102030405 http://example.com/ text/html 200 ABCDEFG 1234")
-                .unwrap();
-
-        assert_eq!(record.timestamp, "20200102030405");
-        assert_eq!(record.original, "http://example.com/");
-        assert_eq!(record.mimetype, "text/html");
-        assert_eq!(record.status_code, 200);
-        assert_eq!(record.digest, "ABCDEFG");
-        assert_eq!(record.length, Some(1234));
+        for line in [
+            "20200102030405 http://example.com/ text/html 200 ABCDEFG 1234",
+            "com,example)/ 20200102030405 http://example.com/ text/html 200 ABCDEFG 1234",
+        ] {
+            let record = parse_cdx_line(line).unwrap();
+            assert_eq!(record.timestamp, "20200102030405");
+            assert_eq!(record.original, "http://example.com/");
+            assert_eq!(record.mimetype, "text/html");
+            assert_eq!(record.status_code, 200);
+            assert_eq!(record.digest, "ABCDEFG");
+            assert_eq!(record.length, Some(1234));
+        }
     }
 
     #[test]
@@ -759,8 +934,162 @@ mod tests {
         assert!(url.starts_with("https://web.archive.org/cdx/search/cdx?"));
         assert!(url.contains("url=example.com"));
         assert!(url.contains("matchType=domain"));
-        assert!(url.contains("fl=timestamp%2Coriginal%2Cmimetype%2Cstatuscode%2Cdigest%2Clength"));
+        assert!(url.contains("fl=urlkey%2Ctimestamp%2Coriginal%2Cmimetype%2Cstatuscode%2Cdigest%2Clength"));
         assert!(url.contains("filter=statuscode%3A200"));
+        assert!(url.contains("showResumeKey=true"));
+    }
+
+    #[test]
+    fn search_url_with_resume_preserves_single_encoding_of_wayback_resume_key() {
+        let archive_root = Url::parse("https://web.archive.org").unwrap();
+        let query = CdxQuery::new(
+            "example.com".to_owned(),
+            MatchType::Domain,
+            SnapshotStrategy::Latest,
+            archive_root,
+        );
+        let key = "com%2Cexample%29%2F+20200102030405%21";
+        let url = query
+            .search_url_with_resume(Some(key), Some(50_000))
+            .unwrap()
+            .to_string();
+        assert!(url.contains("limit=50000"), "{url}");
+        assert!(url.contains(&format!("resumeKey={key}")), "{url}");
+        assert!(!url.contains("%252C"), "resumeKey must not be double-encoded: {url}");
+    }
+
+    #[test]
+    fn page_parser_extracts_records_and_trailing_resume_key() {
+        let mut parser = CdxPageParser::default();
+        for line in [
+            "com,example)/ 20200101000000 http://example.com/ text/html 200 A 100\n",
+            "com,example)/a 20200102000000 http://example.com/a text/html 200 B 200\n",
+            "\n",
+            "com%2Cexample%29%2Fa+20200102000000%21\n",
+        ] {
+            parser.push_line(line.as_bytes()).unwrap();
+        }
+        let page = parser.finish();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(
+            page.resume_key.as_deref(),
+            Some("com%2Cexample%29%2Fa+20200102000000%21")
+        );
+
+        let mut empty_with_key = CdxPageParser::default();
+        empty_with_key.push_line(b"\n").unwrap();
+        empty_with_key.push_line(b"next_chunk_key\n").unwrap();
+        let page = empty_with_key.finish();
+        assert!(page.records.is_empty());
+        assert_eq!(page.resume_key.as_deref(), Some("next_chunk_key"));
+
+        let mut trailing_content = CdxPageParser::default();
+        trailing_content.push_line(b"\n").unwrap();
+        trailing_content.push_line(b"next_chunk_key\n").unwrap();
+        assert!(trailing_content.push_line(b"unexpected\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_records_paginates_via_resume_key_and_respects_limit() {
+        use wiremock::matchers::{path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resume_token = "com%2Cexample%29%2Fa+20200102000000%21";
+        let decoded_token = "com,example)/a 20200102000000!";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("url", "example.com"))
+            .and(query_param("showResumeKey", "true"))
+            .and(query_param_is_missing("resumeKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                concat!(
+                    "com,example)/ 20200101000000 http://example.com/ text/html 200 OLD 100\n",
+                    "com,example)/a 20200102000000 http://example.com/a text/html 200 A 100\n",
+                    "\n",
+                    "{resume_token}\n"
+                ),
+                resume_token = resume_token
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("url", "example.com"))
+            .and(query_param("showResumeKey", "true"))
+            .and(query_param("resumeKey", decoded_token))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "com,example)/ 20200105000000 http://example.com/ text/html 200 NEW 120\n",
+                "com,example)/orphan.html 20200106000000 http://example.com/orphan.html text/html 200 ORPHAN 150\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = WaybackClient::new("cdx-pagination-test", Duration::from_secs(5), Vec::new()).unwrap();
+        let full_query = CdxQuery::new(
+            "example.com".to_owned(),
+            MatchType::Domain,
+            SnapshotStrategy::Latest,
+            Url::parse(&server.uri()).unwrap(),
+        );
+        let full_records = fetch_latest_records(&client, &full_query).await.unwrap();
+        assert_eq!(full_records.len(), 3);
+        assert_eq!(full_records[0].original, "http://example.com/");
+        assert_eq!(full_records[0].timestamp, "20200105000000");
+        assert_eq!(full_records[1].original, "http://example.com/a");
+        assert_eq!(full_records[2].original, "http://example.com/orphan.html");
+
+        let mut limited_query = full_query;
+        limited_query.limit = Some(2);
+        let limited_records = fetch_latest_records(&client, &limited_query).await.unwrap();
+        assert_eq!(limited_records.len(), 2);
+        assert_eq!(limited_records[0].timestamp, "20200101000000");
+    }
+
+    #[tokio::test]
+    async fn fetch_all_records_paginates_and_stops_on_repeated_resume_key() {
+        use wiremock::matchers::{path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("url", "http://example.com/page.html"))
+            .and(query_param_is_missing("resumeKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "com,example)/page.html 20200101000000 http://example.com/page.html text/html 200 A 100\n",
+                "\n",
+                "stuck_key\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("url", "http://example.com/page.html"))
+            .and(query_param("resumeKey", "stuck_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "com,example)/page.html 20200102000000 http://example.com/page.html text/html 200 B 100\n",
+                "\n",
+                "stuck_key\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = WaybackClient::new("cdx-all-pagination-test", Duration::from_secs(5), Vec::new()).unwrap();
+        let query = CdxQuery::new(
+            "http://example.com/page.html".to_owned(),
+            MatchType::Exact,
+            SnapshotStrategy::Latest,
+            Url::parse(&server.uri()).unwrap(),
+        );
+        let records = fetch_all_records_with_policy(&client, &query, CdxRetryPolicy::limited(1))
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].timestamp, "20200102000000");
+        assert_eq!(records[1].timestamp, "20200101000000");
     }
 
     #[test]

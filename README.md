@@ -26,7 +26,7 @@ Inside Rust code, Cargo exposes the library crate as `webarchive_downloader_rust
 
 This is an early but working Rust CLI. It:
 
-- queries the Wayback CDX API for archived captures
+- queries the Wayback CDX API for archived captures, paginating automatically with `showResumeKey`/`resumeKey` so large domains are not truncated at one CDX page
 - keeps the latest capture per original URL by default
 - downloads files sequentially to keep memory use low and avoid hammering the Internet Archive
 - retries transient Wayback CDX failures indefinitely with backoff and diagnostic retry logs
