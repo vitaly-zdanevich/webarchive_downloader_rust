@@ -196,7 +196,17 @@ fn extract_html_references(input: &str) -> Result<HtmlReferenceReport> {
 						Ok(())
 					}
 				}),
-                collect_attr!("*[href]", "href", references),
+                element!("*[href]", {
+                    let references = Rc::clone(&references);
+                    move |element| {
+                        if !element.tag_name().eq_ignore_ascii_case("base")
+                            && let Some(value) = decoded_attribute(element, "href")
+                        {
+                            references.borrow_mut().push(value);
+                        }
+                        Ok(())
+                    }
+                }),
                 collect_attr!("*[src]", "src", references),
                 collect_attr!("blockquote[cite]", "cite", references),
                 collect_attr!("q[cite]", "cite", references),

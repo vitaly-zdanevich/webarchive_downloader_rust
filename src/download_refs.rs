@@ -4,6 +4,7 @@ use url::Url;
 use crate::link_validation::extract_document_references;
 use crate::noise::is_archive_noise_reference;
 use crate::pathmap::{SiteMapper, unwrap_wayback_url};
+use crate::rewrite::extract_html_base_url;
 
 /// Finds related archived pages and resources without restricting file extensions.
 /// Only HTTP(S) URLs are returned; the caller queries Wayback, never the live site.
@@ -13,13 +14,18 @@ pub(crate) fn extract_related_references(
 	mapper: &SiteMapper,
 	is_css: bool,
 ) -> Result<Vec<String>> {
+	let effective_base = if is_css {
+		base_url.clone()
+	} else {
+		extract_html_base_url(input, base_url).unwrap_or_else(|| base_url.clone())
+	};
 	let mut references = Vec::new();
 	for value in extract_document_references(input, is_css)? {
 		let value = value.trim();
 		if value.is_empty() || value.starts_with('#') {
 			continue;
 		}
-		let Ok(mut url) = base_url.join(&unwrap_wayback_url(value)) else {
+		let Ok(mut url) = effective_base.join(&unwrap_wayback_url(value)) else {
 			continue;
 		};
 		url.set_fragment(None);
@@ -315,6 +321,29 @@ mod tests {
 				"http://www.example.com/forums/memberlist.php?mode=viewprofile&u=2".to_owned(),
 				"http://www.example.com/forums/search.php?search_id=active_topics".to_owned(),
 				"http://www.example.com/forums/viewtopic.php?t=2".to_owned(),
+			]
+		);
+	}
+
+	/// Relative references in HTML documents with `<base href>` must resolve against the
+	/// `<base href>` URL rather than the document URL during extra-download discovery.
+	#[test]
+	fn discovery_resolves_relative_references_against_base_href() {
+		let mapper = SiteMapper::new("example.com").unwrap();
+		let base = Url::parse("http://example.com/archive/old.html").unwrap();
+		let references = extract_related_references(
+			r#"<html><head><base href="http://example.com/sub/dir/"></head><body><img src="logo.gif"><a href="next.html">Next</a></body></html>"#,
+			&base,
+			&mapper,
+			false,
+		)
+		.unwrap();
+
+		assert_eq!(
+			references,
+			vec![
+				"http://example.com/sub/dir/logo.gif".to_owned(),
+				"http://example.com/sub/dir/next.html".to_owned(),
 			]
 		);
 	}

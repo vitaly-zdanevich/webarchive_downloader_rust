@@ -47,6 +47,7 @@ macro_rules! js_attr_rewriter {
 #[derive(Clone, Debug)]
 pub struct RewriteContext<'a> {
     current_original: Url,
+    resolution_base: Url,
     current_local_path: PathBuf,
     known_paths: &'a HashMap<String, PathBuf>,
     mapper: Option<&'a SiteMapper>,
@@ -82,9 +83,11 @@ impl<'a> RewriteContext<'a> {
         current_local_path: PathBuf,
         known_paths: &'a HashMap<String, PathBuf>,
     ) -> Result<Self> {
+        let current_original = Url::parse(current_original)
+            .with_context(|| format!("invalid original URL: {current_original}"))?;
         Ok(Self {
-            current_original: Url::parse(current_original)
-                .with_context(|| format!("invalid original URL: {current_original}"))?,
+            resolution_base: current_original.clone(),
+            current_original,
             current_local_path,
             known_paths,
             mapper: None,
@@ -101,13 +104,25 @@ impl<'a> RewriteContext<'a> {
         known_paths: &'a HashMap<String, PathBuf>,
         mapper: &'a SiteMapper,
     ) -> Result<Self> {
+        let current_original = Url::parse(current_original)
+            .with_context(|| format!("invalid original URL: {current_original}"))?;
         Ok(Self {
-            current_original: Url::parse(current_original)
-                .with_context(|| format!("invalid original URL: {current_original}"))?,
+            resolution_base: current_original.clone(),
+            current_original,
             current_local_path,
             known_paths,
             mapper: Some(mapper),
         })
+    }
+
+    fn with_resolution_base(&self, resolution_base: Url) -> Self {
+        Self {
+            current_original: self.current_original.clone(),
+            resolution_base,
+            current_local_path: self.current_local_path.clone(),
+            known_paths: self.known_paths,
+            mapper: self.mapper,
+        }
     }
 
     /// Rewrites one URL-like resource reference relative to the current local file.
@@ -127,7 +142,7 @@ impl<'a> RewriteContext<'a> {
 
         let (without_fragment, fragment) = split_fragment(trimmed);
         let archive_unwrapped = unwrap_wayback_url(without_fragment);
-        let resolved = self.current_original.join(&archive_unwrapped).ok()?;
+        let resolved = self.resolution_base.join(&archive_unwrapped).ok()?;
         let mut lookup_url = resolved.clone();
         lookup_url.set_fragment(None);
         let lookup_key = normalize_lookup_url(lookup_url.as_str());
@@ -135,15 +150,32 @@ impl<'a> RewriteContext<'a> {
 			self.mapper?.known_path_for_url(&lookup_url, self.known_paths)
 		});
         let local_path = if let Some(local_path) = known_path.cloned() {
-            local_path
+            Some(local_path)
         } else if is_archive_noise_reference(lookup_url.as_str()) {
-            return None;
+            None
         } else if kind == ReferenceKind::Document && is_downloadable_file_url(&lookup_url) {
-            self.downloadable_fallback_path(&lookup_url)?
+            self.downloadable_fallback_path(&lookup_url)
         } else if is_extra_file_url(&lookup_url) {
-            self.related_resource_fallback_path(&lookup_url, kind)?
+            self.related_resource_fallback_path(&lookup_url, kind)
         } else {
-            self.fallback_same_site_path(&lookup_url, kind)?
+            self.fallback_same_site_path(&lookup_url, kind)
+        };
+
+        let Some(local_path) = local_path else {
+            let lower = archive_unwrapped.to_ascii_lowercase();
+            if self.resolution_base != self.current_original
+                && !lower.starts_with("http://")
+                && !lower.starts_with("https://")
+                && !archive_unwrapped.starts_with("//")
+            {
+                let mut absolute = resolved.to_string();
+                if let Some(fragment) = fragment {
+                    absolute.push('#');
+                    absolute.push_str(fragment);
+                }
+                return Some(UrlRewrite::Rewrite(absolute));
+            }
+            return None;
         };
 
         let mut rewritten = relative_link(&self.current_local_path, &local_path);
@@ -215,12 +247,60 @@ impl<'a> RewriteContext<'a> {
     }
 }
 
+/// Resolves the document's effective base URL from the first `<base href="...">` element,
+/// unwrapping any Wayback replay wrapper and resolving relative base hrefs against `document_url`.
+pub(crate) fn extract_html_base_url(input: &str, document_url: &Url) -> Option<Url> {
+    let seen_base_href = Rc::new(Cell::new(false));
+    let resolved = Rc::new(RefCell::new(None::<Url>));
+    let mut parser = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: vec![element!("base[href]", {
+                let seen_base_href = Rc::clone(&seen_base_href);
+                let resolved = Rc::clone(&resolved);
+                let document_url = document_url.clone();
+                move |element| {
+                    if seen_base_href.replace(true) {
+                        return Ok(());
+                    }
+                    if let Some(href) = decoded_attribute(element, "href") {
+                        let trimmed = href.trim();
+                        if !trimmed.is_empty() {
+                            let unwrapped = unwrap_wayback_url(trimmed);
+                            if let Ok(url) = document_url.join(&unwrapped)
+                                && matches!(url.scheme(), "http" | "https")
+                            {
+                                *resolved.borrow_mut() = Some(url);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            })],
+            ..Settings::default()
+        },
+        |_: &[u8]| {},
+    );
+    let _ = parser.write(input.as_bytes()).and_then(|_| parser.end());
+    resolved.borrow().clone()
+}
+
 /// Rewrites localizable references in one HTML document.
 ///
 /// The pass covers ordinary URL attributes, CSS in style blocks and attributes,
 /// JavaScript string references, old rollover image handlers, `srcset`,
 /// `meta refresh`, and legacy `APPLET`/`PARAM` patterns common in older sites.
+/// Any `<base href>` element is honored during URL resolution and neutralized
+/// in the rewritten output so browsers resolve relative local links against the
+/// saved file rather than the original remote base URL.
 pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String> {
+    let base_override = extract_html_base_url(input, &context.current_original);
+    let effective_context;
+    let context = if let Some(base_url) = base_override {
+        effective_context = context.with_resolution_base(base_url);
+        &effective_context
+    } else {
+        context
+    };
     let mut output = Vec::with_capacity(input.len());
 	let mut style_text = String::new();
 	let mut script_text = String::new();
@@ -228,6 +308,13 @@ pub fn rewrite_html(input: &str, context: &RewriteContext<'_>) -> Result<String>
     let rollover_stack = Rc::new(RefCell::new(Vec::<Vec<RolloverImageSource>>::new()));
     let settings = Settings {
         element_content_handlers: vec![
+            element!("base[href]", |element| {
+                element.remove_attribute("href");
+                if element.attributes().is_empty() {
+                    element.remove();
+                }
+                Ok(())
+            }),
 			element!("script", {
 				let javascript_script = Rc::clone(&javascript_script);
 				move |element| {
@@ -1516,5 +1603,71 @@ mod tests {
             "JS static asset literal should stay a resource: {rewritten}"
         );
         assert!(!rewritten.contains("viewtopic__q_"), "{rewritten}");
+    }
+
+    /// `<base href>` must drive relative URL resolution during rewriting and then be neutralized
+    /// so browsers resolve the rewritten relative links against the saved local file path.
+    #[test]
+    fn honors_and_neutralizes_base_href_elements() {
+        let mut known_paths = HashMap::new();
+        known_paths.insert(
+            "http://example.com/sub/dir/logo.gif".to_owned(),
+            PathBuf::from("sub/dir/logo.gif"),
+        );
+        known_paths.insert(
+            "http://example.com/sub/dir/about.html".to_owned(),
+            PathBuf::from("sub/dir/about.html"),
+        );
+        let mapper = SiteMapper::new("example.com").unwrap();
+        let context = RewriteContext::new_with_mapper(
+            "http://example.com/archive/old.html",
+            PathBuf::from("archive/old.html"),
+            &known_paths,
+            &mapper,
+        )
+        .unwrap();
+
+        let html = concat!(
+            r#"<html><head><base href="http://example.com/sub/dir/" target="_blank"></head>"#,
+            r#"<body><img src="logo.gif"><a href="about.html#team">About</a></body></html>"#,
+        );
+        let rewritten = rewrite_html(html, &context).unwrap();
+        assert!(
+            rewritten.contains(r#"<base target="_blank">"#),
+            "non-href base attributes should be preserved while href is removed: {rewritten}"
+        );
+        assert!(!rewritten.contains("href=\"http://example.com/sub/dir/\""), "{rewritten}");
+        assert!(rewritten.contains(r#"src="../sub/dir/logo.gif""#), "{rewritten}");
+        assert!(
+            rewritten.contains(r#"href="../sub/dir/about.html#team""#),
+            "{rewritten}"
+        );
+
+        let wayback_base_html = r#"<html><head><base href="/web/20060101/http://example.com/sub/dir/"></head><body><img src="logo.gif"></body></html>"#;
+        let wayback_rewritten = rewrite_html(wayback_base_html, &context).unwrap();
+        assert!(!wayback_rewritten.contains("<base"), "{wayback_rewritten}");
+        assert!(
+            wayback_rewritten.contains(r#"src="../sub/dir/logo.gif""#),
+            "{wayback_rewritten}"
+        );
+
+        let external_base_html = r#"<html><head><base href="https://external.invalid/docs/"></head><body><a href="manual.pdf#p2">Manual</a></body></html>"#;
+        let external_rewritten = rewrite_html(external_base_html, &context).unwrap();
+        assert!(!external_rewritten.contains("<base"), "{external_rewritten}");
+        assert!(
+            external_rewritten.contains(r#"href="https://external.invalid/docs/manual.pdf#p2""#),
+            "unmapped relative URLs under an external <base href> must become absolute: {external_rewritten}"
+        );
+
+        let empty_first_base_html = concat!(
+            r#"<html><head><base href=""><base href="http://example.com/sub/dir/"></head>"#,
+            r#"<body><img src="local.gif"></body></html>"#,
+        );
+        let empty_first_rewritten = rewrite_html(empty_first_base_html, &context).unwrap();
+        assert!(!empty_first_rewritten.contains("<base"), "{empty_first_rewritten}");
+        assert!(
+            empty_first_rewritten.contains(r#"src="local.gif""#),
+            "an empty first <base href> must ignore later <base href> elements: {empty_first_rewritten}"
+        );
     }
 }

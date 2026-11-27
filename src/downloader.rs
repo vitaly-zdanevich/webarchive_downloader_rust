@@ -5666,4 +5666,82 @@ mod tests {
             "{saved_index}"
         );
     }
+
+    /// A document with `<base href>` must discover its resources against the base URL,
+    /// rewrite them relative to the saved file path, and neutralize `<base href>` in output.
+    #[tokio::test]
+    async fn download_site_honors_and_neutralizes_base_href() {
+        use wiremock::matchers::{path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let output = tempfile::tempdir().unwrap();
+        let timestamp = "20060101000000";
+        let page_url = "http://example.com/archive/old.html";
+        let asset_url = "http://example.com/sub/dir/logo.gif";
+
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "domain"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {page_url} text/html 200 PAGE 100\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdx/search/cdx"))
+            .and(query_param("matchType", "exact"))
+            .and(query_param("url", asset_url))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{timestamp} {asset_url} image/gif 200 LOGO 6\n"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{page_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><head><base href="http://example.com/sub/dir/"></head><body><img src="logo.gif"></body></html>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/web/{timestamp}id_/{asset_url}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GIF89a".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let report = download_site(
+            build_client("base-href-test", Duration::from_secs(5), Vec::new()).unwrap(),
+            SiteMapper::new("example.com").unwrap(),
+            CdxQuery::new(
+                "example.com".to_owned(),
+                MatchType::Domain,
+                SnapshotStrategy::Latest,
+                Url::parse(&server.uri()).unwrap(),
+            ),
+            DownloadOptions {
+                output_dir: output.path().to_owned(),
+                no_clobber: true,
+                recover_existing: false,
+                rewrite_links: true,
+                add_wayback_comment: true,
+                extra_download_max_bytes: Some(u64::MAX),
+                validate_links: true,
+                cancellation: CancellationFlag::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.downloaded, 2);
+        assert_eq!(report.extra_downloads, 1);
+        assert_eq!(report.missing_local_links, 0);
+        assert_eq!(
+            std::fs::read(output.path().join("sub/dir/logo.gif")).unwrap(),
+            b"GIF89a"
+        );
+        let saved_page = std::fs::read_to_string(output.path().join("archive/old.html")).unwrap();
+        assert!(!saved_page.contains("<base"), "{saved_page}");
+        assert!(saved_page.contains(r#"src="../sub/dir/logo.gif""#), "{saved_page}");
+    }
 }
